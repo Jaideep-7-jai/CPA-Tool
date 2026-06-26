@@ -286,79 +286,111 @@ def process_arcamax(request_id):
 
 
 def process_orange(criteria_type, criteria_value, comp_type, output_dir) -> Tuple[str, int]:
-    logger = logging.getLogger("age_processor")
+    """ORANGE Request Processor"""
+    
+    channel_name = "ORANGE"
+    channel_status = "ORANGE_STATUS"
+    update_request_status(request_id,"Started",channel_status)
+    
+    request_data = fetch_request_details(request_id)
+    if not request_data:
+        raise Exception("Request ID {request_id} not found")
+    
+    client_name = request_data["client_name"]
+    request_type = request_data["requets_type"]
+    request_name = request_data["request_name"]
+    criteria_type = request_data["criteria_type"]
+    criteria_value = request_data["criteria_value"]
+    comp_type = request_data["comp_type"]
+    output_dir = request_data["output_dir"]
+    
     final_dir = ensure_final_files_dir(output_dir)
-    #s3_prefix = "s3://temporary-data/JAIDEEP/ADHOC/CPA_SUPP_MALNG_REQ/ORANGE_PROFILES/"
-    s3_prefix = get_unique_s3_path(S3_BASE, "ORANGE", criteria_type, comp_type)
-    logging.info(f"S3 PREFIX USED: {s3_prefix}")
+    
+    path_date = datetime.now().strftime("%Y%m%d")
+    s3_path = (f"{S3_BASE}/"f"{request_type}/"f"{path_date}/"f"{request_name}/"f"{channel_name}")
+    
+    logger.info(f"Started {channel_name} Processing "f"{criteria_type} {comp_type}")
+    
     try:
         logging.info(f"Sarted Orange Processing for :: {criteria_type} {comp_type}")
         logging.info(f"FILES DIR :: {final_dir}")
 
         if criteria_type == 'age':
-            date_cutoff = get_dob_cutoff(criteria_value, comp_type)
-            dob_condition = f"dob {'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
-            trans_sql = f"""SELECT email_address,feed_id from apt_custom_orange_transaction_dnd
-            where email_address is not null and dob is not null and dob<>'NULL'
-            and {dob_condition}"""
+            date_cutoff = get_dob_cutoff(int(criteria_value),comp_type)
+            condition = f"dob {'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
+            header = "email,dob"
+        elif criteria_type == "state":
+            if isinstance(criteria_value, str):
+                criteria_value = [x.strip() for x in criteria_value.split(",")]
+                states = "','".join(criteria_value)
+                condition = (f"STATE "f"{'IN' if comp_type == 'include' else 'NOT IN'} "f"('{states}')")
+                header = "email,state"
         else:
-            requiredstates="','".join(criteria_value)
-            condition = f"STATE {'in' if comp_type=='include' else 'not in'} ('{requiredstates}')"
-            trans_sql = f"""SELECT email_address,feed_id from apt_custom_orange_transaction_dnd
-            where email_address is not null and {condition}"""
+            raise Exception(f"Unsupported criteria_type "f"{criteria_type}")
 
+        output_file_date = datetime.now().strftime("%Y%m%d")
+        output_file = (f"{client_name}_"f"{request_type}_"f"{channel_name}_"f"{output_file_date}.csv")
 
         sql = f"""
             COPY INTO '{s3_path}/'
-            FROM (select distinct a.email_address,b.ACCOUNT_NAME from (select distinct a.FEED_ID,a.email_address from APT_CUSTOM_ORANGE_TRANSACTION_DND a,(select a.email_address,max(a.created_at) as maxdate from APT_CUSTOM_ORANGE_TRANSACTION_DND a where {condition} group by 1) b where a.email_address=b.email_address and a.created_at=b.maxdate) a join APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 b on a.FEED_ID=b.FEEDID join APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND c on a.email_address=c.email_address join APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND d on a.email_address=d.email)
-            credentials=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}')
-            FILE_FORMAT = (
-                TYPE = CSV
-                COMPRESSION = GZIP
-                FIELD_DELIMITER = '|'
-                FIELD_OPTIONALLY_ENCLOSED_BY='\"'
-            )
-            max_file_size = 490000000;
-        """
+            FROM (select distinct a.email_address,b.ACCOUNT_NAME from (select distinct a.FEED_ID,a.email_address from APT_CUSTOM_ORANGE_TRANSACTION_DND a,(select a.email_address,max(a.created_at) as maxdate from APT_CUSTOM_ORANGE_TRANSACTION_DND a where {condition} group by 1) b where a.email_address=b.email_address and a.created_at=b.maxdate) a join APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 b on a.FEED_ID=b.FEEDID join APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND c on a.email_address=c.email_address join APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND d on a.email_address=d.email) credentials=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') FILE_FORMAT = (TYPE = CSV COMPRESSION = GZIP FIELD_DELIMITER = '|' FIELD_OPTIONALLY_ENCLOSED_BY='\"') max_file_size = 490000000;"""
         run_command(["snowsql","-c", "datateam1","-q", sql])
 
         # Download final
+        output_path = (Path(final_dir)/ "ORANGE_OP_PATH")
+        output_path.mkdir(parents=True,exist_ok=True)
+        
         final_orange = f"ORANGE_{criteria_type}_{comp_type}.csv"
-        run_command(["aws", "s3", "cp", f"{s3_prefix}/ORANGE_FINAL_DATA/", ".", "--recursive", "--quiet"],cwd=final_dir)
-        run_command(f"ls data* 1> /dev/null 2>&1 && zcat data* > {final_orange}", cwd=final_dir)
-        run_command("rm -f data*", cwd=final_dir)
+        run_command(["aws", "s3", "cp", f"{s3_prefix}/ORANGE_FINAL_DATA/", ".", "--recursive", "--quiet"],cwd=output_path)
+        run_command(f"ls data* 1> /dev/null 2>&1 && zcat data* > {output_path}/{final_orange}", cwd=output_path)
+        run_command("rm -f data*", cwd=output_path)
 
-        df_final = pd.read_csv(f"{final_dir}/{final_orange}", names=["email", "account_name"],delimiter='|')
-        esp_names = df_final['account_name'].drop_duplicates().sort_values().tolist()
-        total_count=len(df_final)
+        df_final = pd.read_csv(f"{final_dir}/{final_orange}", names=["email", "account_name"], delimiter="|")
+        
+        total_count = len(df_final)
         logging.info(f"📊 ORANGE Total: {total_count:,} records")
-
-        output_path = Path(final_dir) / "ORANGE_OP_PATH"
-        output_path.mkdir(exist_ok=True)
-
-        for esp in esp_names:
-            df_esp = df_final[df_final['account_name'] == esp][['email']]
-            df_esp.to_csv(output_path / f"{esp}_ORANGE_DATA.csv",index=False, header=False)
-
-        output_file_datee=datetime.now().strftime('%Y%m%d')
-        zipfinal_orange = f"ORANGE_AGE_{criteria_type}_{comp_type}_{output_file_datee}.zip"
-
-        # Zip all
-        zip_file = Path(final_dir) / zipfinal_orange
-        input_folder = Path(final_dir) / "ORANGE_OP_PATH"
-
-        run_command(["zip", "-r", zip_file.name, input_folder.name],cwd=str(Path(final_dir)))
-        zip_filename = zipfinal_orange
-
-        run_command(f"rm -rf {input_folder.name} && rm -f {final_orange}", cwd=final_dir)
-        logging.info(f"✅ ORANGE: {zip_filename} ({total_count:,} records)")
-
-        return zip_filename, total_count
+        
+        output_file_date = datetime.now().strftime("%Y%m%d")
+        
+        if request_type.lower() == "suppression":
+            # Generate email-only CSV
+            suppression_file = (f"{client_name}_{request_type}_{channel_name}_{output_file_date}.csv")
+            suppression_path = Path(final_dir) / suppression_file
+        
+            df_final[["email"]].drop_duplicates().to_csv(suppression_path, index=False, header=False,)
+            # Cleanup downloaded files
+            run_command(f"rm -f {final_orange}", cwd=final_dir)
+        
+            logging.info(f"✅ ORANGE Suppression File Created: {suppression_file} "f"({total_count:,} records)")
+            return suppression_file, total_count
+        
+        else:
+            # Existing ESP split process
+            esp_names = (df_final["account_name"].drop_duplicates().sort_values().tolist())
+        
+            output_path = Path(final_dir) / "ORANGE_OP_PATH"
+            output_path.mkdir(exist_ok=True)
+        
+            for esp in esp_names:
+                df_esp = df_final[df_final["account_name"] == esp][["email"]]
+                df_esp.to_csv(output_path / f"{esp}_ORANGE_DATA.csv", index=False, header=False,)
+        
+            zipfinal_orange = (f"ORANGE_{criteria_type}_{comp_type}_{output_file_date}.zip")
+            zip_file = Path(final_dir) / zipfinal_orange
+            input_folder = Path(final_dir) / "ORANGE_OP_PATH"
+        
+            run_command(["zip", "-r", zip_file.name, input_folder.name], cwd=str(Path(final_dir)),)
+            run_command(f"rm -rf {input_folder.name} && rm -f {final_orange}", cwd=final_dir,)
+        
+            logging.info(f"✅ ORANGE: {zipfinal_orange} ({total_count:,} records)")
+            return zipfinal_orange, total_count
 
     except Exception as e:
         logging.error(f"💥 ORANGE {comp_type} {criteria_type} FAILED: {e}")
         send_error_email(f"ORANGE {comp_type} {criteria_type} FAILED", str(e))
         raise
+
+
 
 
 
