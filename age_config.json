@@ -1,0 +1,9 @@
+{
+  "criteria": "age",
+  "comp": "greater",
+  "value": 50,
+  "output_dir": "./output",
+  "user": "jaideep",
+  "client": "CCU",
+  "request_type": "suppression"
+}

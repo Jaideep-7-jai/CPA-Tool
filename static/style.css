@@ -1,0 +1,15 @@
+:root { --bg:#f7f6f2; --surface:#fff; --surface2:#fbfbf9; --border:#d4d1ca; --text:#28251d; --muted:#6e6b63; --primary:#01696f; --primaryh:#0c4e54; --radius:16px; --shadow:0 12px 32px rgba(0,0,0,.06); }
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:'Satoshi',sans-serif}
+.auth-body{min-height:100vh;display:grid;place-items:center;padding:24px}.auth-shell{width:100%;max-width:460px}
+.auth-card,.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}
+.auth-card{padding:28px}.brand-block h1,.topbar h1{margin:0 0 8px}.brand-block p,.topbar p,.meta{color:var(--muted)}
+.auth-form,.form-card form{display:grid;gap:14px} label{display:grid;gap:8px;font-weight:600} input,select,button{font:inherit}
+input,select{padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:#fff}
+button,.link-button{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;padding:12px 16px;border-radius:10px;border:none;background:var(--primary);color:#fff;font-weight:700;cursor:pointer}
+button:hover,.link-button:hover{background:var(--primaryh)}.alert.error{background:#f7e2ea;color:#7d1e5e;border-radius:10px;padding:12px 14px;margin:16px 0}
+.app-shell{display:grid;grid-template-columns:340px 1fr;min-height:100vh}.sidebar{background:var(--surface2);border-right:1px solid var(--border);padding:20px;overflow-y:auto}
+.sidebar-top{margin-bottom:16px}.main-panel{padding:24px}.topbar{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:24px}
+.form-card{padding:24px;max-width:720px}.request-list{display:grid;gap:12px}.request-item{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px}
+.row-between{display:flex;justify-content:space-between;gap:8px;align-items:center}.badge{display:inline-block;padding:4px 10px;border-radius:999px;font-size:.84rem;font-weight:700}
+.inprogress{background:#d8ecee;color:#0b4b50}.completed{background:#d8e8d0;color:#225011}.failed{background:#ecd3e3;color:#6b1f50}.hidden{display:none}.message{min-height:1.25rem;color:#964219}
+@media (max-width:960px){.app-shell{grid-template-columns:1fr}.sidebar{border-right:none;border-bottom:1px solid var(--border)}}
