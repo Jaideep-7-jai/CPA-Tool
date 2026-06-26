@@ -3,6 +3,10 @@
 AGE STATE Processing - unique request-driven channel execution.
 Supports single-channel or all-channel execution, with parallel execution
 only when multiple channels are requested.
+
+Changes:
+  - GREEN/BLUE/ARCAMAX: deduplicate on email column after combining S3 files
+  - ORANGE: suppression -> email-only CSV; mailing -> ESP-wise split + ZIP
 """
 
 import os
@@ -37,19 +41,23 @@ CHANNELS = ["GREEN", "BLUE", "ARCAMAX", "ORANGE"]
 logger = logging.getLogger("age_processor")
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def setup_logging(output_dir: str, criteria_type: str):
     log_dir = Path(output_dir) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_date = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"{criteria_type}_{log_date}.log"
 
-    logger = logging.getLogger("age_processor")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+    _logger = logging.getLogger("age_processor")
+    _logger.setLevel(logging.INFO)
+    _logger.handlers.clear()
     handler = logging.FileHandler(log_file)
     handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s"))
-    logger.addHandler(handler)
-    return logger
+    _logger.addHandler(handler)
+    return _logger
 
 
 def get_dob_cutoff(min_age, comp_type):
@@ -119,37 +127,38 @@ def _build_common_context(request_id: int, channel_name: str) -> dict:
     if not request_data:
         raise Exception(f"Request ID {request_id} not found")
 
-    client_name = request_data["client_name"]
-    request_type = request_data["requets_type"]
-    request_name = request_data["request_name"]
-    criteria_type = request_data["criteria_type"]
+    client_name    = request_data["client_name"]
+    request_type   = request_data["requets_type"]
+    request_name   = request_data["request_name"]
+    criteria_type  = request_data["criteria_type"]
     criteria_value = request_data["criteria_value"]
-    comp_type = request_data["comp_type"]
-    output_dir = request_data["output_dir"]
+    comp_type      = request_data["comp_type"]
+    output_dir     = request_data["output_dir"]
 
     safe_output_dir = ensure_output_dir(output_dir, criteria_type)
-    final_dir = ensure_final_files_dir(safe_output_dir)
-    path_date = datetime.now().strftime("%Y%m%d")
-    s3_path = f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}"
-    output_file = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
+    final_dir       = ensure_final_files_dir(safe_output_dir)
+    path_date       = datetime.now().strftime("%Y%m%d")
+    s3_path         = f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}"
+    output_file     = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
 
     return {
-        "request_data": request_data,
-        "client_name": client_name,
-        "request_type": request_type,
-        "request_name": request_name,
-        "criteria_type": criteria_type,
+        "request_data"  : request_data,
+        "client_name"   : client_name,
+        "request_type"  : request_type,
+        "request_name"  : request_name,
+        "criteria_type" : criteria_type,
         "criteria_value": criteria_value,
-        "comp_type": comp_type,
-        "output_dir": safe_output_dir,
-        "final_dir": final_dir,
-        "path_date": path_date,
-        "s3_path": s3_path,
-        "output_file": output_file,
+        "comp_type"     : comp_type,
+        "output_dir"    : safe_output_dir,
+        "final_dir"     : final_dir,
+        "path_date"     : path_date,
+        "s3_path"       : s3_path,
+        "output_file"   : output_file,
     }
 
 
 def _download_and_combine(s3_path: str, download_dir: Path, final_dir: str, output_file: str):
+    """Download gzipped S3 parts and concatenate into one pipe-delimited file."""
     download_dir.mkdir(parents=True, exist_ok=True)
     run_command(["aws", "s3", "cp", s3_path, ".", "--recursive", "--quiet"], cwd=download_dir)
     run_command(
@@ -157,6 +166,21 @@ def _download_and_combine(s3_path: str, download_dir: Path, final_dir: str, outp
         cwd=download_dir,
     )
     run_command("rm -f data*", cwd=download_dir)
+
+
+def _dedup_email_col(file_path: str) -> int:
+    """
+    Read a pipe-delimited file, drop duplicate values in column 0 (email),
+    overwrite the file with unique-email rows only, and return final count.
+    Works for GREEN / BLUE / ARCAMAX where S3 exports email|age or email|state.
+    """
+    df = pd.read_csv(file_path, sep="|", header=None, dtype=str)
+    before = len(df)
+    df = df.drop_duplicates(subset=[0])          # col 0 = email
+    df.to_csv(file_path, sep="|", index=False, header=False)
+    after = len(df)
+    logger.info("Dedup %s: %d -> %d unique emails (removed %d)", file_path, before, after, before - after)
+    return after
 
 
 def _post_to_ftp(final_dir: str, path_date: str, output_file: str):
@@ -167,26 +191,26 @@ def _post_to_ftp(final_dir: str, path_date: str, output_file: str):
     run_command(ftp_cmd, cwd=final_dir)
 
 
-def _success_result(channel_name: str, final_dir: str, output_file: str, elapsed: float) -> dict:
+def _success_result(
+    channel_name: str, final_dir: str, output_file: str, elapsed: float, record_count: int = 0
+) -> dict:
     file_path = str(Path(final_dir) / output_file)
-    record_count = 0
-    try:
-        df = pd.read_csv(file_path, sep="|", header=None)
-        record_count = len(df)
-    except Exception:
-        logger.warning("Unable to count records for %s", file_path)
-
     return {
-        "channel": channel_name,
-        "file": output_file,
+        "channel"  : channel_name,
+        "file"     : output_file,
         "file_path": file_path,
-        "status": "SUCCESS",
-        "elapsed": elapsed,
-        "count": record_count,
+        "status"   : "SUCCESS",
+        "elapsed"  : elapsed,
+        "count"    : record_count,
     }
 
 
+# ---------------------------------------------------------------------------
+# Channel processors
+# ---------------------------------------------------------------------------
+
 def process_green_blue(request_id: int, channel_name: str) -> dict:
+    """GREEN and BLUE channel processor with email deduplication."""
     channel_name = channel_name.upper()
     if channel_name not in ["GREEN", "BLUE"]:
         raise ValueError("process_green_blue supports only GREEN or BLUE")
@@ -195,27 +219,22 @@ def process_green_blue(request_id: int, channel_name: str) -> dict:
     update_request_status(request_id, "Started", channel_status)
     ctx = _build_common_context(request_id, channel_name)
 
-    logger.info(
-        "Started %s processing for %s %s",
-        channel_name,
-        ctx["criteria_type"],
-        ctx["comp_type"],
-    )
+    logger.info("Started %s processing for %s %s", channel_name, ctx["criteria_type"], ctx["comp_type"])
 
     try:
-        criteria_type = ctx["criteria_type"]
+        criteria_type  = ctx["criteria_type"]
         criteria_value = ctx["criteria_value"]
-        comp_type = ctx["comp_type"]
+        comp_type      = ctx["comp_type"]
 
         if criteria_type == "age":
             condition = f"b.AGE {'>=' if comp_type == 'greater' else '<'} {criteria_value}"
-            header = "a.email,b.age"
+            header    = "a.email,b.age"
         elif criteria_type == "state":
             if isinstance(criteria_value, str):
                 criteria_value = [x.strip() for x in criteria_value.split(",")]
-            states = "','".join(criteria_value)
+            states    = "','".join(criteria_value)
             condition = f"b.STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
-            header = "a.email,b.state"
+            header    = "a.email,b.state"
         else:
             raise Exception(f"Unsupported criteria_type {criteria_type}")
 
@@ -242,13 +261,18 @@ def process_green_blue(request_id: int, channel_name: str) -> dict:
         output_path = Path(ctx["final_dir"]) / f"{channel_name}_OP_PATH"
         _download_and_combine(ctx["s3_path"], output_path, ctx["final_dir"], ctx["output_file"])
 
+        # ---- Change 2: deduplicate on email column -------------------------
+        final_file_path = str(Path(ctx["final_dir"]) / ctx["output_file"])
+        record_count = _dedup_email_col(final_file_path)
+        # -------------------------------------------------------------------
+
         update_request_status(request_id, "Posting To FTP", channel_status)
         _post_to_ftp(ctx["final_dir"], ctx["path_date"], ctx["output_file"])
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status)
         logger.info("%s processing completed in %.2f seconds", channel_name, elapsed)
-        return _success_result(channel_name, ctx["final_dir"], ctx["output_file"], elapsed)
+        return _success_result(channel_name, ctx["final_dir"], ctx["output_file"], elapsed, record_count)
 
     except Exception as e:
         update_request_status(request_id, "Failed", channel_status)
@@ -258,26 +282,22 @@ def process_green_blue(request_id: int, channel_name: str) -> dict:
 
 
 def process_arcamax(request_id: int) -> dict:
-    channel_name = "ARCAMAX"
+    """ARCAMAX channel processor with email deduplication."""
+    channel_name   = "ARCAMAX"
     channel_status = "ARCAMAX_STATUS"
     update_request_status(request_id, "Started", channel_status)
     ctx = _build_common_context(request_id, channel_name)
 
-    logger.info(
-        "Started %s processing for %s %s",
-        channel_name,
-        ctx["criteria_type"],
-        ctx["comp_type"],
-    )
+    logger.info("Started %s processing for %s %s", channel_name, ctx["criteria_type"], ctx["comp_type"])
 
     try:
-        criteria_type = ctx["criteria_type"]
+        criteria_type  = ctx["criteria_type"]
         criteria_value = ctx["criteria_value"]
-        comp_type = ctx["comp_type"]
+        comp_type      = ctx["comp_type"]
 
         if criteria_type == "age":
             date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
-            condition = (
+            condition   = (
                 f"birthday IS NOT NULL AND TRY_TO_DATE(birthday) "
                 f"{'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
             )
@@ -285,9 +305,9 @@ def process_arcamax(request_id: int) -> dict:
         elif criteria_type == "state":
             if isinstance(criteria_value, str):
                 criteria_value = [x.strip() for x in criteria_value.split(",")]
-            states = "','".join(criteria_value)
+            states    = "','".join(criteria_value)
             condition = f"STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
-            header = "email,state"
+            header    = "email,state"
         else:
             raise Exception(f"Unsupported criteria_type {criteria_type}")
 
@@ -309,13 +329,18 @@ def process_arcamax(request_id: int) -> dict:
         output_path = Path(ctx["final_dir"]) / "ARCAMAX_OP_PATH"
         _download_and_combine(ctx["s3_path"], output_path, ctx["final_dir"], ctx["output_file"])
 
+        # ---- Change 2: deduplicate on email column -------------------------
+        final_file_path = str(Path(ctx["final_dir"]) / ctx["output_file"])
+        record_count = _dedup_email_col(final_file_path)
+        # -------------------------------------------------------------------
+
         update_request_status(request_id, "Posting To FTP", channel_status)
         _post_to_ftp(ctx["final_dir"], ctx["path_date"], ctx["output_file"])
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status)
         logger.info("%s processing completed in %.2f seconds", channel_name, elapsed)
-        return _success_result(channel_name, ctx["final_dir"], ctx["output_file"], elapsed)
+        return _success_result(channel_name, ctx["final_dir"], ctx["output_file"], elapsed, record_count)
 
     except Exception as e:
         update_request_status(request_id, "Failed", channel_status)
@@ -325,30 +350,34 @@ def process_arcamax(request_id: int) -> dict:
 
 
 def process_orange(request_id: int) -> dict:
-    channel_name = "ORANGE"
+    """
+    ORANGE channel processor.
+    - suppression -> single email-only CSV
+    - mailing     -> ESP-wise split CSVs packed into a ZIP
+    """
+    channel_name   = "ORANGE"
     channel_status = "ORANGE_STATUS"
     update_request_status(request_id, "Started", channel_status)
     ctx = _build_common_context(request_id, channel_name)
 
-    logger.info(
-        "Started %s processing for %s %s",
-        channel_name,
-        ctx["criteria_type"],
-        ctx["comp_type"],
-    )
+    logger.info("Started %s processing for %s %s", channel_name, ctx["criteria_type"], ctx["comp_type"])
 
     try:
-        criteria_type = ctx["criteria_type"]
+        criteria_type  = ctx["criteria_type"]
         criteria_value = ctx["criteria_value"]
-        comp_type = ctx["comp_type"]
+        comp_type      = ctx["comp_type"]
+        request_type   = ctx["request_type"]
+        client_name    = ctx["client_name"]
+        final_dir      = ctx["final_dir"]
+        path_date      = ctx["path_date"]
 
         if criteria_type == "age":
             date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
-            condition = f"dob {'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
+            condition   = f"dob {'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
         elif criteria_type == "state":
             if isinstance(criteria_value, str):
                 criteria_value = [x.strip() for x in criteria_value.split(",")]
-            states = "','".join(criteria_value)
+            states    = "','".join(criteria_value)
             condition = f"STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
         else:
             raise Exception(f"Unsupported criteria_type {criteria_type}")
@@ -379,17 +408,82 @@ def process_orange(request_id: int) -> dict:
         os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
         run_command(["snowsql", "-c", "datateam1", "-q", sql])
 
+        # Download raw S3 parts into a temp folder and combine
         update_request_status(request_id, "Combining Data", channel_status)
-        output_path = Path(ctx["final_dir"]) / "ORANGE_OP_PATH"
-        _download_and_combine(ctx["s3_path"], output_path, ctx["final_dir"], ctx["output_file"])
+        raw_combined = f"ORANGE_RAW_{path_date}.csv"
+        output_path  = Path(final_dir) / "ORANGE_OP_PATH"
+        _download_and_combine(ctx["s3_path"], output_path, final_dir, raw_combined)
+
+        # Load combined file: columns -> email_address | account_name
+        df_final = pd.read_csv(
+            str(Path(final_dir) / raw_combined),
+            sep="|",
+            header=None,
+            names=["email_address", "account_name"],
+            dtype=str,
+        )
+        total_count = len(df_final)
+        logger.info("ORANGE raw records: %d", total_count)
 
         update_request_status(request_id, "Posting To FTP", channel_status)
-        _post_to_ftp(ctx["final_dir"], ctx["path_date"], ctx["output_file"])
+
+        # ---- Change 1: suppression vs mailing --------------------------------
+        if request_type.lower() == "suppression":
+            # --- suppression: unique email-only CSV ---------------------------
+            output_file     = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
+            suppression_path = Path(final_dir) / output_file
+            (
+                df_final[["email_address"]]
+                .drop_duplicates()
+                .to_csv(suppression_path, index=False, header=False)
+            )
+            # remove intermediate raw file
+            run_command(f"rm -f {raw_combined}", cwd=final_dir)
+            record_count = len(pd.read_csv(suppression_path, header=None))
+            logger.info("ORANGE suppression file: %s (%d records)", output_file, record_count)
+
+            _post_to_ftp(final_dir, path_date, output_file)
+
+        else:
+            # --- mailing: ESP-wise split + ZIP --------------------------------
+            esp_split_dir = Path(final_dir) / "ORANGE_OP_PATH"
+            esp_split_dir.mkdir(exist_ok=True)
+
+            esp_names = (
+                df_final["account_name"].drop_duplicates().sort_values().tolist()
+            )
+            for esp in esp_names:
+                df_esp = df_final[df_final["account_name"] == esp][["email_address"]]
+                df_esp.to_csv(
+                    esp_split_dir / f"{esp}_ORANGE_DATA.csv",
+                    index=False,
+                    header=False,
+                )
+                logger.info("ESP split: %s -> %d emails", esp, len(df_esp))
+
+            output_file = (
+                f"{client_name}_{request_type}_{channel_name}_{path_date}.zip"
+            )
+            zip_file = Path(final_dir) / output_file
+            run_command(
+                ["zip", "-r", zip_file.name, esp_split_dir.name],
+                cwd=final_dir,
+            )
+            # cleanup split folder and raw combined file
+            run_command(
+                f"rm -rf {esp_split_dir.name} && rm -f {raw_combined}",
+                cwd=final_dir,
+            )
+            record_count = total_count
+            logger.info("ORANGE mailing ZIP: %s (%d records)", output_file, record_count)
+
+            _post_to_ftp(final_dir, path_date, output_file)
+        # ----------------------------------------------------------------------
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status)
         logger.info("%s processing completed in %.2f seconds", channel_name, elapsed)
-        return _success_result(channel_name, ctx["final_dir"], ctx["output_file"], elapsed)
+        return _success_result(channel_name, final_dir, output_file, elapsed, record_count)
 
     except Exception as e:
         update_request_status(request_id, "Failed", channel_status)
@@ -397,6 +491,10 @@ def process_orange(request_id: int) -> dict:
         send_error_email(f"{channel_name} Processing Failed", str(e))
         raise
 
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
 
 def process_channel(request_id: int, channel_name: str) -> dict:
     channel_name = channel_name.upper()
@@ -414,11 +512,11 @@ def process_age_state_request(request_id: int, channel: str = "ALL") -> Dict[str
     if not request_data:
         raise Exception(f"Request ID {request_id} not found")
 
-    criteria_type = request_data["criteria_type"]
+    criteria_type  = request_data["criteria_type"]
     criteria_value = request_data["criteria_value"]
-    comp_type = request_data["comp_type"]
-    output_dir = ensure_output_dir(request_data["output_dir"], criteria_type)
-    final_dir = ensure_final_files_dir(output_dir)
+    comp_type      = request_data["comp_type"]
+    output_dir     = ensure_output_dir(request_data["output_dir"], criteria_type)
+    final_dir      = ensure_final_files_dir(output_dir)
 
     global logger
     logger = setup_logging(output_dir, criteria_type)
@@ -431,9 +529,7 @@ def process_age_state_request(request_id: int, channel: str = "ALL") -> Dict[str
             raise ValueError(f"Unsupported channel: {channel}")
         channels_to_run = [selected]
 
-    logger.info(
-        "Started request_id=%s for channels=%s", request_id, ",".join(channels_to_run)
-    )
+    logger.info("Started request_id=%s for channels=%s", request_id, ",".join(channels_to_run))
     results: Dict[str, dict] = {}
 
     try:
@@ -490,5 +586,5 @@ if __name__ == "__main__":
         raise SystemExit("Usage: python age_state_new.py <request_id> [channel|ALL]")
 
     request_id = int(sys.argv[1])
-    channel = sys.argv[2] if len(sys.argv) > 2 else "ALL"
+    channel    = sys.argv[2] if len(sys.argv) > 2 else "ALL"
     process_age_state_request(request_id, channel)
