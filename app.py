@@ -120,7 +120,6 @@ def get_user_by_username(username):
 
 
 def is_request_name_taken(name):
-    """Return True if request_name already exists in requests table."""
     conn = get_db()
     try:
         with conn.cursor() as cur:
@@ -276,6 +275,29 @@ def fetch_dashboard_stats():
         conn.close()
 
 
+def build_chart_data(stats):
+    """Build chart-friendly data dict from dashboard stats for the template."""
+    by_type     = stats.get("by_type", {})
+    by_criteria = stats.get("by_criteria", {})
+    by_channel  = stats.get("by_channel", {})
+
+    type_labels    = list(by_type.keys())
+    type_values    = [v["total"]     for v in by_type.values()]
+    type_completed = [v["completed"] for v in by_type.values()]
+    type_failed    = [v["failed"]    for v in by_type.values()]
+
+    return {
+        "type_labels":      type_labels    if type_labels    else ["No data"],
+        "type_values":      type_values    if type_values    else [0],
+        "type_completed":   type_completed if type_completed else [0],
+        "type_failed":      type_failed    if type_failed    else [0],
+        "criteria_labels":  list(by_criteria.keys())  if by_criteria  else ["No data"],
+        "criteria_values":  list(by_criteria.values()) if by_criteria else [0],
+        "channel_labels":   list(by_channel.keys())   if by_channel   else ["No data"],
+        "channel_values":   list(by_channel.values())  if by_channel   else [0],
+    }
+
+
 def find_latest_log(output_dir):
     log_dir = Path(output_dir) / "logs"
     if not log_dir.exists():
@@ -285,7 +307,6 @@ def find_latest_log(output_dir):
 
 
 def build_command(payload, uploaded_zip=None):
-    """Build the CLI command for main.py."""
     cmd = [
         PYTHON_BIN, SCRIPT_NAME,
         "--request-type",  payload["request_type"],
@@ -299,7 +320,7 @@ def build_command(payload, uploaded_zip=None):
         cmd.extend(["--age", str(payload["criteria_value"])])
     elif criteria == "state":
         cmd.extend(["--states"] + payload["criteria_value"].split(","))
-    else:  # zips or doordash
+    else:
         cmd.extend(["--zip-file", str(uploaded_zip)])
     return cmd
 
@@ -370,8 +391,11 @@ def logout():
 def dashboard():
     stats = fetch_dashboard_stats()
     recent = fetch_all_requests(limit=10)
+    chart_data = build_chart_data(stats)
     return render_template('dashboard_home.html',
-                           stats=stats, recent=recent,
+                           stats=stats,
+                           recent=recent,
+                           chart_data=chart_data,
                            username=session.get('username'),
                            active_page='dashboard')
 
@@ -396,7 +420,6 @@ def requests_list():
                            active_page='requests')
 
 
-# Legacy home redirect
 @app.route('/home')
 @login_required
 def home():
@@ -408,7 +431,6 @@ def home():
 @app.route('/api/check-name')
 @login_required
 def api_check_name():
-    """Check if a request_name is already taken."""
     name = request.args.get('name', '').strip()
     if not name:
         return jsonify({'available': False, 'error': 'Name is empty'})
@@ -437,15 +459,14 @@ def submit_request():
     form = request.form
     zip_file_upload = request.files.get('zip_file')
 
-    request_name  = form.get('request_name', '').strip()
-    request_type  = form.get('request_type', '').strip()
-    client_name   = form.get('client_name', '').strip()
-    criteria_type = form.get('criteria_type', '').strip().lower()
-    comp_type     = form.get('comp_type', '').strip().lower()
-    channel       = form.get('channel', 'ALL').strip().upper()
+    request_name   = form.get('request_name', '').strip()
+    request_type   = form.get('request_type', '').strip()
+    client_name    = form.get('client_name', '').strip()
+    criteria_type  = form.get('criteria_type', '').strip().lower()
+    comp_type      = form.get('comp_type', '').strip().lower()
+    channel        = form.get('channel', 'ALL').strip().upper()
     criteria_value = form.get('criteria_value', '').strip()
 
-    # ── Validations ──
     if not request_name:
         return jsonify({'ok': False, 'error': 'Request Name is required.'}), 400
     if is_request_name_taken(request_name):
@@ -455,20 +476,17 @@ def submit_request():
     if criteria_type not in {'age', 'state', 'zips'}:
         return jsonify({'ok': False, 'error': 'Criteria type must be age, state, or zips.'}), 400
 
-    # Doordash overrides
     if request_type == 'Doordash':
         client_name   = 'Doordash'
         criteria_type = 'zips'
         comp_type     = 'include'
         channel       = 'ALL'
 
-    # Comp type validation
     if criteria_type == 'age' and comp_type not in {'greater', 'less'}:
         return jsonify({'ok': False, 'error': 'Age criteria requires comp type greater or less.'}), 400
     if criteria_type in {'state', 'zips'} and comp_type not in {'include', 'exclude'}:
         return jsonify({'ok': False, 'error': 'State/Zips criteria requires include or exclude comp type.'}), 400
 
-    # Criteria value validation
     if criteria_type == 'age':
         if not criteria_value.isdigit():
             return jsonify({'ok': False, 'error': 'Valid age number is required.'}), 400
@@ -477,10 +495,9 @@ def submit_request():
         if not states:
             return jsonify({'ok': False, 'error': 'At least one state code is required.'}), 400
         criteria_value = ','.join(s.upper() for s in states)
-    else:  # zips / doordash
-        criteria_value = None  # file-based
+    else:
+        criteria_value = None
 
-    # File upload for zips/doordash
     saved_zip = None
     if criteria_type == 'zips':
         if not zip_file_upload or not zip_file_upload.filename:
@@ -489,7 +506,6 @@ def submit_request():
         saved_zip = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
         zip_file_upload.save(saved_zip)
 
-    # Build output dir
     safe_name = "".join(c if c.isalnum() or c in '-_' else '_' for c in request_name)
     output_dir = str(BASE_DIR / "output" / safe_name)
 
