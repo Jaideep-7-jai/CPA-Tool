@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}Dashboard{% endblock %} | CPA Tool</title>
+  <link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="dashboard-shell">
+    <aside class="dashboard-sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-brand">
+          <svg width="32" height="32" viewBox="0 0 40 40" fill="none">
+            <rect width="40" height="40" rx="10" fill="rgba(255,255,255,0.2)"/>
+            <text x="50%" y="55%" dominant-baseline="middle" text-anchor="middle" fill="white" font-size="14" font-weight="700" font-family="Satoshi,sans-serif">CPA</text>
+          </svg>
+          <div>
+            <h2>CPA Tool</h2>
+            <p>Request Portal</p>
+          </div>
+        </div>
+      </div>
+      <nav class="sidebar-nav">
+        <a href="{{ url_for('dashboard') }}" class="nav-button {% if active_page == 'dashboard' %}active{% endif %}">
+          <span class="icon">📊</span><span class="label">Dashboard</span>
+        </a>
+        <a href="{{ url_for('new_request') }}" class="nav-button {% if active_page == 'new_request' %}active{% endif %}">
+          <span class="icon">➕</span><span class="label">New Request</span>
+        </a>
+        <a href="{{ url_for('requests_list') }}" class="nav-button {% if active_page == 'requests' %}active{% endif %}">
+          <span class="icon">📋</span><span class="label">All Requests</span>
+        </a>
+      </nav>
+      <div class="sidebar-footer">
+        <span class="user-chip">👤 {{ username }}</span>
+        <a href="{{ url_for('logout') }}" class="logout-btn">Logout</a>
+      </div>
+    </aside>
+    <div class="dashboard-main">
+      <header class="dashboard-topbar">
+        <div class="topbar-left">
+          <h1>{% block page_title %}Dashboard{% endblock %}</h1>
+          {% block breadcrumb %}<span class="breadcrumb">Home</span>{% endblock %}
+        </div>
+      </header>
+      <main class="dashboard-content">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="alert {{ category }}">{{ message }}</div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </div>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

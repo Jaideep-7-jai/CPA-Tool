@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Login | CPA Request Portal</title>
+  <title>Login | CPA Tool</title>
   <link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
@@ -11,8 +11,14 @@
   <main class="auth-shell">
     <section class="auth-card">
       <div class="brand-block">
+        <div class="brand-logo">
+          <svg width="40" height="40" viewBox="0 0 40 40" fill="none" aria-label="CPA Tool">
+            <rect width="40" height="40" rx="10" fill="#01696f"/>
+            <text x="50%" y="55%" dominant-baseline="middle" text-anchor="middle" fill="white" font-size="18" font-weight="700" font-family="Satoshi,sans-serif">CPA</text>
+          </svg>
+        </div>
         <h1>CPA Request Portal</h1>
-        <p>Login to create and track suppression requests.</p>
+        <p>Login to create and manage requests.</p>
       </div>
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
@@ -22,8 +28,8 @@
         {% endif %}
       {% endwith %}
       <form method="post" class="auth-form">
-        <label>Username<input type="text" name="username" required /></label>
-        <label>Password<input type="password" name="password" required /></label>
+        <label>Username<input type="text" name="username" required autocomplete="username" /></label>
+        <label>Password<input type="password" name="password" required autocomplete="current-password" /></label>
         <button type="submit">Login</button>
       </form>
     </section>

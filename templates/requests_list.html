@@ -1,0 +1,114 @@
+{% extends "dashboard.html" %}
+{% block title %}All Requests{% endblock %}
+{% block page_title %}All Requests{% endblock %}
+{% block breadcrumb %}<span class="breadcrumb">Requests</span>{% endblock %}
+
+{% block content %}
+<div class="analytics-container">
+
+  <!-- Filters -->
+  <section class="filters-bar">
+    <input type="text" id="searchInput" placeholder="🔍 Search by name, type, criteria..." class="filter-input">
+    <select id="typeFilter" class="filter-select">
+      <option value="">All Types</option>
+      <option value="Suppression">Suppression</option>
+      <option value="Mailing">Mailing</option>
+      <option value="Doordash">Doordash</option>
+    </select>
+    <select id="criteriaFilter" class="filter-select">
+      <option value="">All Criteria</option>
+      <option value="age">Age</option>
+      <option value="state">State</option>
+      <option value="zips">Zips</option>
+    </select>
+    <select id="statusFilter" class="filter-select">
+      <option value="">All Statuses</option>
+      <option value="Completed">Completed</option>
+      <option value="Failed">Failed</option>
+      <option value="In Progress">In Progress</option>
+    </select>
+  </section>
+
+  <section class="table-section">
+    <div class="table-header">
+      <h3>All Requests <span id="rowCount" class="row-count"></span></h3>
+      <a href="{{ url_for('new_request') }}" class="submit-button small">+ New Request</a>
+    </div>
+    <div class="table-scroll">
+      <table class="requests-table" id="requestsTable">
+        <thead>
+          <tr>
+            <th>Request Name</th>
+            <th>Type</th>
+            <th>Criteria</th>
+            <th>Value</th>
+            <th>Comp</th>
+            <th>Channel</th>
+            <th>Green</th>
+            <th>Blue</th>
+            <th>Arcamax</th>
+            <th>Orange</th>
+            <th>Overall</th>
+            <th>Created By</th>
+            <th>Created At</th>
+          </tr>
+        </thead>
+        <tbody id="requestsBody">
+          {% for r in requests %}
+          <tr>
+            <td><strong>{{ r.request_name }}</strong></td>
+            <td><span class="badge-type {{ r.request_type|lower }}">{{ r.request_type }}</span></td>
+            <td><span class="badge-criteria">{{ r.criteria_type|upper }}</span></td>
+            <td class="muted small">{{ r.criteria_value or '-' }}</td>
+            <td class="muted small">{{ r.comp_type }}</td>
+            <td><span class="tag">{{ r.channel }}</span></td>
+            <td><span class="badge-status {{ (r.GREEN_STATUS or 'pending')|lower }}">{{ r.GREEN_STATUS or '-' }}</span></td>
+            <td><span class="badge-status {{ (r.BLUE_STATUS or 'pending')|lower }}">{{ r.BLUE_STATUS or '-' }}</span></td>
+            <td><span class="badge-status {{ (r.ARCAMAX_STATUS or 'pending')|lower }}">{{ r.ARCAMAX_STATUS or '-' }}</span></td>
+            <td><span class="badge-status {{ (r.ORANGE_STATUS or 'pending')|lower }}">{{ r.ORANGE_STATUS or '-' }}</span></td>
+            <td><span class="badge {{ r.overall_status|lower }}">{{ r.overall_status }}</span></td>
+            <td>{{ r.username }}</td>
+            <td class="muted small">{{ r.created_at }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="13" class="text-center muted">No requests found.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Client-side filtering
+const search = document.getElementById('searchInput');
+const typeF  = document.getElementById('typeFilter');
+const critF  = document.getElementById('criteriaFilter');
+const statF  = document.getElementById('statusFilter');
+const tbody  = document.getElementById('requestsBody');
+const countEl = document.getElementById('rowCount');
+
+function filterRows() {
+  const q    = search.value.toLowerCase();
+  const type = typeF.value.toLowerCase();
+  const crit = critF.value.toLowerCase();
+  const stat = statF.value.toLowerCase();
+  let visible = 0;
+  tbody.querySelectorAll('tr').forEach(tr => {
+    const txt = tr.textContent.toLowerCase();
+    const show = (!q || txt.includes(q))
+              && (!type || txt.includes(type))
+              && (!crit || txt.includes(crit))
+              && (!stat || txt.includes(stat));
+    tr.style.display = show ? '' : 'none';
+    if (show) visible++;
+  });
+  countEl.textContent = `(${visible})`;
+}
+
+[search, typeF, critF, statF].forEach(el => el.addEventListener('input', filterRows));
+filterRows();
+</script>
+{% endblock %}
