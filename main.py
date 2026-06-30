@@ -1,70 +1,74 @@
-import json
+#!/usr/bin/env python3
+"""
+CPA Tool – Entry point
+Routes incoming requests to the correct processing module:
+  age / state  → AGE_STATE/age_state_new.py
+  zips         → ZIPS/zips.py  (Suppression / Mailing)
+  doordash     → ZIPS/zips.py  (Doordash mode)
+"""
+
+import argparse
 import sys
-import os
-from AGE_STATE import process_age_state_all_channels
-from config import SNOWSQL_PASSPHRASE
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE_DIR))
 
 
-def load_config(path):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"{path} not found")
-
-    with open(path) as f:
-        return json.load(f)
-
-
-def validate(config):
-    required_fields = ["criteria", "comp", "value", "output_dir", "user", "client", "request_type"]
-
-    for field in required_fields:
-        if field not in config:
-            raise ValueError(f"Missing required field: {field}")
-
-    criteria = config["criteria"]
-    comp = config["comp"]
-    value = config["value"]
-
-    if criteria not in ["age", "state"]:
-        raise ValueError("criteria must be 'age' or 'state'")
-
-    if criteria == "age":
-        if comp not in ["greater", "less"]:
-            raise ValueError("comp must be greater/less for age")
-        if not isinstance(value, int):
-            raise ValueError("value must be integer for age")
-
-    if criteria == "state":
-        if comp not in ["include", "exclude"]:
-            raise ValueError("comp must be include/exclude for state")
-        if not isinstance(value, list):
-            raise ValueError("value must be list for state")
+def parse_args():
+    parser = argparse.ArgumentParser(description="CPA Tool – request processor")
+    parser.add_argument("--request-type",  required=True,
+                        choices=["Suppression", "Mailing", "Doordash"],
+                        help="Type of request")
+    parser.add_argument("--criteria-type", required=True,
+                        choices=["age", "state", "zips"],
+                        help="Criteria type")
+    parser.add_argument("--comp-type",     required=True,
+                        choices=["greater", "less", "include", "exclude"],
+                        help="Comparison / inclusion type")
+    parser.add_argument("--channel",       required=True,
+                        choices=["ALL", "GREEN", "BLUE", "ORANGE", "ARCAMAX"],
+                        help="Channel to process")
+    parser.add_argument("--output-dir",    required=True,
+                        help="Output directory")
+    # Criteria-specific args
+    parser.add_argument("--age",           type=int, default=None)
+    parser.add_argument("--states",        nargs="+", default=None)
+    parser.add_argument("--zip-file",      default=None,
+                        help="Path to uploaded ZIP codes file")
+    return parser.parse_args()
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python main.py <config.json>")
-        sys.exit(1)
+    args = parse_args()
 
-    config_path = sys.argv[1]
+    criteria = args.criteria_type.lower()
+    req_type = args.request_type
 
-    try:
-        config = load_config(config_path)
-        validate(config)
-
-        os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-
-        process_age_state_all_channels(
-            config["criteria"],
-            config["value"],
-            config["comp"],
-            config["output_dir"],
-            config["user"],
-            config["client"],
-            config["request_type"]
+    if criteria in ("age", "state"):
+        from AGE_STATE.age_state_new import process_age_state
+        process_age_state(
+            request_type=req_type,
+            criteria=criteria,
+            comp_type=args.comp_type,
+            channel=args.channel,
+            age=args.age,
+            states=args.states,
+            output_dir=args.output_dir,
         )
 
-    except Exception as e:
-        print(f"ERROR: {e}")
+    elif criteria == "zips":
+        from ZIPS.zips import process_zip_request
+        process_zip_request(
+            request_type=req_type,
+            zip_file=args.zip_file,
+            comp_type=args.comp_type,
+            channel=args.channel,
+            output_dir=args.output_dir,
+        )
+
+    else:
+        print(f"[ERROR] Unknown criteria type: {criteria}", file=sys.stderr)
         sys.exit(1)
 
 

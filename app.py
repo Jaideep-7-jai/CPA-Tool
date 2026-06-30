@@ -69,31 +69,33 @@ def init_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS requests (
                     id INT AUTO_INCREMENT PRIMARY KEY,
-                    request_uuid VARCHAR(64) NOT NULL UNIQUE,
-                    created_by INT NOT NULL,
-                    criteria ENUM('age','state','zip') NOT NULL,
-                    comp ENUM('greater','less','include','exclude') NOT NULL,
-                    age INT NULL,
-                    states VARCHAR(500) NULL,
-                    zip_file_path VARCHAR(500) NULL,
-                    output_dir VARCHAR(255) NOT NULL,
-                    status ENUM('inprogress','completed','failed') NOT NULL DEFAULT 'inprogress',
-                    command_text TEXT NULL,
-                    log_file VARCHAR(500) NULL,
-                    stdout_text MEDIUMTEXT NULL,
-                    stderr_text MEDIUMTEXT NULL,
-                    return_code INT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    started_at DATETIME NULL,
-                    finished_at DATETIME NULL,
+                    request_uuid    VARCHAR(64)  NOT NULL UNIQUE,
+                    request_name    VARCHAR(255) NOT NULL UNIQUE,
+                    request_type    ENUM('Suppression','Mailing','Doordash') NOT NULL DEFAULT 'Suppression',
+                    client_name     VARCHAR(255) NOT NULL DEFAULT '',
+                    created_by      INT NOT NULL,
+                    criteria_type   ENUM('age','state','zips') NOT NULL,
+                    comp_type       ENUM('greater','less','include','exclude') NOT NULL DEFAULT 'include',
+                    channel         ENUM('ALL','GREEN','BLUE','ORANGE','ARCAMAX') NOT NULL DEFAULT 'ALL',
+                    criteria_value  VARCHAR(500) NULL,
+                    zip_file_path   VARCHAR(500) NULL,
+                    output_dir      VARCHAR(255) NOT NULL,
+                    overall_status  ENUM('inprogress','completed','failed') NOT NULL DEFAULT 'inprogress',
+                    command_text    TEXT NULL,
+                    log_file        VARCHAR(500) NULL,
+                    stdout_text     MEDIUMTEXT NULL,
+                    stderr_text     MEDIUMTEXT NULL,
+                    return_code     INT NULL,
+                    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    started_at      DATETIME NULL,
+                    finished_at     DATETIME NULL,
                     FOREIGN KEY (created_by) REFERENCES users(id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
             admin_user = os.getenv("APP_DEFAULT_ADMIN", "admin")
             admin_pass = os.getenv("APP_DEFAULT_ADMIN_PASSWORD", "admin123")
             cur.execute("SELECT id FROM users WHERE username=%s", (admin_user,))
-            row = cur.fetchone()
-            if not row:
+            if not cur.fetchone():
                 cur.execute(
                     "INSERT INTO users (username, password_hash) VALUES (%s, %s)",
                     (admin_user, generate_password_hash(admin_pass)),
@@ -101,6 +103,8 @@ def init_db():
     finally:
         conn.close()
 
+
+# ─── DB helpers ───────────────────────────────────────────────
 
 def get_user_by_username(username):
     conn = get_db()
@@ -115,6 +119,17 @@ def get_user_by_username(username):
         conn.close()
 
 
+def is_request_name_taken(name):
+    """Return True if request_name already exists in requests table."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM requests WHERE request_name=%s", (name,))
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
 def insert_request(record):
     conn = get_db()
     try:
@@ -122,16 +137,20 @@ def insert_request(record):
             cur.execute(
                 """
                 INSERT INTO requests (
-                    request_uuid, created_by, criteria, comp, age, states, zip_file_path,
-                    output_dir, status, command_text, log_file, stdout_text, stderr_text,
+                    request_uuid, request_name, request_type, client_name,
+                    created_by, criteria_type, comp_type, channel,
+                    criteria_value, zip_file_path, output_dir, overall_status,
+                    command_text, log_file, stdout_text, stderr_text,
                     return_code, started_at, finished_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
-                    record["request_uuid"], record["created_by"], record["criteria"], record["comp"],
-                    record.get("age"), record.get("states"), record.get("zip_file_path"),
-                    record["output_dir"], record["status"], record.get("command_text"),
-                    record.get("log_file"), record.get("stdout_text", ""), record.get("stderr_text", ""),
+                    record["request_uuid"], record["request_name"], record["request_type"],
+                    record["client_name"], record["created_by"], record["criteria_type"],
+                    record["comp_type"], record["channel"], record.get("criteria_value"),
+                    record.get("zip_file_path"), record["output_dir"], record["overall_status"],
+                    record.get("command_text"), record.get("log_file"),
+                    record.get("stdout_text", ""), record.get("stderr_text", ""),
                     record.get("return_code"), record.get("started_at"), record.get("finished_at")
                 )
             )
@@ -142,7 +161,8 @@ def insert_request(record):
 def update_request_db(request_uuid, **kwargs):
     if not kwargs:
         return
-    allowed = {"status", "command_text", "log_file", "stdout_text", "stderr_text", "return_code", "started_at", "finished_at"}
+    allowed = {"overall_status", "command_text", "log_file", "stdout_text",
+               "stderr_text", "return_code", "started_at", "finished_at"}
     fields, values = [], []
     for key, value in kwargs.items():
         if key in allowed:
@@ -159,61 +179,101 @@ def update_request_db(request_uuid, **kwargs):
         conn.close()
 
 
-def fetch_requests_for_sidebar():
+def fetch_all_requests(limit=200):
     conn = get_db()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT r.request_uuid, r.criteria, r.comp, r.age, r.states, r.zip_file_path,
-                       r.output_dir, r.status, r.created_at, r.return_code, u.username
+                SELECT r.request_uuid, r.request_name, r.request_type, r.client_name,
+                       r.criteria_type, r.comp_type, r.channel, r.criteria_value,
+                       r.zip_file_path, r.output_dir, r.overall_status,
+                       r.created_at, r.started_at, r.finished_at, r.return_code, u.username
                 FROM requests r
                 JOIN users u ON u.id = r.created_by
                 ORDER BY r.id DESC
-            """)
+                LIMIT %s
+            """, (limit,))
             rows = cur.fetchall()
             return [{
-                "request_uuid": row[0], "criteria": row[1], "comp": row[2], "age": row[3],
-                "states": row[4], "zip_file_path": row[5], "output_dir": row[6], "status": row[7],
-                "created_at": str(row[8]), "return_code": row[9], "username": row[10]
+                "request_uuid":   row[0],
+                "request_name":   row[1],
+                "request_type":   row[2],
+                "client_name":    row[3],
+                "criteria_type":  row[4],
+                "comp_type":      row[5],
+                "channel":        row[6],
+                "criteria_value": row[7],
+                "zip_file_path":  row[8],
+                "output_dir":     row[9],
+                "overall_status": row[10],
+                "created_at":     str(row[11]),
+                "started_at":     str(row[12]) if row[12] else None,
+                "finished_at":    str(row[13]) if row[13] else None,
+                "return_code":    row[14],
+                "username":       row[15],
             } for row in rows]
     finally:
         conn.close()
 
 
-def validate_payload(form, has_file=False):
-    criteria = form.get("criteria", "").strip().lower()
-    comp = form.get("comp", "").strip().lower()
-    if criteria not in {"age", "state", "zip"}:
-        return False, "Criteria must be one of age, state, or zip."
-    if criteria == "age":
-        if comp not in {"greater", "less"}:
-            return False, "Age supports only greater or less."
-        if not form.get("age", "").strip().isdigit():
-            return False, "Valid age is required."
-    else:
-        if comp not in {"include", "exclude"}:
-            return False, "State and zip support only include or exclude."
-    if criteria == "state":
-        states = [s.strip() for s in form.get("states", "").split(",") if s.strip()]
-        if not states:
-            return False, "At least one state is required."
-    if criteria == "zip" and not has_file:
-        return False, "ZIP file upload is required for zip criteria."
-    return True, ""
+def fetch_dashboard_stats():
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(overall_status='completed') AS completed,
+                    SUM(overall_status='failed') AS failed,
+                    SUM(overall_status='inprogress') AS inprogress,
+                    COUNT(DISTINCT request_type) AS types
+                FROM requests
+            """)
+            row = cur.fetchone()
+            total = row[0] or 0
+            completed = int(row[1] or 0)
+            failed = int(row[2] or 0)
+            inprogress = int(row[3] or 0)
 
+            # by_type breakdown
+            cur.execute("""
+                SELECT request_type,
+                       SUM(overall_status='completed') AS completed,
+                       SUM(overall_status='failed') AS failed,
+                       COUNT(*) AS total
+                FROM requests GROUP BY request_type
+            """)
+            by_type = {}
+            for r in cur.fetchall():
+                by_type[r[0]] = {"completed": int(r[1] or 0), "failed": int(r[2] or 0), "total": int(r[3] or 0)}
 
-def normalize_payload(form):
-    criteria = form.get("criteria", "").strip().lower()
-    payload = {
-        "criteria": criteria,
-        "comp": form.get("comp", "").strip().lower(),
-        "output_dir": form.get("output_dir", "./output").strip() or "./output",
-    }
-    if criteria == "age":
-        payload["age"] = int(form.get("age"))
-    elif criteria == "state":
-        payload["states"] = [s.strip().upper() for s in form.get("states", "").split(",") if s.strip()]
-    return payload
+            # by_criteria breakdown
+            cur.execute("""
+                SELECT criteria_type, COUNT(*) AS total
+                FROM requests GROUP BY criteria_type
+            """)
+            by_criteria = {r[0]: int(r[1] or 0) for r in cur.fetchall()}
+
+            # by_channel breakdown
+            cur.execute("""
+                SELECT channel, COUNT(*) AS total
+                FROM requests GROUP BY channel
+            """)
+            by_channel = {r[0]: int(r[1] or 0) for r in cur.fetchall()}
+
+            return {
+                "total": total,
+                "completed": completed,
+                "failed": failed,
+                "inprogress": inprogress,
+                "completed_pct": round(completed / total * 100) if total else 0,
+                "failed_pct": round(failed / total * 100) if total else 0,
+                "by_type": by_type,
+                "by_criteria": by_criteria,
+                "by_channel": by_channel,
+            }
+    finally:
+        conn.close()
 
 
 def find_latest_log(output_dir):
@@ -225,13 +285,21 @@ def find_latest_log(output_dir):
 
 
 def build_command(payload, uploaded_zip=None):
-    cmd = [PYTHON_BIN, SCRIPT_NAME, "--criteria", payload["criteria"], "--comp", payload["comp"], "--output-dir", payload["output_dir"]]
-    if payload["criteria"] == "age":
-        cmd.extend(["--age", str(payload["age"])])
-    elif payload["criteria"] == "state":
-        cmd.append("--states")
-        cmd.extend(payload["states"])
-    else:
+    """Build the CLI command for main.py."""
+    cmd = [
+        PYTHON_BIN, SCRIPT_NAME,
+        "--request-type",  payload["request_type"],
+        "--criteria-type", payload["criteria_type"],
+        "--comp-type",     payload["comp_type"],
+        "--channel",       payload["channel"],
+        "--output-dir",    payload["output_dir"],
+    ]
+    criteria = payload["criteria_type"]
+    if criteria == "age":
+        cmd.extend(["--age", str(payload["criteria_value"])])
+    elif criteria == "state":
+        cmd.extend(["--states"] + payload["criteria_value"].split(","))
+    else:  # zips or doordash
         cmd.extend(["--zip-file", str(uploaded_zip)])
     return cmd
 
@@ -239,7 +307,7 @@ def build_command(payload, uploaded_zip=None):
 def run_job(request_uuid, cmd, output_dir):
     update_request_db(
         request_uuid,
-        status="inprogress",
+        overall_status="inprogress",
         started_at=now_str(),
         command_text=" ".join(shlex.quote(c) for c in cmd)
     )
@@ -254,7 +322,7 @@ def run_job(request_uuid, cmd, output_dir):
         stderr_text = proc.stderr.decode("utf-8", "ignore") if proc.stderr else ""
         update_request_db(
             request_uuid,
-            status="completed" if proc.returncode == 0 else "failed",
+            overall_status="completed" if proc.returncode == 0 else "failed",
             finished_at=now_str(),
             return_code=proc.returncode,
             stdout_text=stdout_text[-20000:],
@@ -264,12 +332,15 @@ def run_job(request_uuid, cmd, output_dir):
     except Exception as exc:
         update_request_db(
             request_uuid,
-            status="failed",
+            overall_status="failed",
             finished_at=now_str(),
             return_code=-1,
             stderr_text=str(exc),
             log_file=find_latest_log(output_dir),
         )
+
+
+# ─── Auth routes ──────────────────────────────────────────────
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -280,7 +351,7 @@ def login():
         if user and check_password_hash(user['password_hash'], password):
             session['user_id'] = user['id']
             session['username'] = user['username']
-            return redirect(url_for('home'))
+            return redirect(url_for('dashboard'))
         flash('Invalid username or password', 'error')
     return render_template('login.html')
 
@@ -292,53 +363,172 @@ def logout():
     return redirect(url_for('login'))
 
 
+# ─── Page routes ──────────────────────────────────────────────
+
 @app.route('/')
 @login_required
+def dashboard():
+    stats = fetch_dashboard_stats()
+    recent = fetch_all_requests(limit=10)
+    return render_template('dashboard_home.html',
+                           stats=stats, recent=recent,
+                           username=session.get('username'),
+                           active_page='dashboard')
+
+
+@app.route('/new-request')
+@login_required
+def new_request():
+    recent = fetch_all_requests(limit=20)
+    return render_template('new_request.html',
+                           recent=recent,
+                           username=session.get('username'),
+                           active_page='new_request')
+
+
+@app.route('/requests')
+@login_required
+def requests_list():
+    all_reqs = fetch_all_requests(limit=500)
+    return render_template('requests_list.html',
+                           requests=all_reqs,
+                           username=session.get('username'),
+                           active_page='requests')
+
+
+# Legacy home redirect
+@app.route('/home')
+@login_required
 def home():
-    return render_template('home.html', requests_data=fetch_requests_for_sidebar(), username=session.get('username'))
+    return redirect(url_for('dashboard'))
+
+
+# ─── API routes ───────────────────────────────────────────────
+
+@app.route('/api/check-name')
+@login_required
+def api_check_name():
+    """Check if a request_name is already taken."""
+    name = request.args.get('name', '').strip()
+    if not name:
+        return jsonify({'available': False, 'error': 'Name is empty'})
+    taken = is_request_name_taken(name)
+    return jsonify({'available': not taken})
 
 
 @app.route('/api/requests')
 @login_required
 def api_requests():
-    return jsonify({'items': fetch_requests_for_sidebar()})
+    return jsonify({'items': fetch_all_requests()})
+
+
+@app.route('/api/analytics')
+@login_required
+def api_analytics():
+    stats = fetch_dashboard_stats()
+    recent = fetch_all_requests(limit=10)
+    stats['recent_requests'] = recent
+    return jsonify(stats)
 
 
 @app.route('/api/submit', methods=['POST'])
 @login_required
 def submit_request():
-    zip_file = request.files.get('zip_file')
-    ok, message = validate_payload(request.form, has_file=bool(zip_file and zip_file.filename))
-    if not ok:
-        return jsonify({'ok': False, 'error': message}), 400
-    payload = normalize_payload(request.form)
+    form = request.form
+    zip_file_upload = request.files.get('zip_file')
+
+    request_name  = form.get('request_name', '').strip()
+    request_type  = form.get('request_type', '').strip()
+    client_name   = form.get('client_name', '').strip()
+    criteria_type = form.get('criteria_type', '').strip().lower()
+    comp_type     = form.get('comp_type', '').strip().lower()
+    channel       = form.get('channel', 'ALL').strip().upper()
+    criteria_value = form.get('criteria_value', '').strip()
+
+    # ── Validations ──
+    if not request_name:
+        return jsonify({'ok': False, 'error': 'Request Name is required.'}), 400
+    if is_request_name_taken(request_name):
+        return jsonify({'ok': False, 'error': f'Request name "{request_name}" is already taken.'}), 400
+    if request_type not in {'Suppression', 'Mailing', 'Doordash'}:
+        return jsonify({'ok': False, 'error': 'Invalid request type.'}), 400
+    if criteria_type not in {'age', 'state', 'zips'}:
+        return jsonify({'ok': False, 'error': 'Criteria type must be age, state, or zips.'}), 400
+
+    # Doordash overrides
+    if request_type == 'Doordash':
+        client_name   = 'Doordash'
+        criteria_type = 'zips'
+        comp_type     = 'include'
+        channel       = 'ALL'
+
+    # Comp type validation
+    if criteria_type == 'age' and comp_type not in {'greater', 'less'}:
+        return jsonify({'ok': False, 'error': 'Age criteria requires comp type greater or less.'}), 400
+    if criteria_type in {'state', 'zips'} and comp_type not in {'include', 'exclude'}:
+        return jsonify({'ok': False, 'error': 'State/Zips criteria requires include or exclude comp type.'}), 400
+
+    # Criteria value validation
+    if criteria_type == 'age':
+        if not criteria_value.isdigit():
+            return jsonify({'ok': False, 'error': 'Valid age number is required.'}), 400
+    elif criteria_type == 'state':
+        states = [s.strip() for s in criteria_value.split(',') if s.strip()]
+        if not states:
+            return jsonify({'ok': False, 'error': 'At least one state code is required.'}), 400
+        criteria_value = ','.join(s.upper() for s in states)
+    else:  # zips / doordash
+        criteria_value = None  # file-based
+
+    # File upload for zips/doordash
     saved_zip = None
-    if payload['criteria'] == 'zip' and zip_file and zip_file.filename:
-        suffix = Path(zip_file.filename).suffix or '.csv'
+    if criteria_type == 'zips':
+        if not zip_file_upload or not zip_file_upload.filename:
+            return jsonify({'ok': False, 'error': 'A ZIP codes file is required for zips/Doordash requests.'}), 400
+        suffix = Path(zip_file_upload.filename).suffix or '.csv'
         saved_zip = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
-        zip_file.save(saved_zip)
-    request_uuid = uuid.uuid4().hex
+        zip_file_upload.save(saved_zip)
+
+    # Build output dir
+    safe_name = "".join(c if c.isalnum() or c in '-_' else '_' for c in request_name)
+    output_dir = str(BASE_DIR / "output" / safe_name)
+
+    payload = {
+        "request_type":   request_type,
+        "criteria_type":  criteria_type,
+        "comp_type":      comp_type,
+        "channel":        channel,
+        "criteria_value": criteria_value,
+        "output_dir":     output_dir,
+    }
+
     cmd = build_command(payload, saved_zip)
+    request_uuid = uuid.uuid4().hex
+
     insert_request({
-        'request_uuid': request_uuid,
-        'created_by': session['user_id'],
-        'criteria': payload['criteria'],
-        'comp': payload['comp'],
-        'age': payload.get('age'),
-        'states': ','.join(payload.get('states', [])) if payload.get('states') else None,
-        'zip_file_path': str(saved_zip) if saved_zip else None,
-        'output_dir': payload['output_dir'],
-        'status': 'inprogress',
-        'command_text': ' '.join(shlex.quote(c) for c in cmd),
-        'log_file': None,
-        'stdout_text': '',
-        'stderr_text': '',
-        'return_code': None,
-        'started_at': None,
-        'finished_at': None,
+        "request_uuid":   request_uuid,
+        "request_name":   request_name,
+        "request_type":   request_type,
+        "client_name":    client_name,
+        "created_by":     session['user_id'],
+        "criteria_type":  criteria_type,
+        "comp_type":      comp_type,
+        "channel":        channel,
+        "criteria_value": criteria_value,
+        "zip_file_path":  str(saved_zip) if saved_zip else None,
+        "output_dir":     output_dir,
+        "overall_status": "inprogress",
+        "command_text":   " ".join(shlex.quote(c) for c in cmd),
+        "log_file":       None,
+        "stdout_text":    "",
+        "stderr_text":    "",
+        "return_code":    None,
+        "started_at":     None,
+        "finished_at":    None,
     })
-    threading.Thread(target=run_job, args=(request_uuid, cmd, payload['output_dir']), daemon=True).start()
-    return jsonify({'ok': True, 'request_uuid': request_uuid})
+
+    threading.Thread(target=run_job, args=(request_uuid, cmd, output_dir), daemon=True).start()
+    return jsonify({'ok': True, 'request_uuid': request_uuid, 'request_name': request_name})
 
 
 @app.route('/health')
