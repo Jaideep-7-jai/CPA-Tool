@@ -130,6 +130,7 @@ def is_request_name_taken(name):
 
 
 def insert_request(record):
+    """Insert a new request row and return the auto-increment DB id."""
     conn = get_db()
     try:
         with conn.cursor() as cur:
@@ -153,6 +154,7 @@ def insert_request(record):
                     record.get("return_code"), record.get("started_at"), record.get("finished_at")
                 )
             )
+            return cur.lastrowid   # ← return the new DB id
     finally:
         conn.close()
 
@@ -234,7 +236,6 @@ def fetch_dashboard_stats():
             failed = int(row[2] or 0)
             inprogress = int(row[3] or 0)
 
-            # by_type breakdown
             cur.execute("""
                 SELECT request_type,
                        SUM(overall_status='completed') AS completed,
@@ -246,14 +247,12 @@ def fetch_dashboard_stats():
             for r in cur.fetchall():
                 by_type[r[0]] = {"completed": int(r[1] or 0), "failed": int(r[2] or 0), "total": int(r[3] or 0)}
 
-            # by_criteria breakdown
             cur.execute("""
                 SELECT criteria_type, COUNT(*) AS total
                 FROM requests GROUP BY criteria_type
             """)
             by_criteria = {r[0]: int(r[1] or 0) for r in cur.fetchall()}
 
-            # by_channel breakdown
             cur.execute("""
                 SELECT channel, COUNT(*) AS total
                 FROM requests GROUP BY channel
@@ -276,7 +275,6 @@ def fetch_dashboard_stats():
 
 
 def build_chart_data(stats):
-    """Build chart-friendly data dict from dashboard stats for the template."""
     by_type     = stats.get("by_type", {})
     by_criteria = stats.get("by_criteria", {})
     by_channel  = stats.get("by_channel", {})
@@ -291,10 +289,10 @@ def build_chart_data(stats):
         "type_values":      type_values    if type_values    else [0],
         "type_completed":   type_completed if type_completed else [0],
         "type_failed":      type_failed    if type_failed    else [0],
-        "criteria_labels":  list(by_criteria.keys())  if by_criteria  else ["No data"],
+        "criteria_labels":  list(by_criteria.keys())   if by_criteria else ["No data"],
         "criteria_values":  list(by_criteria.values()) if by_criteria else [0],
-        "channel_labels":   list(by_channel.keys())   if by_channel   else ["No data"],
-        "channel_values":   list(by_channel.values())  if by_channel   else [0],
+        "channel_labels":   list(by_channel.keys())    if by_channel  else ["No data"],
+        "channel_values":   list(by_channel.values())  if by_channel  else [0],
     }
 
 
@@ -306,22 +304,32 @@ def find_latest_log(output_dir):
     return str(files[0]) if files else None
 
 
-def build_command(payload, uploaded_zip=None):
+def build_command(payload, db_id, uploaded_zip=None):
+    """Build the CLI command for main.py.
+    For age/state criteria, passes --request-id so age_state_new.py can
+    look up all parameters from the DB directly.
+    """
+    criteria = payload["criteria_type"]
+
     cmd = [
         PYTHON_BIN, SCRIPT_NAME,
         "--request-type",  payload["request_type"],
-        "--criteria-type", payload["criteria_type"],
+        "--criteria-type", criteria,
         "--comp-type",     payload["comp_type"],
         "--channel",       payload["channel"],
         "--output-dir",    payload["output_dir"],
     ]
-    criteria = payload["criteria_type"]
-    if criteria == "age":
-        cmd.extend(["--age", str(payload["criteria_value"])])
-    elif criteria == "state":
-        cmd.extend(["--states"] + payload["criteria_value"].split(","))
+
+    if criteria in ("age", "state"):
+        # age_state_new.py reads everything from DB via request_id
+        cmd.extend(["--request-id", str(db_id)])
+        if criteria == "age":
+            cmd.extend(["--age", str(payload["criteria_value"])])
+        else:
+            cmd.extend(["--states"] + payload["criteria_value"].split(","))
     else:
         cmd.extend(["--zip-file", str(uploaded_zip)])
+
     return cmd
 
 
@@ -506,7 +514,7 @@ def submit_request():
         saved_zip = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
         zip_file_upload.save(saved_zip)
 
-    safe_name = "".join(c if c.isalnum() or c in '-_' else '_' for c in request_name)
+    safe_name  = "".join(c if c.isalnum() or c in '-_' else '_' for c in request_name)
     output_dir = str(BASE_DIR / "output" / safe_name)
 
     payload = {
@@ -518,10 +526,10 @@ def submit_request():
         "output_dir":     output_dir,
     }
 
-    cmd = build_command(payload, saved_zip)
     request_uuid = uuid.uuid4().hex
 
-    insert_request({
+    # Insert first to get the DB id, then build command with that id
+    db_id = insert_request({
         "request_uuid":   request_uuid,
         "request_name":   request_name,
         "request_type":   request_type,
@@ -534,7 +542,7 @@ def submit_request():
         "zip_file_path":  str(saved_zip) if saved_zip else None,
         "output_dir":     output_dir,
         "overall_status": "inprogress",
-        "command_text":   " ".join(shlex.quote(c) for c in cmd),
+        "command_text":   None,
         "log_file":       None,
         "stdout_text":    "",
         "stderr_text":    "",
@@ -542,6 +550,11 @@ def submit_request():
         "started_at":     None,
         "finished_at":    None,
     })
+
+    cmd = build_command(payload, db_id, saved_zip)
+
+    # Update command_text now that we have the real command
+    update_request_db(request_uuid, command_text=" ".join(shlex.quote(c) for c in cmd))
 
     threading.Thread(target=run_job, args=(request_uuid, cmd, output_dir), daemon=True).start()
     return jsonify({'ok': True, 'request_uuid': request_uuid, 'request_name': request_name})
