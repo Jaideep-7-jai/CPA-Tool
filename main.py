@@ -2,7 +2,7 @@
 """
 CPA Tool – Entry point
 Routes incoming requests to the correct processing module:
-  age / state  → AGE_STATE/age_state_new.py
+  age / state  → AGE_STATE/age_state_new.py  (process_age_state_request)
   zips         → ZIPS/zips.py  (Suppression / Mailing)
   doordash     → ZIPS/zips.py  (Doordash mode)
 """
@@ -36,6 +36,8 @@ def parse_args():
     parser.add_argument("--states",        nargs="+", default=None)
     parser.add_argument("--zip-file",      default=None,
                         help="Path to uploaded ZIP codes file")
+    parser.add_argument("--request-id",    type=int, default=None,
+                        help="DB request ID (used by age/state processor)")
     return parser.parse_args()
 
 
@@ -46,15 +48,13 @@ def main():
     req_type = args.request_type
 
     if criteria in ("age", "state"):
-        from AGE_STATE.age_state_new import process_age_state
-        process_age_state(
-            request_type=req_type,
-            criteria=criteria,
-            comp_type=args.comp_type,
+        from AGE_STATE.age_state_new import process_age_state_request
+        if args.request_id is None:
+            print("[ERROR] --request-id is required for age/state criteria", file=sys.stderr)
+            sys.exit(1)
+        process_age_state_request(
+            request_id=args.request_id,
             channel=args.channel,
-            age=args.age,
-            states=args.states,
-            output_dir=args.output_dir,
         )
 
     elif criteria == "zips":
