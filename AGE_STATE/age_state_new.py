@@ -157,14 +157,20 @@ def _build_common_context(request_id: int, channel_name: str) -> dict:
     }
 
 
-def _download_and_combine(s3_path: str, download_dir: Path, final_dir: str, output_file: str):
+def _download_and_combine(s3_path: str, download_dir: Path, final_dir: str, output_file: str, channel_name: str):
     """Download gzipped S3 parts and concatenate into one pipe-delimited file."""
     download_dir.mkdir(parents=True, exist_ok=True)
     run_command(["aws", "s3", "cp", s3_path, ".", "--recursive", "--quiet"], cwd=download_dir)
-    run_command(
-        f"ls data* 1>/dev/null 2>&1 && zcat data* > {final_dir}/{output_file}",
-        cwd=download_dir,
-    )
+    if channel_name != "ORANGE":
+        run_command(
+            f"ls data* 1>/dev/null 2>&1 && zcat data* | cut -d'|' -f1 > {final_dir}/{output_file}",
+            cwd=download_dir,
+        )
+    else:
+        run_command(
+            f"ls data* 1>/dev/null 2>&1 && zcat data* > {final_dir}/{output_file}",
+            cwd=download_dir,
+       )
     run_command("rm -f data*", cwd=download_dir)
 
 
@@ -259,7 +265,7 @@ def process_green_blue(request_id: int, channel_name: str) -> dict:
 
         update_request_status(request_id, "Combining Data", channel_status)
         output_path = Path(ctx["final_dir"]) / f"{channel_name}_OP_PATH"
-        _download_and_combine(ctx["s3_path"], output_path, ctx["final_dir"], ctx["output_file"])
+        _download_and_combine(ctx["s3_path"], output_path, ctx["final_dir"], ctx["output_file"], channel_name)
 
         # ---- Change 2: deduplicate on email column -------------------------
         final_file_path = str(Path(ctx["final_dir"]) / ctx["output_file"])
@@ -327,7 +333,7 @@ def process_arcamax(request_id: int) -> dict:
 
         update_request_status(request_id, "Combining Data", channel_status)
         output_path = Path(ctx["final_dir"]) / "ARCAMAX_OP_PATH"
-        _download_and_combine(ctx["s3_path"], output_path, ctx["final_dir"], ctx["output_file"])
+        _download_and_combine(ctx["s3_path"], output_path, ctx["final_dir"], ctx["output_file"], channel_name)
 
         # ---- Change 2: deduplicate on email column -------------------------
         final_file_path = str(Path(ctx["final_dir"]) / ctx["output_file"])
@@ -412,7 +418,7 @@ def process_orange(request_id: int) -> dict:
         update_request_status(request_id, "Combining Data", channel_status)
         raw_combined = f"ORANGE_RAW_{path_date}.csv"
         output_path  = Path(final_dir) / "ORANGE_OP_PATH"
-        _download_and_combine(ctx["s3_path"], output_path, final_dir, raw_combined)
+        _download_and_combine(ctx["s3_path"], output_path, final_dir, raw_combined, channel_name)
 
         # Load combined file: columns -> email_address | account_name
         df_final = pd.read_csv(
