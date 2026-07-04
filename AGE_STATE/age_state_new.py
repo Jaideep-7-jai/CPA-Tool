@@ -86,7 +86,7 @@ def fetch_request_details(request_id: int) -> Optional[dict]:
                 SELECT
                     id,
                     client_name,
-                    requets_type,
+                    request_type,
                     request_name,
                     criteria_type,
                     criteria_value,
@@ -128,7 +128,7 @@ def _build_common_context(request_id: int, channel_name: str) -> dict:
         raise Exception(f"Request ID {request_id} not found")
 
     client_name    = request_data["client_name"]
-    request_type   = request_data["requets_type"]
+    request_type   = request_data["request_type"]
     request_name   = request_data["request_name"]
     criteria_type  = request_data["criteria_type"]
     criteria_value = request_data["criteria_value"]
