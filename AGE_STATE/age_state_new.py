@@ -100,8 +100,7 @@ def setup_channel_logging(output_dir, channel_name, criteria_type):
     """
     log_date = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = (
-        Path(output_dir) / "logs" / channel_name.upper()
-        / f"{criteria_type}_{log_date}.log"
+        Path(output_dir) / "logs" / f"{channel_name.upper()}_{criteria_type}_{log_date}.log"
     )
     handler = _make_handler(log_file)
     _logger = logging.getLogger("age_processor")
@@ -486,7 +485,7 @@ def process_green_blue(request_id, channel_name):
         channel_dir    = ctx["channel_dir"]
 
         if criteria_type == "age":
-            condition = f"b.AGE {'>=\'' if comp_type == 'greater' else '<'}{criteria_value}'"
+            condition = f'''b.AGE {">=" if comp_type == 'greater' else "<"} {criteria_value}'''
             header    = "a.email,b.age"
         elif criteria_type == "state":
             if isinstance(criteria_value, str):
