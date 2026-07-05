@@ -227,21 +227,37 @@ def _dedup_via_snowflake(
     """
     Dedup strategy for files with > LARGE_FILE_ROW_THRESHOLD rows.
 
+    The dedup S3 prefix lives INSIDE the channel's own run path:
+        {s3_path}/DEDUP_{path_date}/
+    e.g.:
+        s3://temporary-data/JAIDEEP/ADHOC/.../GREEN/DEDUP_20260705/
+        s3://temporary-data/JAIDEEP/ADHOC/.../BLUE/DEDUP_20260705/
+
+    This keeps each channel's dedup output isolated so parallel channel
+    runs never collide, and all artefacts stay under the same run tree
+    that is already visible in `aws s3 ls` for the request.
+
     Steps:
       1. Load the combined CSV into a temporary Snowflake staging table.
       2. Assert the staging table has rows (fail fast before COPY OUT).
-      3. Run SELECT DISTINCT email FROM staging_table and COPY OUT back to a
-         dedicated S3 dedup prefix.
-      4. Download the dedup part-files; assert at least one CSV was downloaded.
+      3. Run SELECT DISTINCT email FROM staging_table and COPY OUT back to
+         the per-channel dedup sub-prefix inside s3_path.
+      4. Download the dedup part-files; assert at least one CSV landed.
       5. Concatenate part-files into the original file_path using Python
          (avoids shell glob expansion failure on empty directories).
       6. Clean up the Snowflake staging table and S3 dedup prefix.
 
-    This keeps all heavy sorting/hashing inside Snowflake where /tmp size is
-    not a constraint, instead of on the job server.
+    This keeps all heavy sorting/hashing inside Snowflake where /tmp size
+    is not a constraint, instead of on the job server.
     """
     stage_table  = f"APT_ADHOC_DEDUP_STAGING_{channel_name}_{path_date}"
-    dedup_s3     = f"{s3_path}_DEDUP_{path_date}/"
+
+    # Dedup prefix is a sub-path INSIDE the channel's own s3_path so it
+    # sits alongside the raw part-files and is unique per channel:
+    #   s3_path = s3://bucket/.../request_name/GREEN
+    #   dedup_s3 = s3://bucket/.../request_name/GREEN/DEDUP_20260705/
+    dedup_s3     = f"{s3_path}/DEDUP_{path_date}/"
+
     final_dir    = str(Path(file_path).parent)
 
     # Resolve to absolute path BEFORE use so cwd= and glob patterns are
@@ -295,7 +311,7 @@ def _dedup_via_snowflake(
         )
 
     # ------------------------------------------------------------------
-    # 3. COPY DISTINCT emails back out to S3
+    # 3. COPY DISTINCT emails back out to the per-channel dedup S3 prefix
     # ------------------------------------------------------------------
     copy_out_sql = (
         f"COPY INTO '{dedup_s3}' "
