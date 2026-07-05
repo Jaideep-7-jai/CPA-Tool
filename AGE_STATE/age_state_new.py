@@ -13,6 +13,7 @@ Changes:
 """
 
 import os
+import glob
 import time
 import logging
 import pymysql
@@ -191,6 +192,32 @@ def _download_and_combine(s3_path: str, download_dir: Path, final_dir: str, outp
     run_command("rm -f data*", cwd=download_dir)
 
 
+def _get_snowflake_row_count(stage_table: str) -> int:
+    """
+    Query Snowflake for the exact row count of a staging table.
+    Returns the integer count, or raises RuntimeError if the query fails.
+    """
+    count_sql = f"SELECT COUNT(*) FROM {stage_table};"
+    result = subprocess.run(
+        ["snowsql", "-c", "datateam1", "-q", count_sql, "-o", "output_format=csv", "-o", "header=false"],
+        capture_output=True,
+        universal_newlines=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to query row count for {stage_table}:\n{result.stderr.strip()}"
+        )
+    # SnowSQL CSV output has a blank line then the value then trailing lines
+    for line in result.stdout.splitlines():
+        line = line.strip().strip('"')
+        if line.isdigit():
+            return int(line)
+    raise RuntimeError(
+        f"Could not parse row count from SnowSQL output for {stage_table}.\n"
+        f"stdout: {result.stdout!r}"
+    )
+
+
 def _dedup_via_snowflake(
     file_path: str,
     channel_name: str,
@@ -202,11 +229,13 @@ def _dedup_via_snowflake(
 
     Steps:
       1. Load the combined CSV into a temporary Snowflake staging table.
-      2. Run SELECT DISTINCT email FROM staging_table and COPY OUT back to a
+      2. Assert the staging table has rows (fail fast before COPY OUT).
+      3. Run SELECT DISTINCT email FROM staging_table and COPY OUT back to a
          dedicated S3 dedup prefix.
-      3. Download the dedup part-files and reassemble into a single final CSV,
-         replacing the original file_path.
-      4. Clean up the Snowflake staging table.
+      4. Download the dedup part-files; assert at least one CSV was downloaded.
+      5. Concatenate part-files into the original file_path using Python
+         (avoids shell glob expansion failure on empty directories).
+      6. Clean up the Snowflake staging table and S3 dedup prefix.
 
     This keeps all heavy sorting/hashing inside Snowflake where /tmp size is
     not a constraint, instead of on the job server.
@@ -214,17 +243,28 @@ def _dedup_via_snowflake(
     stage_table  = f"APT_ADHOC_DEDUP_STAGING_{channel_name}_{path_date}"
     dedup_s3     = f"{s3_path}_DEDUP_{path_date}/"
     final_dir    = str(Path(file_path).parent)
-    dedup_dl_dir = Path(final_dir) / f"{channel_name}_DEDUP_TMP"
+
+    # Resolve to absolute path BEFORE use so cwd= and glob patterns are
+    # unambiguous regardless of the process working directory.
+    dedup_dl_dir = Path(final_dir).resolve() / f"{channel_name}_DEDUP_TMP"
     dedup_dl_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(
         "Large file detected for %s — using Snowflake staging dedup (table: %s)",
         channel_name, stage_table,
     )
+    logger.info(
+        "Snowflake dedup S3 prefix  : %s", dedup_s3,
+    )
+    logger.info(
+        "Local download directory    : %s", str(dedup_dl_dir),
+    )
 
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
 
+    # ------------------------------------------------------------------
     # 1. Create staging table and load the combined CSV
+    # ------------------------------------------------------------------
     create_sql = (
         f"CREATE OR REPLACE TEMPORARY TABLE {stage_table} (email VARCHAR);"
     )
@@ -240,7 +280,23 @@ def _dedup_via_snowflake(
     )
     run_command(["snowsql", "-c", "datateam1", "-q", copy_in_sql])
 
-    # 2. COPY DISTINCT emails back out to S3
+    # ------------------------------------------------------------------
+    # 2. Assert staging table has rows before attempting COPY OUT
+    #    This catches schema mismatches, empty COPY IN results, etc.
+    # ------------------------------------------------------------------
+    staging_row_count = _get_snowflake_row_count(stage_table)
+    logger.info(
+        "Staging table %s loaded with %d rows", stage_table, staging_row_count,
+    )
+    if staging_row_count == 0:
+        raise RuntimeError(
+            f"Snowflake staging table {stage_table} has 0 rows after COPY INTO. "
+            f"Check COPY INTO result, file format, and source file: {file_path}"
+        )
+
+    # ------------------------------------------------------------------
+    # 3. COPY DISTINCT emails back out to S3
+    # ------------------------------------------------------------------
     copy_out_sql = (
         f"COPY INTO '{dedup_s3}' "
         f"FROM (SELECT DISTINCT email FROM {stage_table}) "
@@ -250,20 +306,64 @@ def _dedup_via_snowflake(
     )
     run_command(["snowsql", "-c", "datateam1", "-q", copy_out_sql])
 
-    # 3. Download dedup parts and reassemble into the original file_path
+    # ------------------------------------------------------------------
+    # 4. Download dedup parts from S3
+    # ------------------------------------------------------------------
     run_command(
-        ["aws", "s3", "cp", dedup_s3, ".", "--recursive", "--quiet"],
-        cwd=dedup_dl_dir,
-    )
-    run_command(
-        f"cat *.csv > {file_path}",
-        cwd=dedup_dl_dir,
+        ["aws", "s3", "cp", dedup_s3, str(dedup_dl_dir), "--recursive", "--quiet"],
     )
 
-    # 4. Count final rows and cleanup
+    # Assert at least one CSV file was downloaded — fail fast with a
+    # descriptive error instead of letting `cat *.csv` silently fail.
+    downloaded_csvs = sorted(dedup_dl_dir.glob("*.csv"))
+    if not downloaded_csvs:
+        raise FileNotFoundError(
+            f"Snowflake COPY OUT produced no CSV files in {dedup_dl_dir}. "
+            f"Expected files at S3 prefix: {dedup_s3}. "
+            f"Check that COPY INTO '{dedup_s3}' wrote rows and that the "
+            f"aws s3 cp target path matches dedup_dl_dir."
+        )
+
+    total_dl_bytes = sum(f.stat().st_size for f in downloaded_csvs)
+    logger.info(
+        "Downloaded %d CSV part-file(s) from %s (total %.1f MB)",
+        len(downloaded_csvs), dedup_s3, total_dl_bytes / 1_048_576,
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Concatenate part-files into the original file_path using Python
+    #    (avoids shell glob expansion failure on unexpected filenames)
+    # ------------------------------------------------------------------
+    with open(file_path, "wb") as out_fh:
+        for part in downloaded_csvs:
+            with open(part, "rb") as in_fh:
+                while True:
+                    chunk = in_fh.read(8 * 1024 * 1024)  # 8 MB chunks
+                    if not chunk:
+                        break
+                    out_fh.write(chunk)
+    logger.info(
+        "Reassembled %d part-file(s) into %s", len(downloaded_csvs), file_path,
+    )
+
+    # ------------------------------------------------------------------
+    # 6. Count final rows and cleanup
+    # ------------------------------------------------------------------
     record_count = _count_file_lines(file_path)
-    run_command("rm -f *.csv", cwd=dedup_dl_dir)
-    dedup_dl_dir.rmdir()
+
+    # Remove downloaded part-files
+    for part in downloaded_csvs:
+        part.unlink(missing_ok=True)
+
+    # Only remove the temp dir if it is now empty (guard against partial
+    # cleanup masking a secondary error)
+    try:
+        dedup_dl_dir.rmdir()
+    except OSError:
+        logger.warning(
+            "dedup_dl_dir %s is not empty after cleanup — skipping rmdir",
+            str(dedup_dl_dir),
+        )
 
     # Drop staging table and internal stage files
     cleanup_sql = (
