@@ -175,7 +175,7 @@ def _count_file_lines(file_path: str) -> int:
     return int(result) if result else 0
 
 
-def _download_and_combine(s3_path: str, download_dir: Path, final_dir: str, output_file: str, channel_name: str):
+def _download_and_combine(s3_path, download_dir, final_dir, output_file, channel_name):
     """Download gzipped S3 parts and concatenate into one pipe-delimited file."""
     download_dir.mkdir(parents=True, exist_ok=True)
     run_command(["aws", "s3", "cp", s3_path, ".", "--recursive", "--quiet"], cwd=download_dir)
@@ -188,42 +188,51 @@ def _download_and_combine(s3_path: str, download_dir: Path, final_dir: str, outp
         run_command(
             f"ls data* 1>/dev/null 2>&1 && zcat data* > {final_dir}/{output_file}",
             cwd=download_dir,
-       )
+        )
     run_command("rm -f data*", cwd=download_dir)
 
 
-def _get_snowflake_row_count(stage_table: str) -> int:
+def _get_snowflake_row_count(stage_table):
     """
     Query Snowflake for the exact row count of a staging table.
     Returns the integer count, or raises RuntimeError if the query fails.
+
+    Uses stdout=subprocess.PIPE / stderr=subprocess.PIPE instead of
+    capture_output=True to remain compatible with Python 3.6
+    (capture_output was added in Python 3.7).
     """
-    count_sql = f"SELECT COUNT(*) FROM {stage_table};"
+    count_sql = "SELECT COUNT(*) FROM {};".format(stage_table)
     result = subprocess.run(
-        ["snowsql", "-c", "datateam1", "-q", count_sql, "-o", "output_format=csv", "-o", "header=false"],
-        capture_output=True,
+        ["snowsql", "-c", "datateam1", "-q", count_sql,
+         "-o", "output_format=csv", "-o", "header=false"],
+        stdout=subprocess.PIPE,   # Python 3.6 compatible (capture_output added in 3.7)
+        stderr=subprocess.PIPE,
         universal_newlines=True,
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"Failed to query row count for {stage_table}:\n{result.stderr.strip()}"
+            "Failed to query row count for {}:\n{}".format(
+                stage_table, result.stderr.strip()
+            )
         )
-    # SnowSQL CSV output has a blank line then the value then trailing lines
+    # SnowSQL CSV output: blank line, then the numeric value, then trailing lines
     for line in result.stdout.splitlines():
         line = line.strip().strip('"')
         if line.isdigit():
             return int(line)
     raise RuntimeError(
-        f"Could not parse row count from SnowSQL output for {stage_table}.\n"
-        f"stdout: {result.stdout!r}"
+        "Could not parse row count from SnowSQL output for {}.\nstdout: {!r}".format(
+            stage_table, result.stdout
+        )
     )
 
 
 def _dedup_via_snowflake(
-    file_path: str,
-    channel_name: str,
-    s3_path: str,
-    path_date: str,
-) -> int:
+    file_path,
+    channel_name,
+    s3_path,
+    path_date,
+):
     """
     Dedup strategy for files with > LARGE_FILE_ROW_THRESHOLD rows.
 
@@ -247,78 +256,78 @@ def _dedup_via_snowflake(
          (avoids shell glob expansion failure on empty directories).
       6. Clean up the Snowflake staging table and S3 dedup prefix.
 
-    This keeps all heavy sorting/hashing inside Snowflake where /tmp size
-    is not a constraint, instead of on the job server.
+    Python 3.6 compatibility notes:
+      - subprocess.run uses stdout/stderr=PIPE, not capture_output=True (3.7+)
+      - Path.unlink() uses try/except instead of missing_ok=True (3.8+)
     """
-    stage_table  = f"APT_ADHOC_DEDUP_STAGING_{channel_name}_{path_date}"
+    stage_table = "APT_ADHOC_DEDUP_STAGING_{}_{}".format(channel_name, path_date)
 
     # Dedup prefix is a sub-path INSIDE the channel's own s3_path so it
     # sits alongside the raw part-files and is unique per channel:
-    #   s3_path = s3://bucket/.../request_name/GREEN
+    #   s3_path  = s3://bucket/.../request_name/GREEN
     #   dedup_s3 = s3://bucket/.../request_name/GREEN/DEDUP_20260705/
-    dedup_s3     = f"{s3_path}/DEDUP_{path_date}/"
+    dedup_s3  = "{}/DEDUP_{}/".format(s3_path, path_date)
 
     final_dir    = str(Path(file_path).parent)
 
     # Resolve to absolute path BEFORE use so cwd= and glob patterns are
     # unambiguous regardless of the process working directory.
-    dedup_dl_dir = Path(final_dir).resolve() / f"{channel_name}_DEDUP_TMP"
+    dedup_dl_dir = Path(final_dir).resolve() / "{}_DEDUP_TMP".format(channel_name)
     dedup_dl_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(
         "Large file detected for %s — using Snowflake staging dedup (table: %s)",
         channel_name, stage_table,
     )
-    logger.info(
-        "Snowflake dedup S3 prefix  : %s", dedup_s3,
-    )
-    logger.info(
-        "Local download directory    : %s", str(dedup_dl_dir),
-    )
+    logger.info("Snowflake dedup S3 prefix  : %s", dedup_s3)
+    logger.info("Local download directory    : %s", str(dedup_dl_dir))
 
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
 
     # ------------------------------------------------------------------
     # 1. Create staging table and load the combined CSV
     # ------------------------------------------------------------------
-    create_sql = (
-        f"CREATE OR REPLACE TEMPORARY TABLE {stage_table} (email VARCHAR);"
-    )
+    create_sql = "CREATE OR REPLACE TEMPORARY TABLE {} (email VARCHAR);".format(stage_table)
     run_command(["snowsql", "-c", "datateam1", "-q", create_sql])
 
-    # PUT the file to Snowflake internal stage then COPY INTO table
-    put_sql = f"PUT file://{file_path} @~/{stage_table}/ OVERWRITE=TRUE AUTO_COMPRESS=TRUE;"
+    put_sql = "PUT file://{} @~/{}/  OVERWRITE=TRUE AUTO_COMPRESS=TRUE;".format(
+        file_path, stage_table
+    )
     run_command(["snowsql", "-c", "datateam1", "-q", put_sql])
 
     copy_in_sql = (
-        f"COPY INTO {stage_table} FROM @~/{stage_table}/ "
-        f"FILE_FORMAT=(TYPE=CSV FIELD_DELIMITER='|' SKIP_HEADER=0);"
-    )
+        "COPY INTO {table} FROM @~/{table}/ "
+        "FILE_FORMAT=(TYPE=CSV FIELD_DELIMITER='|' SKIP_HEADER=0);"
+    ).format(table=stage_table)
     run_command(["snowsql", "-c", "datateam1", "-q", copy_in_sql])
 
     # ------------------------------------------------------------------
     # 2. Assert staging table has rows before attempting COPY OUT
-    #    This catches schema mismatches, empty COPY IN results, etc.
     # ------------------------------------------------------------------
     staging_row_count = _get_snowflake_row_count(stage_table)
-    logger.info(
-        "Staging table %s loaded with %d rows", stage_table, staging_row_count,
-    )
+    logger.info("Staging table %s loaded with %d rows", stage_table, staging_row_count)
     if staging_row_count == 0:
         raise RuntimeError(
-            f"Snowflake staging table {stage_table} has 0 rows after COPY INTO. "
-            f"Check COPY INTO result, file format, and source file: {file_path}"
+            "Snowflake staging table {} has 0 rows after COPY INTO. "
+            "Check COPY INTO result, file format, and source file: {}".format(
+                stage_table, file_path
+            )
         )
 
     # ------------------------------------------------------------------
     # 3. COPY DISTINCT emails back out to the per-channel dedup S3 prefix
     # ------------------------------------------------------------------
     copy_out_sql = (
-        f"COPY INTO '{dedup_s3}' "
-        f"FROM (SELECT DISTINCT email FROM {stage_table}) "
-        f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
-        f"FILE_FORMAT=(TYPE=CSV COMPRESSION=NONE FIELD_DELIMITER='|') "
-        f"MAX_FILE_SIZE=490000000;"
+        "COPY INTO '{dedup_s3}' "
+        "FROM (SELECT DISTINCT email FROM {table}) "
+        "CREDENTIALS=(AWS_KEY_ID='{key}' AWS_SECRET_KEY='{secret}') "
+        "FILE_FORMAT=(TYPE=CSV COMPRESSION=NONE FIELD_DELIMITER='|') "
+        "MAX_FILE_SIZE=490000000;"
+    ).format(
+        dedup_s3=dedup_s3,
+        table=stage_table,
+        key=AWS_KEY_ID,
+        secret=AWS_SECRET_KEY,
     )
     run_command(["snowsql", "-c", "datateam1", "-q", copy_out_sql])
 
@@ -329,15 +338,15 @@ def _dedup_via_snowflake(
         ["aws", "s3", "cp", dedup_s3, str(dedup_dl_dir), "--recursive", "--quiet"],
     )
 
-    # Assert at least one CSV file was downloaded — fail fast with a
-    # descriptive error instead of letting `cat *.csv` silently fail.
     downloaded_csvs = sorted(dedup_dl_dir.glob("*.csv"))
     if not downloaded_csvs:
         raise FileNotFoundError(
-            f"Snowflake COPY OUT produced no CSV files in {dedup_dl_dir}. "
-            f"Expected files at S3 prefix: {dedup_s3}. "
-            f"Check that COPY INTO '{dedup_s3}' wrote rows and that the "
-            f"aws s3 cp target path matches dedup_dl_dir."
+            "Snowflake COPY OUT produced no CSV files in {}. "
+            "Expected files at S3 prefix: {}. "
+            "Check that COPY INTO '{}' wrote rows and that the "
+            "aws s3 cp target path matches dedup_dl_dir.".format(
+                dedup_dl_dir, dedup_s3, dedup_s3
+            )
         )
 
     total_dl_bytes = sum(f.stat().st_size for f in downloaded_csvs)
@@ -348,11 +357,10 @@ def _dedup_via_snowflake(
 
     # ------------------------------------------------------------------
     # 5. Concatenate part-files into the original file_path using Python
-    #    (avoids shell glob expansion failure on unexpected filenames)
     # ------------------------------------------------------------------
     with open(file_path, "wb") as out_fh:
         for part in downloaded_csvs:
-            with open(part, "rb") as in_fh:
+            with open(str(part), "rb") as in_fh:
                 while True:
                     chunk = in_fh.read(8 * 1024 * 1024)  # 8 MB chunks
                     if not chunk:
@@ -367,12 +375,14 @@ def _dedup_via_snowflake(
     # ------------------------------------------------------------------
     record_count = _count_file_lines(file_path)
 
-    # Remove downloaded part-files
+    # Remove downloaded part-files — use try/except instead of
+    # missing_ok=True which requires Python 3.8+
     for part in downloaded_csvs:
-        part.unlink(missing_ok=True)
+        try:
+            part.unlink()
+        except FileNotFoundError:
+            pass
 
-    # Only remove the temp dir if it is now empty (guard against partial
-    # cleanup masking a secondary error)
     try:
         dedup_dl_dir.rmdir()
     except OSError:
@@ -381,17 +391,12 @@ def _dedup_via_snowflake(
             str(dedup_dl_dir),
         )
 
-    # Drop staging table and internal stage files
     cleanup_sql = (
-        f"DROP TABLE IF EXISTS {stage_table}; "
-        f"REMOVE @~/{stage_table}/;"
+        "DROP TABLE IF EXISTS {table}; REMOVE @~/{table}/;".format(table=stage_table)
     )
     run_command(["snowsql", "-c", "datateam1", "-q", cleanup_sql])
 
-    # Remove dedup S3 prefix files
-    run_command(
-        ["aws", "s3", "rm", dedup_s3, "--recursive", "--quiet"],
-    )
+    run_command(["aws", "s3", "rm", dedup_s3, "--recursive", "--quiet"])
 
     logger.info(
         "Snowflake dedup complete for %s: %d unique emails in final file",
@@ -401,11 +406,11 @@ def _dedup_via_snowflake(
 
 
 def _dedup_email_col(
-    file_path: str,
-    channel_name: str = "",
-    s3_path: str = "",
-    path_date: str = "",
-) -> int:
+    file_path,
+    channel_name="",
+    s3_path="",
+    path_date="",
+):
     """
     Smart dedup dispatcher:
       - Count rows with wc -l (cheap, no memory cost).
@@ -425,9 +430,6 @@ def _dedup_email_col(
     )
 
     if row_count > LARGE_FILE_ROW_THRESHOLD:
-        # ------------------------------------------------------------------
-        # LARGE FILE PATH: offload dedup to Snowflake to avoid disk/tmp issues
-        # ------------------------------------------------------------------
         if not s3_path or not path_date or not channel_name:
             raise ValueError(
                 "_dedup_email_col: s3_path, path_date, and channel_name are "
@@ -436,9 +438,6 @@ def _dedup_email_col(
         return _dedup_via_snowflake(file_path, channel_name, s3_path, path_date)
 
     else:
-        # ------------------------------------------------------------------
-        # SMALL FILE PATH: in-process pandas dedup (fast, no network round-trip)
-        # ------------------------------------------------------------------
         df = pd.read_csv(file_path, sep="|", header=None, dtype=str)
         before = len(df)
         df = df.drop_duplicates(subset=[0])   # col 0 = email
@@ -451,17 +450,15 @@ def _dedup_email_col(
         return after
 
 
-def _post_to_ftp(final_dir: str, path_date: str, output_file: str):
+def _post_to_ftp(final_dir, path_date, output_file):
     ftp_cmd = (
-        f'lftp -u "GreenPub,Zet@Welcome1!" ftp://zxds-ftp-02.bo3.e-dialog.com '
-        f'-e "mkdir -p /CPA/{path_date};cd /CPA/{path_date};put {output_file};bye"'
-    )
+        'lftp -u "GreenPub,Zet@Welcome1!" ftp://zxds-ftp-02.bo3.e-dialog.com '
+        '-e "mkdir -p /CPA/{date};cd /CPA/{date};put {file};bye"'
+    ).format(date=path_date, file=output_file)
     run_command(ftp_cmd, cwd=final_dir)
 
 
-def _success_result(
-    channel_name: str, final_dir: str, output_file: str, elapsed: float, record_count: int = 0
-) -> dict:
+def _success_result(channel_name, final_dir, output_file, elapsed, record_count=0):
     file_path = str(Path(final_dir) / output_file)
     return {
         "channel"  : channel_name,
@@ -477,13 +474,13 @@ def _success_result(
 # Channel processors
 # ---------------------------------------------------------------------------
 
-def process_green_blue(request_id: int, channel_name: str) -> dict:
+def process_green_blue(request_id, channel_name):
     """GREEN and BLUE channel processor with smart email deduplication."""
     channel_name = channel_name.upper()
     if channel_name not in ["GREEN", "BLUE"]:
         raise ValueError("process_green_blue supports only GREEN or BLUE")
 
-    channel_status = f"{channel_name}_STATUS"
+    channel_status = "{}_STATUS".format(channel_name)
     update_request_status(request_id, "Started", channel_status)
     ctx = _build_common_context(request_id, channel_name)
 
@@ -495,29 +492,34 @@ def process_green_blue(request_id: int, channel_name: str) -> dict:
         comp_type      = ctx["comp_type"]
 
         if criteria_type == "age":
-            condition = f"b.AGE {'>=' if comp_type == 'greater' else '<'} {criteria_value}"
+            condition = "b.AGE {} {}".format(">='" if comp_type == "greater" else "<", criteria_value)
             header    = "a.email,b.age"
         elif criteria_type == "state":
             if isinstance(criteria_value, str):
                 criteria_value = [x.strip() for x in criteria_value.split(",")]
             states    = "','".join(criteria_value)
-            condition = f"b.STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
-            header    = "a.email,b.state"
+            condition = "b.STATE {} ('{}')" .format(
+                "IN" if comp_type == "include" else "NOT IN", states
+            )
+            header = "a.email,b.state"
         else:
-            raise Exception(f"Unsupported criteria_type {criteria_type}")
+            raise Exception("Unsupported criteria_type {}".format(criteria_type))
 
         profile_table = (
             "GREEN_LPT.UNIVERSAL_PROFILE" if channel_name == "GREEN" else "INFS_LPT.INFS_PROFILE"
         )
 
         sql = (
-            f"COPY INTO '{ctx['s3_path']}/' "
-            f"FROM (SELECT DISTINCT {header} FROM {profile_table} a "
-            f"JOIN APT_CUSTOM_GREEN_REA_DATA_DND b ON a.md5hash=b.EMAIL_MD5 "
-            f"WHERE {condition}) "
-            f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
-            f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
-            f"FIELD_OPTIONALLY_ENCLOSED_BY='\"') MAX_FILE_SIZE=490000000;"
+            "COPY INTO '{s3}/' "
+            "FROM (SELECT DISTINCT {header} FROM {table} a "
+            "JOIN APT_CUSTOM_GREEN_REA_DATA_DND b ON a.md5hash=b.EMAIL_MD5 "
+            "WHERE {cond}) "
+            "CREDENTIALS=(AWS_KEY_ID='{key}' AWS_SECRET_KEY='{secret}') "
+            "FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
+            "FIELD_OPTIONALLY_ENCLOSED_BY='\"') MAX_FILE_SIZE=490000000;"
+        ).format(
+            s3=ctx["s3_path"], header=header, table=profile_table,
+            cond=condition, key=AWS_KEY_ID, secret=AWS_SECRET_KEY,
         )
 
         start_time = time.time()
@@ -526,10 +528,9 @@ def process_green_blue(request_id: int, channel_name: str) -> dict:
         run_command(["snowsql", "-c", "datateam1", "-q", sql])
 
         update_request_status(request_id, "Combining Data", channel_status)
-        output_path = Path(ctx["final_dir"]) / f"{channel_name}_OP_PATH"
+        output_path = Path(ctx["final_dir"]) / "{}_OP_PATH".format(channel_name)
         _download_and_combine(ctx["s3_path"], output_path, ctx["final_dir"], ctx["output_file"], channel_name)
 
-        # Smart dedup: large files -> Snowflake, small files -> pandas
         final_file_path = str(Path(ctx["final_dir"]) / ctx["output_file"])
         record_count = _dedup_email_col(
             final_file_path,
@@ -549,11 +550,11 @@ def process_green_blue(request_id: int, channel_name: str) -> dict:
     except Exception as e:
         update_request_status(request_id, "Failed", channel_status)
         logger.exception("%s processing failed", channel_name)
-        send_error_email(f"{channel_name} Processing Failed", str(e))
+        send_error_email("{} Processing Failed".format(channel_name), str(e))
         raise
 
 
-def process_arcamax(request_id: int) -> dict:
+def process_arcamax(request_id):
     """ARCAMAX channel processor with smart email deduplication."""
     channel_name   = "ARCAMAX"
     channel_status = "ARCAMAX_STATUS"
@@ -570,26 +571,30 @@ def process_arcamax(request_id: int) -> dict:
         if criteria_type == "age":
             date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
             condition   = (
-                f"birthday IS NOT NULL AND TRY_TO_DATE(birthday) "
-                f"{'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
-            )
+                "birthday IS NOT NULL AND TRY_TO_DATE(birthday) {} '{}'"
+            ).format("<=" if comp_type == "greater" else ">=", date_cutoff)
             header = "email,birthday"
         elif criteria_type == "state":
             if isinstance(criteria_value, str):
                 criteria_value = [x.strip() for x in criteria_value.split(",")]
             states    = "','".join(criteria_value)
-            condition = f"STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
-            header    = "email,state"
+            condition = "STATE {} ('{}')" .format(
+                "IN" if comp_type == "include" else "NOT IN", states
+            )
+            header = "email,state"
         else:
-            raise Exception(f"Unsupported criteria_type {criteria_type}")
+            raise Exception("Unsupported criteria_type {}".format(criteria_type))
 
         sql = (
-            f"COPY INTO '{ctx['s3_path']}/' "
-            f"FROM (SELECT DISTINCT {header} FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
-            f"WHERE {condition}) "
-            f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
-            f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
-            f"FIELD_OPTIONALLY_ENCLOSED_BY='\"') MAX_FILE_SIZE=490000000;"
+            "COPY INTO '{s3}/' "
+            "FROM (SELECT DISTINCT {header} FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
+            "WHERE {cond}) "
+            "CREDENTIALS=(AWS_KEY_ID='{key}' AWS_SECRET_KEY='{secret}') "
+            "FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
+            "FIELD_OPTIONALLY_ENCLOSED_BY='\"') MAX_FILE_SIZE=490000000;"
+        ).format(
+            s3=ctx["s3_path"], header=header,
+            cond=condition, key=AWS_KEY_ID, secret=AWS_SECRET_KEY,
         )
 
         start_time = time.time()
@@ -601,7 +606,6 @@ def process_arcamax(request_id: int) -> dict:
         output_path = Path(ctx["final_dir"]) / "ARCAMAX_OP_PATH"
         _download_and_combine(ctx["s3_path"], output_path, ctx["final_dir"], ctx["output_file"], channel_name)
 
-        # Smart dedup: large files -> Snowflake, small files -> pandas
         final_file_path = str(Path(ctx["final_dir"]) / ctx["output_file"])
         record_count = _dedup_email_col(
             final_file_path,
@@ -621,11 +625,11 @@ def process_arcamax(request_id: int) -> dict:
     except Exception as e:
         update_request_status(request_id, "Failed", channel_status)
         logger.exception("%s processing failed", channel_name)
-        send_error_email(f"{channel_name} Processing Failed", str(e))
+        send_error_email("{} Processing Failed".format(channel_name), str(e))
         raise
 
 
-def process_orange(request_id: int) -> dict:
+def process_orange(request_id):
     """
     ORANGE channel processor.
     - suppression -> single email-only CSV
@@ -649,34 +653,41 @@ def process_orange(request_id: int) -> dict:
 
         if criteria_type == "age":
             date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
-            condition   = f"dob {'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
+            condition   = "dob {} '{}'".format(
+                "<=" if comp_type == "greater" else ">=", date_cutoff
+            )
         elif criteria_type == "state":
             if isinstance(criteria_value, str):
                 criteria_value = [x.strip() for x in criteria_value.split(",")]
             states    = "','".join(criteria_value)
-            condition = f"STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
+            condition = "STATE {} ('{}')" .format(
+                "IN" if comp_type == "include" else "NOT IN", states
+            )
         else:
-            raise Exception(f"Unsupported criteria_type {criteria_type}")
+            raise Exception("Unsupported criteria_type {}".format(criteria_type))
 
         sql = (
-            f"COPY INTO '{ctx['s3_path']}/' "
-            f"FROM ("
-            f"SELECT DISTINCT a.email_address, b.ACCOUNT_NAME "
-            f"FROM ("
-            f"SELECT DISTINCT a.FEED_ID, a.email_address "
-            f"FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a, "
-            f"(SELECT a.email_address, MAX(a.created_at) AS maxdate "
-            f"FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a "
-            f"WHERE {condition} GROUP BY 1) b "
-            f"WHERE a.email_address=b.email_address AND a.created_at=b.maxdate"
-            f") a "
-            f"JOIN APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 b ON a.FEED_ID=b.FEEDID "
-            f"JOIN APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND c ON a.email_address=c.email_address "
-            f"JOIN APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND d ON a.email_address=d.email"
-            f") "
-            f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
-            f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
-            f"FIELD_OPTIONALLY_ENCLOSED_BY='\"') MAX_FILE_SIZE=490000000;"
+            "COPY INTO '{s3}/' "
+            "FROM ("
+            "SELECT DISTINCT a.email_address, b.ACCOUNT_NAME "
+            "FROM ("
+            "SELECT DISTINCT a.FEED_ID, a.email_address "
+            "FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a, "
+            "(SELECT a.email_address, MAX(a.created_at) AS maxdate "
+            "FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a "
+            "WHERE {cond} GROUP BY 1) b "
+            "WHERE a.email_address=b.email_address AND a.created_at=b.maxdate"
+            ") a "
+            "JOIN APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 b ON a.FEED_ID=b.FEEDID "
+            "JOIN APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND c ON a.email_address=c.email_address "
+            "JOIN APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND d ON a.email_address=d.email"
+            ") "
+            "CREDENTIALS=(AWS_KEY_ID='{key}' AWS_SECRET_KEY='{secret}') "
+            "FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
+            "FIELD_OPTIONALLY_ENCLOSED_BY='\"') MAX_FILE_SIZE=490000000;"
+        ).format(
+            s3=ctx["s3_path"], cond=condition,
+            key=AWS_KEY_ID, secret=AWS_SECRET_KEY,
         )
 
         start_time = time.time()
@@ -684,13 +695,11 @@ def process_orange(request_id: int) -> dict:
         os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
         run_command(["snowsql", "-c", "datateam1", "-q", sql])
 
-        # Download raw S3 parts into a temp folder and combine
         update_request_status(request_id, "Combining Data", channel_status)
-        raw_combined = f"ORANGE_RAW_{path_date}.csv"
+        raw_combined = "ORANGE_RAW_{}.csv".format(path_date)
         output_path  = Path(final_dir) / "ORANGE_OP_PATH"
         _download_and_combine(ctx["s3_path"], output_path, final_dir, raw_combined, channel_name)
 
-        # Load combined file: columns -> email_address | account_name
         df_final = pd.read_csv(
             str(Path(final_dir) / raw_combined),
             sep="|",
@@ -703,58 +712,47 @@ def process_orange(request_id: int) -> dict:
 
         update_request_status(request_id, "Posting To FTP", channel_status)
 
-        # ---- suppression vs mailing ----------------------------------------
         if request_type.lower() == "suppression":
-            # suppression: unique email-only CSV
-            output_file      = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
+            output_file      = "{}_{}_{_{}.csv".format(client_name, request_type, channel_name, path_date)
             suppression_path = Path(final_dir) / output_file
             (
                 df_final[["email_address"]]
                 .drop_duplicates()
-                .to_csv(suppression_path, index=False, header=False)
+                .to_csv(str(suppression_path), index=False, header=False)
             )
-            # remove intermediate raw file
-            run_command(f"rm -f {raw_combined}", cwd=final_dir)
-            record_count = len(pd.read_csv(suppression_path, header=None))
+            run_command("rm -f {}".format(raw_combined), cwd=final_dir)
+            record_count = len(pd.read_csv(str(suppression_path), header=None))
             logger.info("ORANGE suppression file: %s (%d records)", output_file, record_count)
-
             _post_to_ftp(final_dir, path_date, output_file)
 
         else:
-            # mailing: ESP-wise split + ZIP
             esp_split_dir = Path(final_dir) / "ORANGE_OP_PATH"
             esp_split_dir.mkdir(exist_ok=True)
-
-            esp_names = (
-                df_final["account_name"].drop_duplicates().sort_values().tolist()
-            )
+            esp_names = df_final["account_name"].drop_duplicates().sort_values().tolist()
             for esp in esp_names:
                 df_esp = df_final[df_final["account_name"] == esp][["email_address"]]
                 df_esp.to_csv(
-                    esp_split_dir / f"{esp}_ORANGE_DATA.csv",
+                    str(esp_split_dir / "{}_ORANGE_DATA.csv".format(esp)),
                     index=False,
                     header=False,
                 )
                 logger.info("ESP split: %s -> %d emails", esp, len(df_esp))
 
-            output_file = (
-                f"{client_name}_{request_type}_{channel_name}_{path_date}.zip"
+            output_file = "{}_{}_{}_{}.zip".format(
+                client_name, request_type, channel_name, path_date
             )
             zip_file = Path(final_dir) / output_file
             run_command(
                 ["zip", "-r", zip_file.name, esp_split_dir.name],
                 cwd=final_dir,
             )
-            # cleanup split folder and raw combined file
             run_command(
-                f"rm -rf {esp_split_dir.name} && rm -f {raw_combined}",
+                "rm -rf {} && rm -f {}".format(esp_split_dir.name, raw_combined),
                 cwd=final_dir,
             )
             record_count = total_count
             logger.info("ORANGE mailing ZIP: %s (%d records)", output_file, record_count)
-
             _post_to_ftp(final_dir, path_date, output_file)
-        # --------------------------------------------------------------------
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status)
@@ -764,7 +762,7 @@ def process_orange(request_id: int) -> dict:
     except Exception as e:
         update_request_status(request_id, "Failed", channel_status)
         logger.exception("%s processing failed", channel_name)
-        send_error_email(f"{channel_name} Processing Failed", str(e))
+        send_error_email("{} Processing Failed".format(channel_name), str(e))
         raise
 
 
@@ -772,7 +770,7 @@ def process_orange(request_id: int) -> dict:
 # Dispatcher
 # ---------------------------------------------------------------------------
 
-def process_channel(request_id: int, channel_name: str) -> dict:
+def process_channel(request_id, channel_name):
     channel_name = channel_name.upper()
     if channel_name in ["GREEN", "BLUE"]:
         return process_green_blue(request_id, channel_name)
@@ -780,13 +778,13 @@ def process_channel(request_id: int, channel_name: str) -> dict:
         return process_arcamax(request_id)
     if channel_name == "ORANGE":
         return process_orange(request_id)
-    raise ValueError(f"Unsupported channel: {channel_name}")
+    raise ValueError("Unsupported channel: {}".format(channel_name))
 
 
-def process_age_state_request(request_id: int, channel: str = "ALL") -> Dict[str, dict]:
+def process_age_state_request(request_id, channel="ALL"):
     request_data = fetch_request_details(request_id)
     if not request_data:
-        raise Exception(f"Request ID {request_id} not found")
+        raise Exception("Request ID {} not found".format(request_id))
 
     criteria_type  = request_data["criteria_type"]
     criteria_value = request_data["criteria_value"]
@@ -802,11 +800,11 @@ def process_age_state_request(request_id: int, channel: str = "ALL") -> Dict[str
         channels_to_run = CHANNELS
     else:
         if selected not in CHANNELS:
-            raise ValueError(f"Unsupported channel: {channel}")
+            raise ValueError("Unsupported channel: {}".format(channel))
         channels_to_run = [selected]
 
     logger.info("Started request_id=%s for channels=%s", request_id, ",".join(channels_to_run))
-    results: Dict[str, dict] = {}
+    results = {}
 
     try:
         if len(channels_to_run) == 1:
@@ -822,26 +820,31 @@ def process_age_state_request(request_id: int, channel: str = "ALL") -> Dict[str
                     result = future.result()
                     results[result["channel"]] = result
 
-        all_files: List[str] = [
+        all_files = [
             r["file_path"] for r in results.values() if Path(r["file_path"]).exists()
         ]
         total_records = sum(r.get("count", 0) for r in results.values())
 
         summary = (
-            f"SUCCESS - {comp_type.upper()} {criteria_type} {criteria_value}\n"
-            f"Final Dir: {final_dir}\n"
-            f"Total Records: {total_records:,}\n"
+            "SUCCESS - {} {} {}\nFinal Dir: {}\nTotal Records: {:,}\n".format(
+                comp_type.upper(), criteria_type, criteria_value,
+                final_dir, total_records,
+            )
             + "\n".join(
                 [
-                    f"{r['channel']}: {r['file']} | {r.get('count', 0):,} records "
-                    f"| {r['status']} | {r['elapsed']:.2f}s"
+                    "{}: {} | {:,} records | {} | {:.2f}s".format(
+                        r["channel"], r["file"], r.get("count", 0),
+                        r["status"], r["elapsed"],
+                    )
                     for r in results.values()
                 ]
             )
         )
         logger.info(summary)
         send_success_email(
-            f"{comp_type.upper()} {criteria_type} {criteria_value} - {total_records:,} RECORDS",
+            "{} {} {} - {:,} RECORDS".format(
+                comp_type.upper(), criteria_type, criteria_value, total_records
+            ),
             all_files,
             output_dir,
         )
@@ -850,7 +853,8 @@ def process_age_state_request(request_id: int, channel: str = "ALL") -> Dict[str
     except Exception as e:
         logger.error("FAILED: %s", e)
         send_error_email(
-            f"{comp_type.upper()} {criteria_type} {criteria_value} FAILED", str(e)
+            "{} {} {} FAILED".format(comp_type.upper(), criteria_type, criteria_value),
+            str(e),
         )
         raise
 
