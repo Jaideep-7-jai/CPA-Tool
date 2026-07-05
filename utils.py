@@ -19,17 +19,27 @@ from email.mime.multipart import MIMEMultipart
 from config import DB_CONFIG, SENDER, RECIPIENT, CC_RECIPIENTS
 
 def ensure_output_dir(output_dir, criteria_type):
-    """Create output directory if not exists + add timestamped run subdir.
+    """
+    Create output directory if not exists + add timestamped run subdir.
 
-    Always creates a run_age_<HHMMSS> subdir inside output_dir so each
-    execution gets its own isolated folder.
+    Layout:
+        <output_dir>/run_age_<YYYYMMDD_HHMMSS>/
+            logs/         <- combined + per-channel log files
+            FINAL_DIR/    <- final output CSVs/ZIPs that remain after run
+
+    Each execution gets its own isolated folder with full date+time stamp.
     """
     path = Path(output_dir)
     path.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime('%H%M%S')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     safe_dir = path / f"run_age_{timestamp}"
     safe_dir.mkdir(exist_ok=True)
+
+    # Pre-create logs/ and FINAL_DIR/ so they always exist
+    (safe_dir / "logs").mkdir(exist_ok=True)
+    (safe_dir / "FINAL_DIR").mkdir(exist_ok=True)
+
     logging.info(f"Using run directory: {safe_dir}")
     return safe_dir
 
@@ -164,7 +174,7 @@ def send_success_email(subject, files, output_dir):
             [f"{os.path.basename(f)} ({os.path.getsize(f)/1e6:.1f} MB)" for f in safe_files]
         )
     else:
-        file_details = "Files uploaded to FTP (local copies removed)"
+        file_details = "Files uploaded to FTP (local copies in FINAL_DIR)"
     body = f"""SUCCESS: {subject}
 
 Output Directory: {output_dir}
