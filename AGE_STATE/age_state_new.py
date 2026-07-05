@@ -16,6 +16,8 @@ import os
 import time
 import logging
 import pymysql
+import subprocess
+import shlex
 import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -167,11 +169,9 @@ def _build_common_context(request_id: int, channel_name: str) -> dict:
 
 def _count_file_lines(file_path: str) -> int:
     """Fast line count using wc -l (avoids loading file into memory)."""
-    result = run_command(f"wc -l < {file_path}", capture_output=True)
-    try:
-        return int(result.strip())
-    except (ValueError, AttributeError):
-        return 0
+    cmd = f"wc -l < {shlex.quote(file_path)}"
+    result = subprocess.check_output(cmd, shell=True, text=True).strip()
+    return int(result) if result else 0
 
 
 def _download_and_combine(s3_path: str, download_dir: Path, final_dir: str, output_file: str, channel_name: str):
