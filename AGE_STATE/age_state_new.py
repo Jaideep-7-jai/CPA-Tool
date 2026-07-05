@@ -30,9 +30,9 @@ Changes:
   - FINAL_DIR and logs/ are never deleted
   - GREEN/BLUE/ARCAMAX: deduplicate on email column after combining S3 files
   - ORANGE: suppression -> email-only CSV; mailing -> ESP-wise split + ZIP
-  - SMART DEDUP: if combined file row-count > 100M, dedup via Snowflake staging
-    table (avoids /tmp space exhaustion on servers like GREEN with 278M rows).
-    If <= 100M rows, dedup in-process with pandas (fast, no network round-trip).
+  - SMART DEDUP: if combined file row-count > 100M, dedup via disk-streaming
+    sort | uniq (avoids /tmp and RAM exhaustion on large files like GREEN
+    with 162M+ rows).  If <= 100M rows, dedup in-process with pandas.
 """
 
 import os
@@ -68,9 +68,9 @@ DB_CONFIG = {
 
 CHANNELS = ["GREEN", "BLUE", "ARCAMAX", "ORANGE"]
 
-# Row count threshold above which we use Snowflake staging for dedup instead
-# of in-process pandas (to avoid /tmp space exhaustion on large datasets like
-# GREEN which can produce 278M+ rows).
+# Row count threshold above which we use disk-streaming sort|uniq dedup
+# instead of in-process pandas (to avoid RAM exhaustion on large files
+# like GREEN which can produce 162M+ rows).
 LARGE_FILE_ROW_THRESHOLD = 100_000_000
 
 # Module-level logger; replaced per-run by setup_logging().
@@ -95,10 +95,6 @@ def setup_logging(output_dir, criteria_type):
     """
     Set up the shared 'age_processor' logger with a single combined log file
     under <output_dir>/logs/<criteria_type>_<timestamp>.log.
-
-    All logs (combined + per-channel) live exclusively inside logs/.
-    No log files are written outside logs/.
-    Returns the logger.
     """
     log_date = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = Path(output_dir) / "logs" / f"{criteria_type}_{log_date}.log"
@@ -112,14 +108,8 @@ def setup_logging(output_dir, criteria_type):
 
 def setup_channel_logging(output_dir, channel_name, criteria_type):
     """
-    Add a per-channel FileHandler to the shared 'age_processor' logger so that
-    every message is written to BOTH the combined log and the channel-specific
-    log file:
-
-        <output_dir>/logs/<CHANNEL>_<criteria_type>_<timestamp>.log
-
-    Returns the channel-specific FileHandler so the caller can remove it when
-    the channel finishes (keeping the combined log handler in place).
+    Add a per-channel FileHandler to the shared 'age_processor' logger.
+    Returns the handler so the caller can remove it when the channel finishes.
     """
     log_date = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = (
@@ -194,16 +184,6 @@ def update_request_status(request_id, status, status_column):
 def _build_common_context(request_id, channel_name):
     """
     Build the shared context dict for a channel run.
-
-    Output folder layout:
-
-        <output_dir>/run_age_<YYYYMMDD_HHMMSS>/
-            logs/                              <- all log files
-            FINAL_DIR/                         <- final output files (kept)
-            <CHANNEL>/                         <- temp working dir (deleted after FTP)
-
-    Final files are always written into FINAL_DIR/.
-    Temp channel dirs are created as siblings of FINAL_DIR/ and deleted after FTP.
     """
     request_data = fetch_request_details(request_id)
     if not request_data:
@@ -217,14 +197,11 @@ def _build_common_context(request_id, channel_name):
     comp_type      = request_data["comp_type"]
     output_dir     = request_data["output_dir"]
 
-    # ensure_output_dir returns the timestamped run subdir (run_age_YYYYMMDD_HHMMSS)
     safe_output_dir = ensure_output_dir(output_dir, criteria_type)
 
-    # FINAL_DIR: permanent home for all final output files
     final_dir = Path(str(safe_output_dir)) / "FINAL_DIR"
     final_dir.mkdir(parents=True, exist_ok=True)
 
-    # Temp per-channel working dir — deleted after FTP
     channel_dir = Path(str(safe_output_dir)) / channel_name.upper()
     channel_dir.mkdir(parents=True, exist_ok=True)
 
@@ -260,9 +237,6 @@ def _download_and_combine(s3_path, download_dir, work_dir, output_file, channel_
     """
     Download gzipped S3 parts into *download_dir* and concatenate into one
     pipe-delimited file at <work_dir>/<output_file>.
-
-    work_dir is the temp channel dir; output ends up here before being
-    moved to FINAL_DIR after dedup.
     """
     download_dir = Path(download_dir)
     work_dir     = Path(work_dir)
@@ -293,124 +267,53 @@ def _download_and_combine(s3_path, download_dir, work_dir, output_file, channel_
     run_command(f"rm -f {str(download_dir / 'data*')}", cwd=str(download_dir))
 
 
-def _dedup_via_snowflake(file_path, channel_name, s3_path, path_date, final_dir):
+def _dedup_via_sort(file_path, final_dir, channel_name):
     """
-    Dedup strategy for files with > LARGE_FILE_ROW_THRESHOLD rows.
+    Disk-streaming dedup for files with > LARGE_FILE_ROW_THRESHOLD rows.
 
-    Steps:
-      1. Load combined CSV from channel temp dir into Snowflake staging table.
-      2. SELECT DISTINCT email -> COPY OUT to per-channel dedup S3 prefix.
-      3. Download part-files into a tmp subdir inside final_dir; assert >=1 CSV.
-      4. Concatenate part-files into final_dir/<output_file> (permanent).
-      5. Clean up Snowflake staging table, S3 dedup prefix, and tmp part-files.
+    Uses the GNU coreutils pipeline:
+        sort --parallel=4 -T <tmp_dir> -u <input> -o <output>
 
-    NOTE: The intermediate row-count check via SnowSQL SELECT COUNT(*) was
-    removed because SnowSQL stdout is unreliable when called from subprocess
-    in this environment (returns empty string). Validation is done instead by
-    asserting that at least one CSV part-file was downloaded after COPY OUT —
-    if the staging COPY INTO produced 0 rows, Snowflake writes 0 files and
-    the FileNotFoundError below fires immediately with a clear message.
+    This spills merge-sort chunks to disk (-T), so it never loads the entire
+    file into RAM.  It is guaranteed to work on any Linux server regardless
+    of Snowflake connectivity or S3 credential issues.
 
-    Python 3.6 compatibility:
-      - subprocess.run uses stdout/stderr=PIPE, not capture_output=True (3.7+)
-      - Path.unlink() uses try/except instead of missing_ok=True (3.8+)
+    The sort tmp dir is placed inside the channel's FINAL_DIR so it stays
+    on the same filesystem as the output (avoids cross-device mv issues).
+
+    Returns (final_file_path_str, record_count).
     """
-    stage_table  = f"APT_ADHOC_DEDUP_STAGING_{channel_name}_{path_date}"
-    dedup_s3     = f"{s3_path}/DEDUP_{path_date}/"
-    final_dir    = Path(final_dir)
-
-    # Tmp download dir lives inside FINAL_DIR; cleaned up after assembly
-    dedup_dl_dir = final_dir / f"{channel_name}_DEDUP_TMP"
-    dedup_dl_dir.mkdir(parents=True, exist_ok=True)
-
-    # Final assembled output goes directly to FINAL_DIR
+    final_dir   = Path(final_dir)
     output_filename = Path(file_path).name
     final_file_path = final_dir / output_filename
 
+    # Use a tmp dir inside final_dir so sort spill files stay on the same fs
+    sort_tmp_dir = final_dir / f"{channel_name}_SORT_TMP"
+    sort_tmp_dir.mkdir(parents=True, exist_ok=True)
+
     logger.info(
-        f"Large file detected for {channel_name} — using Snowflake staging dedup "
-        f"(table: {stage_table})"
+        f"Large file detected for {channel_name} — using disk-streaming sort|uniq dedup "
+        f"(sort tmp: {sort_tmp_dir})"
     )
-    logger.info(f"Snowflake dedup S3 prefix  : {dedup_s3}")
-    logger.info(f"Local dedup tmp directory  : {str(dedup_dl_dir)}")
-    logger.info(f"Final output path          : {str(final_file_path)}")
+    logger.info(f"Input  : {file_path}")
+    logger.info(f"Output : {final_file_path}")
 
-    os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-
-    # 1. Create staging table and load
-    run_command(["snowsql", "-c", "datateam1", "-q",
-                 f"CREATE OR REPLACE TEMPORARY TABLE {stage_table} (email VARCHAR);"])
-
-    run_command(["snowsql", "-c", "datateam1", "-q",
-                 f"PUT file://{file_path} @~/{stage_table}/  OVERWRITE=TRUE AUTO_COMPRESS=TRUE;"])
-
-    run_command(["snowsql", "-c", "datateam1", "-q",
-                 f"COPY INTO {stage_table} FROM @~/{stage_table}/ "
-                 f"FILE_FORMAT=(TYPE=CSV FIELD_DELIMITER='|' SKIP_HEADER=0);"])
-
-    logger.info(f"Snowflake staging table {stage_table} loaded — running COPY OUT for DISTINCT emails")
-
-    # 2. COPY DISTINCT emails out to S3
-    run_command(["snowsql", "-c", "datateam1", "-q",
-                 f"COPY INTO '{dedup_s3}' "
-                 f"FROM (SELECT DISTINCT email FROM {stage_table}) "
-                 f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
-                 f"FILE_FORMAT=(TYPE=CSV COMPRESSION=NONE FIELD_DELIMITER='|') "
-                 f"MAX_FILE_SIZE=490000000;"])
-
-    # 3. Download dedup parts into tmp dir inside FINAL_DIR
-    run_command(["aws", "s3", "cp", dedup_s3, str(dedup_dl_dir), "--recursive", "--quiet"])
-
-    downloaded_csvs = sorted(dedup_dl_dir.glob("*.csv"))
-    if not downloaded_csvs:
-        raise FileNotFoundError(
-            f"Snowflake COPY OUT produced no CSV files in {dedup_dl_dir}. "
-            f"Expected files at S3 prefix: {dedup_s3}. "
-            f"Check that COPY INTO loaded rows and the COPY OUT S3 path is correct."
-        )
-
-    total_dl_bytes = sum(f.stat().st_size for f in downloaded_csvs)
-    logger.info(
-        f"Downloaded {len(downloaded_csvs)} CSV part-file(s) from {dedup_s3} "
-        f"(total {total_dl_bytes / 1_048_576:.1f} MB)"
+    # sort -u: sort + unique in one pass; -T: spill dir; --parallel: use 4 cores
+    sort_cmd = (
+        f"sort -u --parallel=4 -T {shlex.quote(str(sort_tmp_dir))} "
+        f"{shlex.quote(file_path)} -o {shlex.quote(str(final_file_path))}"
     )
+    run_command(sort_cmd)
 
-    # 4. Concatenate part-files into FINAL_DIR/<output_filename>
-    with open(str(final_file_path), "wb") as out_fh:
-        for part in downloaded_csvs:
-            with open(str(part), "rb") as in_fh:
-                while True:
-                    chunk = in_fh.read(8 * 1024 * 1024)
-                    if not chunk:
-                        break
-                    out_fh.write(chunk)
-    logger.info(
-        f"Reassembled {len(downloaded_csvs)} part-file(s) into FINAL_DIR/{output_filename}"
-    )
-
-    # 5. Count final rows
-    record_count = _count_file_lines(str(final_file_path))
-
-    # Cleanup tmp part-files and dedup tmp dir
-    for part in downloaded_csvs:
-        try:
-            part.unlink()
-        except FileNotFoundError:
-            pass
+    # Clean up sort tmp dir
     try:
-        dedup_dl_dir.rmdir()
-    except OSError:
-        logger.warning(
-            f"dedup_dl_dir {str(dedup_dl_dir)} is not empty after cleanup — skipping rmdir"
-        )
+        shutil.rmtree(str(sort_tmp_dir))
+    except Exception as e:
+        logger.warning(f"Could not remove sort tmp dir {sort_tmp_dir}: {e}")
 
-    # Cleanup Snowflake staging and S3 dedup prefix
-    run_command(["snowsql", "-c", "datateam1", "-q",
-                 f"DROP TABLE IF EXISTS {stage_table}; REMOVE @~/{stage_table}/;"])
-    run_command(["aws", "s3", "rm", dedup_s3, "--recursive", "--quiet"])
-
+    record_count = _count_file_lines(str(final_file_path))
     logger.info(
-        f"Snowflake dedup complete for {channel_name}: "
+        f"sort|uniq dedup complete for {channel_name}: "
         f"{record_count} unique emails -> FINAL_DIR/{output_filename}"
     )
     return str(final_file_path), record_count
@@ -421,11 +324,10 @@ def _dedup_email_col(file_path, final_dir, channel_name="", s3_path="", path_dat
     Smart dedup dispatcher:
       - Count rows with wc -l (cheap, no memory cost).
       - If row count > LARGE_FILE_ROW_THRESHOLD (100M):
-            use Snowflake staging table to do the dedup.
-            Final file is written directly into FINAL_DIR by _dedup_via_snowflake.
+            use disk-streaming sort -u (GNU coreutils, spills to disk,
+            no RAM or Snowflake/S3 dependency).
       - Else:
-            use pandas in-process dedup (fast for smaller files),
-            then move the deduped file from channel temp dir to FINAL_DIR.
+            use pandas in-process dedup (fast for smaller files).
 
     Returns (final_file_path, record_count).
     """
@@ -435,12 +337,7 @@ def _dedup_email_col(file_path, final_dir, channel_name="", s3_path="", path_dat
     )
 
     if row_count > LARGE_FILE_ROW_THRESHOLD:
-        if not s3_path or not path_date or not channel_name:
-            raise ValueError(
-                "_dedup_email_col: s3_path, path_date, and channel_name are "
-                "required for large-file Snowflake dedup."
-            )
-        return _dedup_via_snowflake(file_path, channel_name, s3_path, path_date, final_dir)
+        return _dedup_via_sort(file_path, final_dir, channel_name)
     else:
         df     = pd.read_csv(file_path, sep="|", header=None, dtype=str)
         before = len(df)
@@ -449,7 +346,6 @@ def _dedup_email_col(file_path, final_dir, channel_name="", s3_path="", path_dat
         logger.info(
             f"Dedup {file_path}: {before} -> {after} unique emails (removed {before - after})"
         )
-        # Write deduped file directly to FINAL_DIR
         final_file_path = str(Path(final_dir) / Path(file_path).name)
         df.to_csv(final_file_path, sep="|", index=False, header=False)
         logger.info(f"Deduped file written to FINAL_DIR/{Path(file_path).name}")
@@ -509,7 +405,7 @@ def process_green_blue(request_id, channel_name):
         final_dir      = ctx["final_dir"]
 
         if criteria_type == "age":
-            condition = f'''b.AGE {">=\" if comp_type == 'greater' else \"<"} {criteria_value}'''
+            condition = f"b.AGE {'>=': if comp_type == 'greater' else '<'} {criteria_value}"
             header    = "a.email,b.age"
         elif criteria_type == "state":
             if isinstance(criteria_value, str):
@@ -541,12 +437,10 @@ def process_green_blue(request_id, channel_name):
 
         update_request_status(request_id, "Combining Data", channel_status)
         download_dir = channel_dir / f"{channel_name}_OP_PATH"
-        # Download and combine into channel temp dir
         _download_and_combine(
             ctx["s3_path"], download_dir, channel_dir, ctx["output_file"], channel_name
         )
 
-        # Dedup: result final file goes to FINAL_DIR
         tmp_file_path = str(channel_dir / ctx["output_file"])
         final_file_path, record_count = _dedup_email_col(
             tmp_file_path,
@@ -557,7 +451,6 @@ def process_green_blue(request_id, channel_name):
         )
 
         update_request_status(request_id, "Posting To FTP", channel_status)
-        # FTP from FINAL_DIR
         _post_to_ftp(final_dir, ctx["path_date"], ctx["output_file"])
 
         elapsed = time.time() - start_time
@@ -570,7 +463,6 @@ def process_green_blue(request_id, channel_name):
         result = _success_result(
             channel_name, ctx["output_file"], final_file_path, elapsed, record_count
         )
-        # Remove only the temp channel working dir; FINAL_DIR untouched
         _cleanup_channel_dir(channel_dir)
         return result
 
@@ -738,7 +630,6 @@ def process_orange(request_id):
         update_request_status(request_id, "Combining Data", channel_status)
         raw_combined = f"ORANGE_RAW_{path_date}.csv"
         download_dir = channel_dir / "ORANGE_OP_PATH"
-        # Download/combine into temp channel dir
         _download_and_combine(
             ctx["s3_path"], download_dir, channel_dir, raw_combined, channel_name
         )
@@ -757,7 +648,6 @@ def process_orange(request_id):
 
         if request_type.lower() == "suppression":
             output_file      = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
-            # Write final suppression file directly to FINAL_DIR
             suppression_path = final_dir / output_file
             (
                 df_final[["email_address"]]
@@ -824,7 +714,6 @@ def process_orange(request_id):
 def process_age_state_request(request_id, channel="ALL"):
     """
     Orchestrate channel processing for a single request.
-
     channel: "ALL" | "GREEN" | "BLUE" | "ARCAMAX" | "ORANGE"
     """
     request_data = fetch_request_details(request_id)
@@ -834,7 +723,6 @@ def process_age_state_request(request_id, channel="ALL"):
     output_dir    = request_data["output_dir"]
     criteria_type = request_data["criteria_type"]
 
-    # Setup combined log first (channel logs add on top of this)
     setup_logging(output_dir, criteria_type)
 
     channels_to_run = CHANNELS if channel.upper() == "ALL" else [channel.upper()]
@@ -842,7 +730,6 @@ def process_age_state_request(request_id, channel="ALL"):
         f"Started request_id={request_id} for channels={','.join(channels_to_run)}"
     )
 
-    # Update per-channel status to Started up front
     for ch in channels_to_run:
         update_request_status(request_id, "Started", f"{ch}_STATUS")
 
@@ -856,8 +743,8 @@ def process_age_state_request(request_id, channel="ALL"):
         else:
             raise ValueError(f"Unknown channel: {ch}")
 
-    results  = {}
-    failed   = []
+    results = {}
+    failed  = []
 
     if len(channels_to_run) == 1:
         ch = channels_to_run[0]
