@@ -7,6 +7,9 @@ only when multiple channels are requested.
 Changes:
   - GREEN/BLUE/ARCAMAX: deduplicate on email column after combining S3 files
   - ORANGE: suppression -> email-only CSV; mailing -> ESP-wise split + ZIP
+  - SMART DEDUP: if combined file row-count > 100M, dedup via Snowflake staging
+    table (avoids /tmp space exhaustion on servers like GREEN with 278M rows).
+    If <= 100M rows, dedup in-process with pandas (fast, no network round-trip).
 """
 
 import os
@@ -37,6 +40,11 @@ DB_CONFIG = {
 }
 
 CHANNELS = ["GREEN", "BLUE", "ARCAMAX", "ORANGE"]
+
+# Row count threshold above which we use Snowflake staging for dedup instead
+# of in-process pandas (to avoid /tmp space exhaustion on large datasets like
+# GREEN which can produce 278M+ rows).
+LARGE_FILE_ROW_THRESHOLD = 100_000_000
 
 logger = logging.getLogger("age_processor")
 
@@ -157,6 +165,15 @@ def _build_common_context(request_id: int, channel_name: str) -> dict:
     }
 
 
+def _count_file_lines(file_path: str) -> int:
+    """Fast line count using wc -l (avoids loading file into memory)."""
+    result = run_command(f"wc -l < {file_path}", capture_output=True)
+    try:
+        return int(result.strip())
+    except (ValueError, AttributeError):
+        return 0
+
+
 def _download_and_combine(s3_path: str, download_dir: Path, final_dir: str, output_file: str, channel_name: str):
     """Download gzipped S3 parts and concatenate into one pipe-delimited file."""
     download_dir.mkdir(parents=True, exist_ok=True)
@@ -174,19 +191,148 @@ def _download_and_combine(s3_path: str, download_dir: Path, final_dir: str, outp
     run_command("rm -f data*", cwd=download_dir)
 
 
-def _dedup_email_col(file_path: str) -> int:
+def _dedup_via_snowflake(
+    file_path: str,
+    channel_name: str,
+    s3_path: str,
+    path_date: str,
+) -> int:
     """
-    Read a pipe-delimited file, drop duplicate values in column 0 (email),
-    overwrite the file with unique-email rows only, and return final count.
-    Works for GREEN / BLUE / ARCAMAX where S3 exports email|age or email|state.
+    Dedup strategy for files with > LARGE_FILE_ROW_THRESHOLD rows.
+
+    Steps:
+      1. Load the combined CSV into a temporary Snowflake staging table.
+      2. Run SELECT DISTINCT email FROM staging_table and COPY OUT back to a
+         dedicated S3 dedup prefix.
+      3. Download the dedup part-files and reassemble into a single final CSV,
+         replacing the original file_path.
+      4. Clean up the Snowflake staging table.
+
+    This keeps all heavy sorting/hashing inside Snowflake where /tmp size is
+    not a constraint, instead of on the job server.
     """
-    df = pd.read_csv(file_path, sep="|", header=None, dtype=str)
-    before = len(df)
-    df = df.drop_duplicates(subset=[0])          # col 0 = email
-    df.to_csv(file_path, sep="|", index=False, header=False)
-    after = len(df)
-    logger.info("Dedup %s: %d -> %d unique emails (removed %d)", file_path, before, after, before - after)
-    return after
+    stage_table  = f"APT_ADHOC_DEDUP_STAGING_{channel_name}_{path_date}"
+    dedup_s3     = f"{s3_path}_DEDUP_{path_date}/"
+    final_dir    = str(Path(file_path).parent)
+    dedup_dl_dir = Path(final_dir) / f"{channel_name}_DEDUP_TMP"
+    dedup_dl_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "Large file detected for %s — using Snowflake staging dedup (table: %s)",
+        channel_name, stage_table,
+    )
+
+    os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
+
+    # 1. Create staging table and load the combined CSV
+    create_sql = (
+        f"CREATE OR REPLACE TEMPORARY TABLE {stage_table} (email VARCHAR);"
+    )
+    run_command(["snowsql", "-c", "datateam1", "-q", create_sql])
+
+    # PUT the file to Snowflake internal stage then COPY INTO table
+    put_sql = f"PUT file://{file_path} @~/{stage_table}/ OVERWRITE=TRUE AUTO_COMPRESS=TRUE;"
+    run_command(["snowsql", "-c", "datateam1", "-q", put_sql])
+
+    copy_in_sql = (
+        f"COPY INTO {stage_table} FROM @~/{stage_table}/ "
+        f"FILE_FORMAT=(TYPE=CSV FIELD_DELIMITER='|' SKIP_HEADER=0);"
+    )
+    run_command(["snowsql", "-c", "datateam1", "-q", copy_in_sql])
+
+    # 2. COPY DISTINCT emails back out to S3
+    copy_out_sql = (
+        f"COPY INTO '{dedup_s3}' "
+        f"FROM (SELECT DISTINCT email FROM {stage_table}) "
+        f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
+        f"FILE_FORMAT=(TYPE=CSV COMPRESSION=NONE FIELD_DELIMITER='|') "
+        f"MAX_FILE_SIZE=490000000;"
+    )
+    run_command(["snowsql", "-c", "datateam1", "-q", copy_out_sql])
+
+    # 3. Download dedup parts and reassemble into the original file_path
+    run_command(
+        ["aws", "s3", "cp", dedup_s3, ".", "--recursive", "--quiet"],
+        cwd=dedup_dl_dir,
+    )
+    run_command(
+        f"cat *.csv > {file_path}",
+        cwd=dedup_dl_dir,
+    )
+
+    # 4. Count final rows and cleanup
+    record_count = _count_file_lines(file_path)
+    run_command("rm -f *.csv", cwd=dedup_dl_dir)
+    dedup_dl_dir.rmdir()
+
+    # Drop staging table and internal stage files
+    cleanup_sql = (
+        f"DROP TABLE IF EXISTS {stage_table}; "
+        f"REMOVE @~/{stage_table}/;"
+    )
+    run_command(["snowsql", "-c", "datateam1", "-q", cleanup_sql])
+
+    # Remove dedup S3 prefix files
+    run_command(
+        ["aws", "s3", "rm", dedup_s3, "--recursive", "--quiet"],
+    )
+
+    logger.info(
+        "Snowflake dedup complete for %s: %d unique emails in final file",
+        channel_name, record_count,
+    )
+    return record_count
+
+
+def _dedup_email_col(
+    file_path: str,
+    channel_name: str = "",
+    s3_path: str = "",
+    path_date: str = "",
+) -> int:
+    """
+    Smart dedup dispatcher:
+      - Count rows with wc -l (cheap, no memory cost).
+      - If row count > LARGE_FILE_ROW_THRESHOLD (100M):
+            use Snowflake staging table to do the dedup (avoids /tmp exhaustion).
+      - Else:
+            use pandas in-process dedup (fast for smaller files).
+
+    Works for GREEN / BLUE / ARCAMAX where the combined file contains
+    email (and optionally a second column).  Only column 0 (email) is
+    considered for deduplication.
+    """
+    row_count = _count_file_lines(file_path)
+    logger.info(
+        "Dedup check for %s: %d rows (threshold=%d)",
+        file_path, row_count, LARGE_FILE_ROW_THRESHOLD,
+    )
+
+    if row_count > LARGE_FILE_ROW_THRESHOLD:
+        # ------------------------------------------------------------------
+        # LARGE FILE PATH: offload dedup to Snowflake to avoid disk/tmp issues
+        # ------------------------------------------------------------------
+        if not s3_path or not path_date or not channel_name:
+            raise ValueError(
+                "_dedup_email_col: s3_path, path_date, and channel_name are "
+                "required for large-file Snowflake dedup."
+            )
+        return _dedup_via_snowflake(file_path, channel_name, s3_path, path_date)
+
+    else:
+        # ------------------------------------------------------------------
+        # SMALL FILE PATH: in-process pandas dedup (fast, no network round-trip)
+        # ------------------------------------------------------------------
+        df = pd.read_csv(file_path, sep="|", header=None, dtype=str)
+        before = len(df)
+        df = df.drop_duplicates(subset=[0])   # col 0 = email
+        df.to_csv(file_path, sep="|", index=False, header=False)
+        after = len(df)
+        logger.info(
+            "Dedup %s: %d -> %d unique emails (removed %d)",
+            file_path, before, after, before - after,
+        )
+        return after
 
 
 def _post_to_ftp(final_dir: str, path_date: str, output_file: str):
@@ -216,7 +362,7 @@ def _success_result(
 # ---------------------------------------------------------------------------
 
 def process_green_blue(request_id: int, channel_name: str) -> dict:
-    """GREEN and BLUE channel processor with email deduplication."""
+    """GREEN and BLUE channel processor with smart email deduplication."""
     channel_name = channel_name.upper()
     if channel_name not in ["GREEN", "BLUE"]:
         raise ValueError("process_green_blue supports only GREEN or BLUE")
@@ -267,10 +413,14 @@ def process_green_blue(request_id: int, channel_name: str) -> dict:
         output_path = Path(ctx["final_dir"]) / f"{channel_name}_OP_PATH"
         _download_and_combine(ctx["s3_path"], output_path, ctx["final_dir"], ctx["output_file"], channel_name)
 
-        # ---- Change 2: deduplicate on email column -------------------------
+        # Smart dedup: large files -> Snowflake, small files -> pandas
         final_file_path = str(Path(ctx["final_dir"]) / ctx["output_file"])
-        record_count = _dedup_email_col(final_file_path)
-        # -------------------------------------------------------------------
+        record_count = _dedup_email_col(
+            final_file_path,
+            channel_name=channel_name,
+            s3_path=ctx["s3_path"],
+            path_date=ctx["path_date"],
+        )
 
         update_request_status(request_id, "Posting To FTP", channel_status)
         _post_to_ftp(ctx["final_dir"], ctx["path_date"], ctx["output_file"])
@@ -288,7 +438,7 @@ def process_green_blue(request_id: int, channel_name: str) -> dict:
 
 
 def process_arcamax(request_id: int) -> dict:
-    """ARCAMAX channel processor with email deduplication."""
+    """ARCAMAX channel processor with smart email deduplication."""
     channel_name   = "ARCAMAX"
     channel_status = "ARCAMAX_STATUS"
     update_request_status(request_id, "Started", channel_status)
@@ -335,10 +485,14 @@ def process_arcamax(request_id: int) -> dict:
         output_path = Path(ctx["final_dir"]) / "ARCAMAX_OP_PATH"
         _download_and_combine(ctx["s3_path"], output_path, ctx["final_dir"], ctx["output_file"], channel_name)
 
-        # ---- Change 2: deduplicate on email column -------------------------
+        # Smart dedup: large files -> Snowflake, small files -> pandas
         final_file_path = str(Path(ctx["final_dir"]) / ctx["output_file"])
-        record_count = _dedup_email_col(final_file_path)
-        # -------------------------------------------------------------------
+        record_count = _dedup_email_col(
+            final_file_path,
+            channel_name=channel_name,
+            s3_path=ctx["s3_path"],
+            path_date=ctx["path_date"],
+        )
 
         update_request_status(request_id, "Posting To FTP", channel_status)
         _post_to_ftp(ctx["final_dir"], ctx["path_date"], ctx["output_file"])
@@ -433,10 +587,10 @@ def process_orange(request_id: int) -> dict:
 
         update_request_status(request_id, "Posting To FTP", channel_status)
 
-        # ---- Change 1: suppression vs mailing --------------------------------
+        # ---- suppression vs mailing ----------------------------------------
         if request_type.lower() == "suppression":
-            # --- suppression: unique email-only CSV ---------------------------
-            output_file     = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
+            # suppression: unique email-only CSV
+            output_file      = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
             suppression_path = Path(final_dir) / output_file
             (
                 df_final[["email_address"]]
@@ -451,7 +605,7 @@ def process_orange(request_id: int) -> dict:
             _post_to_ftp(final_dir, path_date, output_file)
 
         else:
-            # --- mailing: ESP-wise split + ZIP --------------------------------
+            # mailing: ESP-wise split + ZIP
             esp_split_dir = Path(final_dir) / "ORANGE_OP_PATH"
             esp_split_dir.mkdir(exist_ok=True)
 
@@ -484,7 +638,7 @@ def process_orange(request_id: int) -> dict:
             logger.info("ORANGE mailing ZIP: %s (%d records)", output_file, record_count)
 
             _post_to_ftp(final_dir, path_date, output_file)
-        # ----------------------------------------------------------------------
+        # --------------------------------------------------------------------
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status)
