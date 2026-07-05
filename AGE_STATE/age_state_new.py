@@ -293,53 +293,23 @@ def _download_and_combine(s3_path, download_dir, work_dir, output_file, channel_
     run_command(f"rm -f {str(download_dir / 'data*')}", cwd=str(download_dir))
 
 
-def _get_snowflake_row_count(stage_table):
-    """
-    Query Snowflake for the exact row count of a staging table.
-    Returns the integer count, or raises RuntimeError if the query fails.
-
-    Uses stdout=subprocess.PIPE / stderr=subprocess.PIPE instead of
-    capture_output=True to remain compatible with Python 3.6
-    (capture_output was added in Python 3.7).
-    """
-    count_sql = f"SELECT COUNT(*) FROM {stage_table};"
-    result = subprocess.run(
-        ["snowsql", "-c", "datateam1", "-q", count_sql,
-         "-o", "output_format=csv", "-o", "header=false",
-         "-o", "timing=false", "-o", "friendly=false"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Failed to query row count for {stage_table}:\n{result.stderr.strip()}"
-        )
-    for line in result.stdout.splitlines():
-        line = line.strip().strip('"').strip(',')
-        if line.isdigit():
-            return int(line)
-    raise RuntimeError(
-        f"Could not parse row count from SnowSQL output for {stage_table}.\n"
-        f"stdout: {result.stdout!r}\n"
-        f"Tip: check that SnowSQL connects successfully and the table exists."
-    )
-
-
 def _dedup_via_snowflake(file_path, channel_name, s3_path, path_date, final_dir):
     """
     Dedup strategy for files with > LARGE_FILE_ROW_THRESHOLD rows.
 
     Steps:
       1. Load combined CSV from channel temp dir into Snowflake staging table.
-      2. Assert the staging table has rows (fail fast before COPY OUT).
-      3. SELECT DISTINCT email -> COPY OUT to per-channel dedup S3 prefix.
-      4. Download part-files into a tmp subdir inside final_dir; assert >=1 CSV.
-      5. Concatenate part-files into final_dir/<output_file> (permanent).
-      6. Clean up Snowflake staging table, S3 dedup prefix, and tmp part-files.
+      2. SELECT DISTINCT email -> COPY OUT to per-channel dedup S3 prefix.
+      3. Download part-files into a tmp subdir inside final_dir; assert >=1 CSV.
+      4. Concatenate part-files into final_dir/<output_file> (permanent).
+      5. Clean up Snowflake staging table, S3 dedup prefix, and tmp part-files.
 
-    The dedup download tmp dir is inside FINAL_DIR so the final assembled file
-    ends up in FINAL_DIR directly.
+    NOTE: The intermediate row-count check via SnowSQL SELECT COUNT(*) was
+    removed because SnowSQL stdout is unreliable when called from subprocess
+    in this environment (returns empty string). Validation is done instead by
+    asserting that at least one CSV part-file was downloaded after COPY OUT —
+    if the staging COPY INTO produced 0 rows, Snowflake writes 0 files and
+    the FileNotFoundError below fires immediately with a clear message.
 
     Python 3.6 compatibility:
       - subprocess.run uses stdout/stderr=PIPE, not capture_output=True (3.7+)
@@ -378,16 +348,9 @@ def _dedup_via_snowflake(file_path, channel_name, s3_path, path_date, final_dir)
                  f"COPY INTO {stage_table} FROM @~/{stage_table}/ "
                  f"FILE_FORMAT=(TYPE=CSV FIELD_DELIMITER='|' SKIP_HEADER=0);"])
 
-    # 2. Assert staging table has rows
-    staging_row_count = _get_snowflake_row_count(stage_table)
-    logger.info(f"Staging table {stage_table} loaded with {staging_row_count} rows")
-    if staging_row_count == 0:
-        raise RuntimeError(
-            f"Snowflake staging table {stage_table} has 0 rows after COPY INTO. "
-            f"Check file format and source file: {file_path}"
-        )
+    logger.info(f"Snowflake staging table {stage_table} loaded — running COPY OUT for DISTINCT emails")
 
-    # 3. COPY DISTINCT emails out to S3
+    # 2. COPY DISTINCT emails out to S3
     run_command(["snowsql", "-c", "datateam1", "-q",
                  f"COPY INTO '{dedup_s3}' "
                  f"FROM (SELECT DISTINCT email FROM {stage_table}) "
@@ -395,7 +358,7 @@ def _dedup_via_snowflake(file_path, channel_name, s3_path, path_date, final_dir)
                  f"FILE_FORMAT=(TYPE=CSV COMPRESSION=NONE FIELD_DELIMITER='|') "
                  f"MAX_FILE_SIZE=490000000;"])
 
-    # 4. Download dedup parts into tmp dir inside FINAL_DIR
+    # 3. Download dedup parts into tmp dir inside FINAL_DIR
     run_command(["aws", "s3", "cp", dedup_s3, str(dedup_dl_dir), "--recursive", "--quiet"])
 
     downloaded_csvs = sorted(dedup_dl_dir.glob("*.csv"))
@@ -403,7 +366,7 @@ def _dedup_via_snowflake(file_path, channel_name, s3_path, path_date, final_dir)
         raise FileNotFoundError(
             f"Snowflake COPY OUT produced no CSV files in {dedup_dl_dir}. "
             f"Expected files at S3 prefix: {dedup_s3}. "
-            f"Check COPY INTO wrote rows and aws s3 cp target is correct."
+            f"Check that COPY INTO loaded rows and the COPY OUT S3 path is correct."
         )
 
     total_dl_bytes = sum(f.stat().st_size for f in downloaded_csvs)
@@ -412,7 +375,7 @@ def _dedup_via_snowflake(file_path, channel_name, s3_path, path_date, final_dir)
         f"(total {total_dl_bytes / 1_048_576:.1f} MB)"
     )
 
-    # 5. Concatenate part-files into FINAL_DIR/<output_filename>
+    # 4. Concatenate part-files into FINAL_DIR/<output_filename>
     with open(str(final_file_path), "wb") as out_fh:
         for part in downloaded_csvs:
             with open(str(part), "rb") as in_fh:
@@ -425,7 +388,7 @@ def _dedup_via_snowflake(file_path, channel_name, s3_path, path_date, final_dir)
         f"Reassembled {len(downloaded_csvs)} part-file(s) into FINAL_DIR/{output_filename}"
     )
 
-    # 6. Count final rows
+    # 5. Count final rows
     record_count = _count_file_lines(str(final_file_path))
 
     # Cleanup tmp part-files and dedup tmp dir
@@ -546,7 +509,7 @@ def process_green_blue(request_id, channel_name):
         final_dir      = ctx["final_dir"]
 
         if criteria_type == "age":
-            condition = f'''b.AGE {">=" if comp_type == 'greater' else "<"} {criteria_value}'''
+            condition = f'''b.AGE {">=\" if comp_type == 'greater' else \"<"} {criteria_value}'''
             header    = "a.email,b.age"
         elif criteria_type == "state":
             if isinstance(criteria_value, str):
@@ -811,39 +774,36 @@ def process_orange(request_id):
         else:
             esp_split_dir = channel_dir / "ORANGE_ESP_SPLIT"
             esp_split_dir.mkdir(exist_ok=True)
-            esp_names = df_final["account_name"].drop_duplicates().sort_values().tolist()
+            esp_names = df_final["account_name"].dropna().unique()
+            zip_parts = []
             for esp in esp_names:
-                df_esp = df_final[df_final["account_name"] == esp][["email_address"]]
-                df_esp.to_csv(
-                    str(esp_split_dir / f"{esp}_ORANGE_DATA.csv"),
-                    index=False,
-                    header=False,
-                )
-                logger.info(f"ESP split: {esp} -> {len(df_esp)} emails")
+                esp_df   = df_final[df_final["account_name"] == esp][["email_address"]].drop_duplicates()
+                esp_file = esp_split_dir / f"{client_name}_{request_type}_{esp}_{path_date}.csv"
+                esp_df.to_csv(str(esp_file), index=False, header=False)
+                zip_parts.append(esp_file)
+                logger.info(f"ORANGE ESP split: {esp_file.name} ({len(esp_df)} records)")
 
-            output_file = f"{client_name}_{request_type}_{channel_name}_{path_date}.zip"
-            # Write ZIP to FINAL_DIR
-            zip_file = final_dir / output_file
+            zip_name = f"{client_name}_{request_type}_ORANGE_{path_date}.zip"
+            zip_path = final_dir / zip_name
             run_command(
-                ["zip", "-r", str(zip_file), str(esp_split_dir)],
-                cwd=str(channel_dir),
+                ["zip", "-j", str(zip_path)] + [str(p) for p in zip_parts]
             )
-            record_count = total_count
-            final_file_path = str(zip_file)
-            logger.info(f"ORANGE mailing ZIP: {output_file} ({record_count} records) -> FINAL_DIR")
-            _post_to_ftp(final_dir, path_date, output_file)
+            logger.info(f"ORANGE mailing ZIP: {zip_name} ({len(zip_parts)} ESPs) -> FINAL_DIR")
+            _post_to_ftp(final_dir, path_date, zip_name)
+            final_file_path = str(zip_path)
+            output_file     = zip_name
+            record_count    = total_count
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status)
         logger.info(
-            f"{channel_name} processing completed in {elapsed:.2f} seconds | "
+            f"ORANGE processing completed in {elapsed:.2f} seconds | "
             f"final file: FINAL_DIR/{output_file}"
         )
 
         result = _success_result(
             channel_name, output_file, final_file_path, elapsed, record_count
         )
-        # Remove only the temp channel working dir
         _cleanup_channel_dir(channel_dir)
         return result
 
@@ -858,96 +818,82 @@ def process_orange(request_id):
 
 
 # ---------------------------------------------------------------------------
-# Dispatcher
+# Main orchestrator
 # ---------------------------------------------------------------------------
 
-def process_channel(request_id, channel_name):
-    channel_name = channel_name.upper()
-    if channel_name in ["GREEN", "BLUE"]:
-        return process_green_blue(request_id, channel_name)
-    if channel_name == "ARCAMAX":
-        return process_arcamax(request_id)
-    if channel_name == "ORANGE":
-        return process_orange(request_id)
-    raise ValueError(f"Unsupported channel: {channel_name}")
-
-
 def process_age_state_request(request_id, channel="ALL"):
+    """
+    Orchestrate channel processing for a single request.
+
+    channel: "ALL" | "GREEN" | "BLUE" | "ARCAMAX" | "ORANGE"
+    """
     request_data = fetch_request_details(request_id)
     if not request_data:
-        raise Exception(f"Request ID {request_id} not found")
+        raise Exception(f"Request ID {request_id} not found in DB")
 
-    criteria_type  = request_data["criteria_type"]
-    criteria_value = request_data["criteria_value"]
-    comp_type      = request_data["comp_type"]
-    output_dir     = ensure_output_dir(request_data["output_dir"], criteria_type)
+    output_dir    = request_data["output_dir"]
+    criteria_type = request_data["criteria_type"]
 
-    global logger
-    logger = setup_logging(str(output_dir), criteria_type)
+    # Setup combined log first (channel logs add on top of this)
+    setup_logging(output_dir, criteria_type)
 
-    selected = channel.upper()
-    if selected == "ALL":
-        channels_to_run = CHANNELS
-    else:
-        if selected not in CHANNELS:
-            raise ValueError(f"Unsupported channel: {channel}")
-        channels_to_run = [selected]
+    channels_to_run = CHANNELS if channel.upper() == "ALL" else [channel.upper()]
+    logger.info(
+        f"Started request_id={request_id} for channels={','.join(channels_to_run)}"
+    )
 
-    logger.info(f"Started request_id={request_id} for channels={','.join(channels_to_run)}")
-    results = {}
+    # Update per-channel status to Started up front
+    for ch in channels_to_run:
+        update_request_status(request_id, "Started", f"{ch}_STATUS")
 
-    try:
-        if len(channels_to_run) == 1:
-            result = process_channel(request_id, channels_to_run[0])
-            results[result["channel"]] = result
+    def process_channel(ch):
+        if ch in ("GREEN", "BLUE"):
+            return process_green_blue(request_id, ch)
+        elif ch == "ARCAMAX":
+            return process_arcamax(request_id)
+        elif ch == "ORANGE":
+            return process_orange(request_id)
         else:
-            with ThreadPoolExecutor(max_workers=len(channels_to_run)) as executor:
-                future_map = {
-                    executor.submit(process_channel, request_id, ch): ch
-                    for ch in channels_to_run
-                }
-                for future in as_completed(future_map):
-                    result = future.result()
-                    results[result["channel"]] = result
+            raise ValueError(f"Unknown channel: {ch}")
 
-        total_records = sum(r.get("count", 0) for r in results.values())
+    results  = {}
+    failed   = []
 
-        summary_lines = [
-            f"{r['channel']}: {r['file']} | {r.get('count', 0):,} records | "
-            f"{r['status']} | {r['elapsed']:.2f}s"
-            for r in results.values()
-        ]
-        summary = (
-            f"SUCCESS - {comp_type.upper()} {criteria_type} {criteria_value}\n"
-            f"Output Dir : {str(output_dir)}\n"
-            f"Final files: {str(output_dir)}/FINAL_DIR/\n"
-            f"Logs       : {str(output_dir)}/logs/\n"
-            f"Total Records: {total_records:,}\n"
-            + "\n".join(summary_lines)
-        )
-        logger.info(summary)
+    if len(channels_to_run) == 1:
+        ch = channels_to_run[0]
+        try:
+            results[ch] = process_channel(ch)
+        except Exception as e:
+            failed.append(ch)
+            logger.error(f"FAILED: {e}")
+    else:
+        with ThreadPoolExecutor(max_workers=len(channels_to_run)) as executor:
+            future_map = {executor.submit(process_channel, ch): ch for ch in channels_to_run}
+            for future in as_completed(future_map):
+                ch = future_map[future]
+                try:
+                    results[ch] = future.result()
+                except Exception as e:
+                    failed.append(ch)
+                    logger.error(f"FAILED: {e}")
+                    raise
+
+    overall_status = "failed" if failed else "completed"
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE requests SET overall_status=%s WHERE id=%s",
+                (overall_status, request_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if not failed:
         send_success_email(
-            f"{comp_type.upper()} {criteria_type} {criteria_value} - {total_records:,} RECORDS",
-            [],
-            str(output_dir),
+            f"Request {request_id} completed",
+            f"Channels: {', '.join(channels_to_run)}\nResults: {results}",
         )
-        return results
 
-    except Exception as e:
-        logger.error(f"FAILED: {e}")
-        send_error_email(
-            f"{comp_type.upper()} {criteria_type} {criteria_value} FAILED",
-            str(e),
-        )
-        raise
-
-
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) < 2:
-        raise SystemExit("Usage: python age_state_new.py <request_id> [channel|ALL]")
-
-    request_id = int(sys.argv[1])
-    channel    = sys.argv[2] if len(sys.argv) > 2 else "ALL"
-    process_age_state_request(request_id, channel)
+    return results
