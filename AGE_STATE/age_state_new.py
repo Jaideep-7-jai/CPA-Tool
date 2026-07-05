@@ -170,7 +170,7 @@ def _build_common_context(request_id: int, channel_name: str) -> dict:
 def _count_file_lines(file_path: str) -> int:
     """Fast line count using wc -l (avoids loading file into memory)."""
     cmd = f"wc -l < {shlex.quote(file_path)}"
-    result = subprocess.check_output(cmd, shell=True, text=True).strip()
+    result = subprocess.check_output(cmd, shell=True, universal_newlines=True).strip()
     return int(result) if result else 0
 
 
