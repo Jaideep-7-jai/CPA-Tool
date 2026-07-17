@@ -28,11 +28,10 @@ Changes:
   - logs/: combined + per-channel logs, all inside logs/ (no files outside)
   - Temp channel dirs (GREEN/, BLUE/ etc) removed after FTP upload
   - FINAL_DIR and logs/ are never deleted
-  - GREEN/BLUE/ARCAMAX: deduplicate on email column after combining S3 files
-  - ORANGE: suppression -> email-only CSV; mailing -> ESP-wise split + ZIP
-  - SMART DEDUP: if combined file row-count > 100M, dedup via disk-streaming
-    sort | uniq (avoids /tmp and RAM exhaustion on large files like GREEN
-    with 162M+ rows).  If <= 100M rows, dedup in-process with pandas.
+  - GREEN/BLUE/ARCAMAX/ORANGE: data loaded to S3, then staged into a Snowflake
+    TEMPORARY table; DISTINCT email written from that table to path_FINAL
+    (one level above s3_path). File is downloaded from path_FINAL for FTP.
+  - No row-count deduplication check (removed 100M threshold logic).
 """
 
 import os
@@ -67,11 +66,6 @@ DB_CONFIG = {
 }
 
 CHANNELS = ["GREEN", "BLUE", "ARCAMAX", "ORANGE"]
-
-# Row count threshold above which we use disk-streaming sort|uniq dedup
-# instead of in-process pandas (to avoid RAM exhaustion on large files
-# like GREEN which can produce 162M+ rows).
-LARGE_FILE_ROW_THRESHOLD = 100_000_000
 
 # Module-level logger; replaced per-run by setup_logging().
 logger = logging.getLogger("age_processor")
@@ -184,6 +178,10 @@ def update_request_status(request_id, status, status_column):
 def _build_common_context(request_id, channel_name):
     """
     Build the shared context dict for a channel run.
+
+    S3 layout:
+        s3_path       = S3_BASE/<request_type>/<date>/<request_name>/<channel>   <- raw data
+        path_FINAL    = S3_BASE/<request_type>/<date>/<request_name>/<channel>_FINAL  <- distinct email output
     """
     request_data = fetch_request_details(request_id)
     if not request_data:
@@ -205,9 +203,20 @@ def _build_common_context(request_id, channel_name):
     channel_dir = Path(str(safe_output_dir)) / channel_name.upper()
     channel_dir.mkdir(parents=True, exist_ok=True)
 
-    path_date   = datetime.now().strftime("%Y%m%d")
-    s3_path     = f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}"
+    path_date = datetime.now().strftime("%Y%m%d")
+
+    # Raw S3 path where Snowflake COPY INTO writes gzipped parts
+    s3_path = f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}"
+
+    # FINAL S3 path (one level above s3_path folder, suffixed _FINAL).
+    # DISTINCT email is written here from the Snowflake temp table.
+    path_FINAL = f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}_FINAL"
+
     output_file = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
+
+    # Snowflake temporary table name (unique per channel + timestamp to avoid collisions)
+    ts_suffix   = datetime.now().strftime("%Y%m%d%H%M%S")
+    temp_table  = f"TMP_{channel_name.upper()}_{ts_suffix}"
 
     return {
         "request_data"  : request_data,
@@ -222,7 +231,9 @@ def _build_common_context(request_id, channel_name):
         "channel_dir"   : channel_dir,
         "path_date"     : path_date,
         "s3_path"       : s3_path,
+        "path_FINAL"    : path_FINAL,
         "output_file"   : output_file,
+        "temp_table"    : temp_table,
     }
 
 
@@ -267,89 +278,89 @@ def _download_and_combine(s3_path, download_dir, work_dir, output_file, channel_
     run_command(f"rm -f {str(download_dir / 'data*')}", cwd=str(download_dir))
 
 
-def _dedup_via_sort(file_path, final_dir, channel_name):
+def _load_s3_to_snowflake_temp(s3_path, temp_table, channel_name, criteria_type):
     """
-    Disk-streaming dedup for files with > LARGE_FILE_ROW_THRESHOLD rows.
+    Stage the raw gzipped S3 parts into a Snowflake TEMPORARY table.
 
-    Uses the GNU coreutils pipeline:
-        sort --parallel=4 -T <tmp_dir> -u <input> -o <output>
+    The temp table schema is always (email STRING) for non-ORANGE channels.
+    For ORANGE it is (email_address STRING, account_name STRING).
+    The table is TEMPORARY so it is auto-dropped at session end.
 
-    This spills merge-sort chunks to disk (-T), so it never loads the entire
-    file into RAM.  It is guaranteed to work on any Linux server regardless
-    of Snowflake connectivity or S3 credential issues.
-
-    The sort tmp dir is placed inside the channel's FINAL_DIR so it stays
-    on the same filesystem as the output (avoids cross-device mv issues).
-
-    Returns (final_file_path_str, record_count).
+    Steps:
+      1. CREATE OR REPLACE TEMPORARY TABLE <temp_table> ...
+      2. CREATE OR REPLACE STAGE pointing to s3_path
+      3. COPY INTO <temp_table> FROM the stage
     """
-    final_dir   = Path(final_dir)
-    output_filename = Path(file_path).name
-    final_file_path = final_dir / output_filename
+    os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
 
-    # Use a tmp dir inside final_dir so sort spill files stay on the same fs
-    sort_tmp_dir = final_dir / f"{channel_name}_SORT_TMP"
-    sort_tmp_dir.mkdir(parents=True, exist_ok=True)
+    stage_name = f"STG_{temp_table}"
 
-    logger.info(
-        f"Large file detected for {channel_name} — using disk-streaming sort|uniq dedup "
-        f"(sort tmp: {sort_tmp_dir})"
-    )
-    logger.info(f"Input  : {file_path}")
-    logger.info(f"Output : {final_file_path}")
-
-    # sort -u: sort + unique in one pass; -T: spill dir; --parallel: use 4 cores
-    sort_cmd = (
-        f"sort -u --parallel=4 -T {shlex.quote(str(sort_tmp_dir))} "
-        f"{shlex.quote(file_path)} -o {shlex.quote(str(final_file_path))}"
-    )
-    run_command(sort_cmd)
-
-    # Clean up sort tmp dir
-    try:
-        shutil.rmtree(str(sort_tmp_dir))
-    except Exception as e:
-        logger.warning(f"Could not remove sort tmp dir {sort_tmp_dir}: {e}")
-
-    record_count = _count_file_lines(str(final_file_path))
-    logger.info(
-        f"sort|uniq dedup complete for {channel_name}: "
-        f"{record_count} unique emails -> FINAL_DIR/{output_filename}"
-    )
-    return str(final_file_path), record_count
-
-
-def _dedup_email_col(file_path, final_dir, channel_name="", s3_path="", path_date=""):
-    """
-    Smart dedup dispatcher:
-      - Count rows with wc -l (cheap, no memory cost).
-      - If row count > LARGE_FILE_ROW_THRESHOLD (100M):
-            use disk-streaming sort -u (GNU coreutils, spills to disk,
-            no RAM or Snowflake/S3 dependency).
-      - Else:
-            use pandas in-process dedup (fast for smaller files).
-
-    Returns (final_file_path, record_count).
-    """
-    row_count = _count_file_lines(file_path)
-    logger.info(
-        f"Dedup check for {file_path}: {row_count} rows (threshold={LARGE_FILE_ROW_THRESHOLD})"
-    )
-
-    if row_count > LARGE_FILE_ROW_THRESHOLD:
-        return _dedup_via_sort(file_path, final_dir, channel_name)
-    else:
-        df     = pd.read_csv(file_path, sep="|", header=None, dtype=str)
-        before = len(df)
-        df     = df.drop_duplicates(subset=[0])
-        after  = len(df)
-        logger.info(
-            f"Dedup {file_path}: {before} -> {after} unique emails (removed {before - after})"
+    if channel_name == "ORANGE":
+        create_sql = (
+            f"CREATE OR REPLACE TEMPORARY TABLE {temp_table} "
+            f"(email_address STRING, account_name STRING);"
         )
-        final_file_path = str(Path(final_dir) / Path(file_path).name)
-        df.to_csv(final_file_path, sep="|", index=False, header=False)
-        logger.info(f"Deduped file written to FINAL_DIR/{Path(file_path).name}")
-        return final_file_path, after
+        copy_sql = (
+            f"COPY INTO {temp_table} "
+            f"FROM @{stage_name} "
+            f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
+            f"FIELD_OPTIONALLY_ENCLOSED_BY='\"' SKIP_HEADER=0) "
+            f"ON_ERROR=CONTINUE;"
+        )
+    else:
+        create_sql = (
+            f"CREATE OR REPLACE TEMPORARY TABLE {temp_table} (email STRING);"
+        )
+        copy_sql = (
+            f"COPY INTO {temp_table} "
+            f"FROM (SELECT $1 FROM @{stage_name}) "
+            f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
+            f"FIELD_OPTIONALLY_ENCLOSED_BY='\"' SKIP_HEADER=0) "
+            f"ON_ERROR=CONTINUE;"
+        )
+
+    stage_sql = (
+        f"CREATE OR REPLACE STAGE {stage_name} "
+        f"URL='{s3_path}/' "
+        f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
+        f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP);"
+    )
+
+    combined_sql = f"{create_sql} {stage_sql} {copy_sql}"
+    logger.info(f"Loading S3 data into Snowflake temp table: {temp_table}")
+    run_command(["snowsql", "-c", "datateam1", "-q", combined_sql])
+    logger.info(f"Temp table {temp_table} loaded successfully")
+
+
+def _write_distinct_email_to_path_FINAL(temp_table, path_FINAL, channel_name):
+    """
+    Write DISTINCT email from the Snowflake temp table to path_FINAL (S3).
+
+    For non-ORANGE channels: SELECT DISTINCT email
+    For ORANGE channel     : SELECT DISTINCT email_address, account_name
+
+    path_FINAL is one level above s3_path (e.g. <channel>_FINAL vs <channel>).
+    """
+    os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
+
+    if channel_name == "ORANGE":
+        select_clause = "DISTINCT email_address, account_name"
+    else:
+        select_clause = "DISTINCT email"
+
+    sql = (
+        f"COPY INTO '{path_FINAL}/' "
+        f"FROM (SELECT {select_clause} FROM {temp_table}) "
+        f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
+        f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
+        f"FIELD_OPTIONALLY_ENCLOSED_BY='\"') MAX_FILE_SIZE=490000000;"
+    )
+
+    logger.info(
+        f"Writing DISTINCT email from {temp_table} to path_FINAL: {path_FINAL}"
+    )
+    run_command(["snowsql", "-c", "datateam1", "-q", sql])
+    logger.info(f"DISTINCT email written to path_FINAL successfully")
 
 
 def _post_to_ftp(final_dir, path_date, output_file):
@@ -387,7 +398,16 @@ def _success_result(channel_name, output_file, final_file_path, elapsed, record_
 # ---------------------------------------------------------------------------
 
 def process_green_blue(request_id, channel_name):
-    """GREEN and BLUE channel processor with smart email deduplication."""
+    """
+    GREEN and BLUE channel processor.
+
+    Flow:
+      1. COPY INTO s3_path   (raw data written to S3)
+      2. Load s3_path -> Snowflake TEMPORARY table
+      3. COPY DISTINCT email from temp table -> path_FINAL (S3)
+      4. Download from path_FINAL -> combine -> local CSV in channel_dir
+      5. FTP upload from FINAL_DIR
+    """
     channel_name   = channel_name.upper()
     channel_status = f"{channel_name}_STATUS"
     update_request_status(request_id, "Started", channel_status)
@@ -403,6 +423,8 @@ def process_green_blue(request_id, channel_name):
         comp_type      = ctx["comp_type"]
         channel_dir    = ctx["channel_dir"]
         final_dir      = ctx["final_dir"]
+        temp_table     = ctx["temp_table"]
+        path_FINAL     = ctx["path_FINAL"]
 
         if criteria_type == "age":
             condition = f"b.AGE {'>=': if comp_type == 'greater' else '<'} {criteria_value}"
@@ -420,9 +442,10 @@ def process_green_blue(request_id, channel_name):
             "GREEN_LPT.UNIVERSAL_PROFILE" if channel_name == "GREEN" else "INFS_LPT.INFS_PROFILE"
         )
 
-        sql = (
+        # Step 1: Write raw data to S3
+        sql_copy = (
             f"COPY INTO '{ctx['s3_path']}/' "
-            f"FROM (SELECT DISTINCT {header} FROM {profile_table} a "
+            f"FROM (SELECT {header} FROM {profile_table} a "
             f"JOIN APT_CUSTOM_GREEN_REA_DATA_DND b ON a.md5hash=b.EMAIL_MD5 "
             f"WHERE {condition}) "
             f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
@@ -433,23 +456,35 @@ def process_green_blue(request_id, channel_name):
         start_time = time.time()
         update_request_status(request_id, "Pulling Data", channel_status)
         os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-        run_command(["snowsql", "-c", "datateam1", "-q", sql])
+        logger.info(f"Writing raw data to S3: {ctx['s3_path']}")
+        run_command(["snowsql", "-c", "datateam1", "-q", sql_copy])
 
+        # Step 2: Load S3 data into Snowflake temp table
+        update_request_status(request_id, "Loading to Snowflake", channel_status)
+        _load_s3_to_snowflake_temp(ctx["s3_path"], temp_table, channel_name, criteria_type)
+
+        # Step 3: Write DISTINCT email from temp table to path_FINAL
+        update_request_status(request_id, "Writing Distinct Emails", channel_status)
+        _write_distinct_email_to_path_FINAL(temp_table, path_FINAL, channel_name)
+
+        # Step 4: Download from path_FINAL and combine into local CSV
         update_request_status(request_id, "Combining Data", channel_status)
-        download_dir = channel_dir / f"{channel_name}_OP_PATH"
+        download_dir = channel_dir / f"{channel_name}_FINAL_PATH"
+        logger.info(f"Downloading distinct email data from path_FINAL: {path_FINAL}")
         _download_and_combine(
-            ctx["s3_path"], download_dir, channel_dir, ctx["output_file"], channel_name
+            path_FINAL, download_dir, channel_dir, ctx["output_file"], channel_name
         )
 
-        tmp_file_path = str(channel_dir / ctx["output_file"])
-        final_file_path, record_count = _dedup_email_col(
-            tmp_file_path,
-            final_dir=str(final_dir),
-            channel_name=channel_name,
-            s3_path=ctx["s3_path"],
-            path_date=ctx["path_date"],
+        # Move combined file to FINAL_DIR
+        tmp_file_path   = channel_dir / ctx["output_file"]
+        final_file_path = final_dir / ctx["output_file"]
+        shutil.move(str(tmp_file_path), str(final_file_path))
+        record_count = _count_file_lines(str(final_file_path))
+        logger.info(
+            f"{channel_name}: {record_count} distinct emails -> FINAL_DIR/{ctx['output_file']}"
         )
 
+        # Step 5: FTP upload
         update_request_status(request_id, "Posting To FTP", channel_status)
         _post_to_ftp(final_dir, ctx["path_date"], ctx["output_file"])
 
@@ -461,7 +496,7 @@ def process_green_blue(request_id, channel_name):
         )
 
         result = _success_result(
-            channel_name, ctx["output_file"], final_file_path, elapsed, record_count
+            channel_name, ctx["output_file"], str(final_file_path), elapsed, record_count
         )
         _cleanup_channel_dir(channel_dir)
         return result
@@ -477,7 +512,16 @@ def process_green_blue(request_id, channel_name):
 
 
 def process_arcamax(request_id):
-    """ARCAMAX channel processor with smart email deduplication."""
+    """
+    ARCAMAX channel processor.
+
+    Flow:
+      1. COPY INTO s3_path   (raw data written to S3)
+      2. Load s3_path -> Snowflake TEMPORARY table
+      3. COPY DISTINCT email from temp table -> path_FINAL (S3)
+      4. Download from path_FINAL -> combine -> local CSV in channel_dir
+      5. FTP upload from FINAL_DIR
+    """
     channel_name   = "ARCAMAX"
     channel_status = "ARCAMAX_STATUS"
     update_request_status(request_id, "Started", channel_status)
@@ -493,6 +537,8 @@ def process_arcamax(request_id):
         comp_type      = ctx["comp_type"]
         channel_dir    = ctx["channel_dir"]
         final_dir      = ctx["final_dir"]
+        temp_table     = ctx["temp_table"]
+        path_FINAL     = ctx["path_FINAL"]
 
         if criteria_type == "age":
             date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
@@ -510,9 +556,10 @@ def process_arcamax(request_id):
         else:
             raise Exception(f"Unsupported criteria_type {criteria_type}")
 
-        sql = (
+        # Step 1: Write raw data to S3
+        sql_copy = (
             f"COPY INTO '{ctx['s3_path']}/' "
-            f"FROM (SELECT DISTINCT {header} FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
+            f"FROM (SELECT {header} FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
             f"WHERE {condition}) "
             f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
             f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
@@ -522,23 +569,35 @@ def process_arcamax(request_id):
         start_time = time.time()
         update_request_status(request_id, "Pulling Data", channel_status)
         os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-        run_command(["snowsql", "-c", "datateam1", "-q", sql])
+        logger.info(f"Writing raw data to S3: {ctx['s3_path']}")
+        run_command(["snowsql", "-c", "datateam1", "-q", sql_copy])
 
+        # Step 2: Load S3 data into Snowflake temp table
+        update_request_status(request_id, "Loading to Snowflake", channel_status)
+        _load_s3_to_snowflake_temp(ctx["s3_path"], temp_table, channel_name, criteria_type)
+
+        # Step 3: Write DISTINCT email from temp table to path_FINAL
+        update_request_status(request_id, "Writing Distinct Emails", channel_status)
+        _write_distinct_email_to_path_FINAL(temp_table, path_FINAL, channel_name)
+
+        # Step 4: Download from path_FINAL and combine into local CSV
         update_request_status(request_id, "Combining Data", channel_status)
-        download_dir = channel_dir / "ARCAMAX_OP_PATH"
+        download_dir = channel_dir / "ARCAMAX_FINAL_PATH"
+        logger.info(f"Downloading distinct email data from path_FINAL: {path_FINAL}")
         _download_and_combine(
-            ctx["s3_path"], download_dir, channel_dir, ctx["output_file"], channel_name
+            path_FINAL, download_dir, channel_dir, ctx["output_file"], channel_name
         )
 
-        tmp_file_path = str(channel_dir / ctx["output_file"])
-        final_file_path, record_count = _dedup_email_col(
-            tmp_file_path,
-            final_dir=str(final_dir),
-            channel_name=channel_name,
-            s3_path=ctx["s3_path"],
-            path_date=ctx["path_date"],
+        # Move combined file to FINAL_DIR
+        tmp_file_path   = channel_dir / ctx["output_file"]
+        final_file_path = final_dir / ctx["output_file"]
+        shutil.move(str(tmp_file_path), str(final_file_path))
+        record_count = _count_file_lines(str(final_file_path))
+        logger.info(
+            f"{channel_name}: {record_count} distinct emails -> FINAL_DIR/{ctx['output_file']}"
         )
 
+        # Step 5: FTP upload
         update_request_status(request_id, "Posting To FTP", channel_status)
         _post_to_ftp(final_dir, ctx["path_date"], ctx["output_file"])
 
@@ -550,7 +609,7 @@ def process_arcamax(request_id):
         )
 
         result = _success_result(
-            channel_name, ctx["output_file"], final_file_path, elapsed, record_count
+            channel_name, ctx["output_file"], str(final_file_path), elapsed, record_count
         )
         _cleanup_channel_dir(channel_dir)
         return result
@@ -568,8 +627,15 @@ def process_arcamax(request_id):
 def process_orange(request_id):
     """
     ORANGE channel processor.
-    - suppression -> single email-only CSV in FINAL_DIR
-    - mailing     -> ESP-wise split CSVs packed into a ZIP in FINAL_DIR
+
+    Flow:
+      1. COPY INTO s3_path   (raw data written to S3)
+      2. Load s3_path -> Snowflake TEMPORARY table (email_address, account_name)
+      3. COPY DISTINCT email_address, account_name from temp table -> path_FINAL (S3)
+      4. Download from path_FINAL -> combine -> local CSV in channel_dir
+      5. suppression -> single email-only CSV in FINAL_DIR
+         mailing     -> ESP-wise split CSVs packed into a ZIP in FINAL_DIR
+      6. FTP upload from FINAL_DIR
     """
     channel_name   = "ORANGE"
     channel_status = "ORANGE_STATUS"
@@ -589,6 +655,8 @@ def process_orange(request_id):
         channel_dir    = ctx["channel_dir"]
         final_dir      = ctx["final_dir"]
         path_date      = ctx["path_date"]
+        temp_table     = ctx["temp_table"]
+        path_FINAL     = ctx["path_FINAL"]
 
         if criteria_type == "age":
             date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
@@ -601,12 +669,13 @@ def process_orange(request_id):
         else:
             raise Exception(f"Unsupported criteria_type {criteria_type}")
 
-        sql = (
+        # Step 1: Write raw data to S3
+        sql_copy = (
             f"COPY INTO '{ctx['s3_path']}/' "
             f"FROM ("
-            f"SELECT DISTINCT a.email_address, b.ACCOUNT_NAME "
+            f"SELECT a.email_address, b.ACCOUNT_NAME "
             f"FROM ("
-            f"SELECT DISTINCT a.FEED_ID, a.email_address "
+            f"SELECT a.FEED_ID, a.email_address "
             f"FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a, "
             f"(SELECT a.email_address, MAX(a.created_at) AS maxdate "
             f"FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a "
@@ -625,13 +694,24 @@ def process_orange(request_id):
         start_time = time.time()
         update_request_status(request_id, "Pulling Data", channel_status)
         os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-        run_command(["snowsql", "-c", "datateam1", "-q", sql])
+        logger.info(f"Writing raw data to S3: {ctx['s3_path']}")
+        run_command(["snowsql", "-c", "datateam1", "-q", sql_copy])
 
+        # Step 2: Load S3 data into Snowflake temp table
+        update_request_status(request_id, "Loading to Snowflake", channel_status)
+        _load_s3_to_snowflake_temp(ctx["s3_path"], temp_table, channel_name, criteria_type)
+
+        # Step 3: Write DISTINCT email_address, account_name from temp table to path_FINAL
+        update_request_status(request_id, "Writing Distinct Emails", channel_status)
+        _write_distinct_email_to_path_FINAL(temp_table, path_FINAL, channel_name)
+
+        # Step 4: Download from path_FINAL and combine into local CSV
         update_request_status(request_id, "Combining Data", channel_status)
         raw_combined = f"ORANGE_RAW_{path_date}.csv"
-        download_dir = channel_dir / "ORANGE_OP_PATH"
+        download_dir = channel_dir / "ORANGE_FINAL_PATH"
+        logger.info(f"Downloading distinct email data from path_FINAL: {path_FINAL}")
         _download_and_combine(
-            ctx["s3_path"], download_dir, channel_dir, raw_combined, channel_name
+            path_FINAL, download_dir, channel_dir, raw_combined, channel_name
         )
 
         df_final = pd.read_csv(
@@ -642,7 +722,7 @@ def process_orange(request_id):
             dtype=str,
         )
         total_count = len(df_final)
-        logger.info(f"ORANGE raw records: {total_count}")
+        logger.info(f"ORANGE distinct records from path_FINAL: {total_count}")
 
         update_request_status(request_id, "Posting To FTP", channel_status)
 
