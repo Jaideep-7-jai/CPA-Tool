@@ -14,28 +14,31 @@ Output directory layout per run:
             ARCAMAX_age_<YYYYMMDD_HHMMSS>.log
             ORANGE_age_<YYYYMMDD_HHMMSS>.log
         FINAL_DIR/
-            <client>_Suppression_GREEN_<date>.csv
-            <client>_Suppression_BLUE_<date>.csv
+            <client>_<request_type>_GREEN_<date>.csv
+            <client>_<request_type>_BLUE_<date>.csv
             ...  (final files; never deleted)
         GREEN/   <- temp channel working dir; deleted after FTP
         BLUE/
         ARCAMAX/
         ORANGE/
 
-Changes:
-  - run dir: run_age_YYYYMMDD_HHMMSS (date+time, not just time)
-  - FINAL_DIR: all final output files placed here and kept permanently
-  - logs/: combined + per-channel logs, all inside logs/ (no files outside)
-  - Temp channel dirs (GREEN/, BLUE/ etc) removed after FTP upload
-  - FINAL_DIR and logs/ are never deleted
-  - GREEN/BLUE/ARCAMAX/ORANGE: data loaded to S3, then staged into a Snowflake
-    TEMPORARY table; DISTINCT email written from that table to path_FINAL
-    (one level above s3_path). File is downloaded from path_FINAL for FTP.
-  - No row-count deduplication check (removed 100M threshold logic).
+Processing flow per channel:
+  1. INSERT raw query results directly into a permanent Snowflake table
+       APT_CPA_<CHANNEL>_<YYYYMMDD>  (no S3 write for raw data)
+  2. Export FINAL FILE  -> path_FINAL  (S3)
+       DISTINCT email (with header)                 [GREEN / BLUE / ARCAMAX]
+       DISTINCT email_address, account_name (header)[ORANGE]
+  3. Export COMPLETE DATA FILE -> path_COMPLETE (S3)
+       email, condition_field                        [GREEN / BLUE / ARCAMAX]
+       email_address, condition_field, account_name  [ORANGE]
+  4. DROP the permanent table (no re-load needed; both files already exported)
+  5. Download FINAL FILE from path_FINAL -> combine -> FINAL_DIR
+  6. FTP upload from FINAL_DIR
+     ORANGE suppression: email-only CSV
+     ORANGE mailing    : ESP-wise split CSVs in a ZIP
 """
 
 import os
-import glob
 import time
 import shutil
 import logging
@@ -44,7 +47,6 @@ import subprocess
 import shlex
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List, Optional
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -92,8 +94,7 @@ def setup_logging(output_dir, criteria_type):
     """
     log_date = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = Path(output_dir) / "logs" / f"{criteria_type}_{log_date}.log"
-
-    _logger = logging.getLogger("age_processor")
+    _logger  = logging.getLogger("age_processor")
     _logger.setLevel(logging.INFO)
     _logger.handlers.clear()
     _logger.addHandler(_make_handler(log_file))
@@ -107,11 +108,11 @@ def setup_channel_logging(output_dir, channel_name, criteria_type):
     """
     log_date = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = (
-        Path(output_dir) / "logs" / f"{channel_name.upper()}_{criteria_type}_{log_date}.log"
+        Path(output_dir) / "logs"
+        / f"{channel_name.upper()}_{criteria_type}_{log_date}.log"
     )
     handler = _make_handler(log_file)
-    _logger = logging.getLogger("age_processor")
-    _logger.addHandler(handler)
+    logging.getLogger("age_processor").addHandler(handler)
     return handler
 
 
@@ -179,9 +180,14 @@ def _build_common_context(request_id, channel_name):
     """
     Build the shared context dict for a channel run.
 
-    S3 layout:
-        s3_path       = S3_BASE/<request_type>/<date>/<request_name>/<channel>   <- raw data
-        path_FINAL    = S3_BASE/<request_type>/<date>/<request_name>/<channel>_FINAL  <- distinct email output
+    Snowflake permanent table:
+        perm_table  = APT_CPA_<CHANNEL>_<YYYYMMDD>
+
+    S3 layout (no raw-data S3 write; only two export paths):
+        path_FINAL    = S3_BASE/<request_type>/<date>/<request_name>/<channel>_FINAL
+                        DISTINCT email (with header) / DISTINCT email,account_name
+        path_COMPLETE = S3_BASE/<request_type>/<date>/<request_name>/<channel>_COMPLETE
+                        Full email + condition field (+ account_name for ORANGE)
     """
     request_data = fetch_request_details(request_id)
     if not request_data:
@@ -205,18 +211,14 @@ def _build_common_context(request_id, channel_name):
 
     path_date = datetime.now().strftime("%Y%m%d")
 
-    # Raw S3 path where Snowflake COPY INTO writes gzipped parts
-    s3_path = f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}"
+    # Permanent Snowflake staging table (not TEMPORARY — persists until explicitly DROPped)
+    perm_table = f"APT_CPA_{channel_name.upper()}_{path_date}"
 
-    # FINAL S3 path (one level above s3_path folder, suffixed _FINAL).
-    # DISTINCT email is written here from the Snowflake temp table.
-    path_FINAL = f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}_FINAL"
+    # S3 export paths (written FROM the permanent table)
+    path_FINAL    = f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}_FINAL"
+    path_COMPLETE = f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}_COMPLETE"
 
     output_file = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
-
-    # Snowflake temporary table name (unique per channel + timestamp to avoid collisions)
-    ts_suffix   = datetime.now().strftime("%Y%m%d%H%M%S")
-    temp_table  = f"TMP_{channel_name.upper()}_{ts_suffix}"
 
     return {
         "request_data"  : request_data,
@@ -230,10 +232,10 @@ def _build_common_context(request_id, channel_name):
         "final_dir"     : final_dir,
         "channel_dir"   : channel_dir,
         "path_date"     : path_date,
-        "s3_path"       : s3_path,
         "path_FINAL"    : path_FINAL,
+        "path_COMPLETE" : path_COMPLETE,
         "output_file"   : output_file,
-        "temp_table"    : temp_table,
+        "perm_table"    : perm_table,
     }
 
 
@@ -248,6 +250,8 @@ def _download_and_combine(s3_path, download_dir, work_dir, output_file, channel_
     """
     Download gzipped S3 parts into *download_dir* and concatenate into one
     pipe-delimited file at <work_dir>/<output_file>.
+    For non-ORANGE channels: strip to first column (email only).
+    For ORANGE: keep all columns.
     """
     download_dir = Path(download_dir)
     work_dir     = Path(work_dir)
@@ -262,84 +266,162 @@ def _download_and_combine(s3_path, download_dir, work_dir, output_file, channel_
     if not downloaded:
         raise RuntimeError(
             f"aws s3 cp from {s3_path} downloaded 0 files into {download_dir}. "
-            f"Check S3 path and IAM permissions."
+            "Check S3 path and IAM permissions."
         )
 
     out_path = work_dir / output_file
     if channel_name != "ORANGE":
+        # path_FINAL for non-ORANGE only has email column; take col 1 to be safe
         run_command(
-            f"zcat {shlex.quote(str(download_dir) + '/')}data* | cut -d'|' -f1 > {shlex.quote(str(out_path))}",
+            f"zcat {shlex.quote(str(download_dir) + '/')}data* "
+            f"| tail -n +2 "
+            f"| cut -d'|' -f1 > {shlex.quote(str(out_path))}"
         )
     else:
+        # path_FINAL for ORANGE has email_address|account_name; skip header row
         run_command(
-            f"zcat {shlex.quote(str(download_dir) + '/')}data* > {shlex.quote(str(out_path))}",
+            f"zcat {shlex.quote(str(download_dir) + '/')}data* "
+            f"| tail -n +2 > {shlex.quote(str(out_path))}"
         )
 
     run_command(f"rm -f {str(download_dir / 'data*')}", cwd=str(download_dir))
 
 
-def _load_s3_to_snowflake_temp(s3_path, temp_table, channel_name, criteria_type):
+# ---------------------------------------------------------------------------
+# Snowflake table helpers
+# ---------------------------------------------------------------------------
+
+def _insert_into_perm_table(perm_table, channel_name, criteria_type,
+                             criteria_value, comp_type):
     """
-    Stage the raw gzipped S3 parts into a Snowflake TEMPORARY table.
+    CREATE OR REPLACE the permanent staging table and INSERT query results
+    directly (no S3 write for raw data).
 
-    The temp table schema is always (email STRING) for non-ORANGE channels.
-    For ORANGE it is (email_address STRING, account_name STRING).
-    The table is TEMPORARY so it is auto-dropped at session end.
-
-    Steps:
-      1. CREATE OR REPLACE TEMPORARY TABLE <temp_table> ...
-      2. CREATE OR REPLACE STAGE pointing to s3_path
-      3. COPY INTO <temp_table> FROM the stage
+    Table schemas
+    -------------
+    GREEN / BLUE  : (email, condition_field)   condition_field = age or state
+    ARCAMAX       : (email, condition_field)   condition_field = birthday or state
+    ORANGE        : (email_address, condition_field, account_name)
+                   condition_field = dob or state
     """
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
 
-    stage_name = f"STG_{temp_table}"
+    if channel_name in ("GREEN", "BLUE"):
+        profile_table = (
+            "GREEN_LPT.UNIVERSAL_PROFILE"
+            if channel_name == "GREEN"
+            else "INFS_LPT.INFS_PROFILE"
+        )
+        if criteria_type == "age":
+            cond_col  = "b.AGE"
+            condition = (
+                f"b.AGE {'>=': if comp_type == 'greater' else '<'} {criteria_value}"
+            )
+        else:  # state
+            cond_col  = "b.STATE"
+            if isinstance(criteria_value, str):
+                criteria_value = [x.strip() for x in criteria_value.split(",")]
+            states    = "','".join(criteria_value)
+            condition = (
+                f"b.STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
+            )
 
-    if channel_name == "ORANGE":
         create_sql = (
-            f"CREATE OR REPLACE TEMPORARY TABLE {temp_table} "
-            f"(email_address STRING, account_name STRING);"
+            f"CREATE OR REPLACE TABLE {perm_table} "
+            f"(email STRING, condition_field STRING);"
         )
-        copy_sql = (
-            f"COPY INTO {temp_table} "
-            f"FROM @{stage_name} "
-            f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
-            f"FIELD_OPTIONALLY_ENCLOSED_BY='\"' SKIP_HEADER=0) "
-            f"ON_ERROR=CONTINUE;"
+        insert_sql = (
+            f"INSERT INTO {perm_table} (email, condition_field) "
+            f"SELECT a.email, {cond_col} "
+            f"FROM {profile_table} a "
+            f"JOIN APT_CUSTOM_GREEN_REA_DATA_DND b ON a.md5hash = b.EMAIL_MD5 "
+            f"WHERE {condition};"
         )
-    else:
+
+    elif channel_name == "ARCAMAX":
+        if criteria_type == "age":
+            date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
+            cond_col    = "birthday"
+            condition   = (
+                f"birthday IS NOT NULL AND TRY_TO_DATE(birthday) "
+                f"{'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
+            )
+        else:  # state
+            cond_col  = "STATE"
+            if isinstance(criteria_value, str):
+                criteria_value = [x.strip() for x in criteria_value.split(",")]
+            states    = "','".join(criteria_value)
+            condition = (
+                f"STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
+            )
+
         create_sql = (
-            f"CREATE OR REPLACE TEMPORARY TABLE {temp_table} (email STRING);"
+            f"CREATE OR REPLACE TABLE {perm_table} "
+            f"(email STRING, condition_field STRING);"
         )
-        copy_sql = (
-            f"COPY INTO {temp_table} "
-            f"FROM (SELECT $1 FROM @{stage_name}) "
-            f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
-            f"FIELD_OPTIONALLY_ENCLOSED_BY='\"' SKIP_HEADER=0) "
-            f"ON_ERROR=CONTINUE;"
+        insert_sql = (
+            f"INSERT INTO {perm_table} (email, condition_field) "
+            f"SELECT email, {cond_col} "
+            f"FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
+            f"WHERE {condition};"
         )
 
-    stage_sql = (
-        f"CREATE OR REPLACE STAGE {stage_name} "
-        f"URL='{s3_path}/' "
-        f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
-        f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP);"
-    )
+    else:  # ORANGE
+        if criteria_type == "age":
+            date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
+            cond_col    = "a.dob"
+            condition   = (
+                f"dob {'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
+            )
+        else:  # state
+            cond_col  = "a.STATE"
+            if isinstance(criteria_value, str):
+                criteria_value = [x.strip() for x in criteria_value.split(",")]
+            states    = "','".join(criteria_value)
+            condition = (
+                f"STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
+            )
 
-    combined_sql = f"{create_sql} {stage_sql} {copy_sql}"
-    logger.info(f"Loading S3 data into Snowflake temp table: {temp_table}")
+        create_sql = (
+            f"CREATE OR REPLACE TABLE {perm_table} "
+            f"(email_address STRING, condition_field STRING, account_name STRING);"
+        )
+        insert_sql = (
+            f"INSERT INTO {perm_table} (email_address, condition_field, account_name) "
+            f"SELECT a.email_address, {cond_col}, b.ACCOUNT_NAME "
+            f"FROM ("
+            f"  SELECT a.FEED_ID, a.email_address, a.dob, a.STATE "
+            f"  FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a "
+            f"  JOIN ("
+            f"    SELECT email_address, MAX(created_at) AS maxdate "
+            f"    FROM APT_CUSTOM_ORANGE_TRANSACTION_DND "
+            f"    WHERE {condition} GROUP BY 1"
+            f"  ) b ON a.email_address = b.email_address AND a.created_at = b.maxdate"
+            f") a "
+            f"JOIN APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 b "
+            f"  ON a.FEED_ID = b.FEEDID "
+            f"JOIN APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND c "
+            f"  ON a.email_address = c.email_address "
+            f"JOIN APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND d "
+            f"  ON a.email_address = d.email;"
+        )
+
+    combined_sql = f"{create_sql} {insert_sql}"
+    logger.info(f"Creating permanent table and inserting data: {perm_table}")
     run_command(["snowsql", "-c", "datateam1", "-q", combined_sql])
-    logger.info(f"Temp table {temp_table} loaded successfully")
+    logger.info(f"Data inserted into permanent table {perm_table} successfully")
 
 
-def _write_distinct_email_to_path_FINAL(temp_table, path_FINAL, channel_name):
+def _export_final_file(perm_table, path_FINAL, channel_name):
     """
-    Write DISTINCT email from the Snowflake temp table to path_FINAL (S3).
+    Export FINAL FILE from the permanent table to path_FINAL (S3).
 
-    For non-ORANGE channels: SELECT DISTINCT email
-    For ORANGE channel     : SELECT DISTINCT email_address, account_name
+    GREEN / BLUE / ARCAMAX:
+        DISTINCT email  (header: email)
+    ORANGE:
+        DISTINCT email_address, account_name  (header: email,accountname)
 
-    path_FINAL is one level above s3_path (e.g. <channel>_FINAL vs <channel>).
+    SINGLE_HEADER option writes column names as the first row in the output.
     """
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
 
@@ -350,17 +432,63 @@ def _write_distinct_email_to_path_FINAL(temp_table, path_FINAL, channel_name):
 
     sql = (
         f"COPY INTO '{path_FINAL}/' "
-        f"FROM (SELECT {select_clause} FROM {temp_table}) "
+        f"FROM (SELECT {select_clause} FROM {perm_table}) "
         f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
         f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
-        f"FIELD_OPTIONALLY_ENCLOSED_BY='\"') MAX_FILE_SIZE=490000000;"
+        f"FIELD_OPTIONALLY_ENCLOSED_BY='\"' "
+        f"NULL_IF=() EMPTY_FIELD_AS_NULL=FALSE) "
+        f"HEADER=TRUE "
+        f"MAX_FILE_SIZE=490000000;"
     )
 
-    logger.info(
-        f"Writing DISTINCT email from {temp_table} to path_FINAL: {path_FINAL}"
-    )
+    logger.info(f"Exporting FINAL FILE from {perm_table} -> {path_FINAL}")
     run_command(["snowsql", "-c", "datateam1", "-q", sql])
-    logger.info(f"DISTINCT email written to path_FINAL successfully")
+    logger.info("FINAL FILE export complete")
+
+
+def _export_complete_file(perm_table, path_COMPLETE, channel_name):
+    """
+    Export COMPLETE DATA FILE from the permanent table to path_COMPLETE (S3).
+
+    GREEN / BLUE / ARCAMAX:
+        email, condition_field   (all rows, with header)
+    ORANGE:
+        email_address, condition_field, account_name  (all rows, with header)
+    """
+    os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
+
+    if channel_name == "ORANGE":
+        select_clause = "email_address, condition_field, account_name"
+    else:
+        select_clause = "email, condition_field"
+
+    sql = (
+        f"COPY INTO '{path_COMPLETE}/' "
+        f"FROM (SELECT {select_clause} FROM {perm_table}) "
+        f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
+        f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
+        f"FIELD_OPTIONALLY_ENCLOSED_BY='\"' "
+        f"NULL_IF=() EMPTY_FIELD_AS_NULL=FALSE) "
+        f"HEADER=TRUE "
+        f"MAX_FILE_SIZE=490000000;"
+    )
+
+    logger.info(f"Exporting COMPLETE DATA FILE from {perm_table} -> {path_COMPLETE}")
+    run_command(["snowsql", "-c", "datateam1", "-q", sql])
+    logger.info("COMPLETE DATA FILE export complete")
+
+
+def _drop_perm_table(perm_table):
+    """
+    DROP the permanent staging table after both S3 exports are done.
+    Both FINAL and COMPLETE files are already in S3, so the table is no
+    longer needed and dropping it frees Snowflake storage.
+    """
+    os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
+    sql = f"DROP TABLE IF EXISTS {perm_table};"
+    logger.info(f"Dropping permanent table: {perm_table}")
+    run_command(["snowsql", "-c", "datateam1", "-q", sql])
+    logger.info(f"Table {perm_table} dropped successfully")
 
 
 def _post_to_ftp(final_dir, path_date, output_file):
@@ -402,101 +530,86 @@ def process_green_blue(request_id, channel_name):
     GREEN and BLUE channel processor.
 
     Flow:
-      1. COPY INTO s3_path   (raw data written to S3)
-      2. Load s3_path -> Snowflake TEMPORARY table
-      3. COPY DISTINCT email from temp table -> path_FINAL (S3)
-      4. Download from path_FINAL -> combine -> local CSV in channel_dir
-      5. FTP upload from FINAL_DIR
+      1. INSERT raw data directly into permanent Snowflake table (no S3 raw write)
+      2. Export FINAL FILE  (DISTINCT email, with header)        -> path_FINAL
+      3. Export COMPLETE DATA FILE (email, condition_field)       -> path_COMPLETE
+      4. DROP permanent table
+      5. Download FINAL FILE from path_FINAL -> combine -> FINAL_DIR
+      6. FTP upload from FINAL_DIR
     """
     channel_name   = channel_name.upper()
     channel_status = f"{channel_name}_STATUS"
     update_request_status(request_id, "Started", channel_status)
     ctx = _build_common_context(request_id, channel_name)
 
-    ch_handler = setup_channel_logging(ctx["output_dir"], channel_name, ctx["criteria_type"])
-
-    logger.info(f"Started {channel_name} processing for {ctx['criteria_type']} {ctx['comp_type']}")
+    ch_handler = setup_channel_logging(
+        ctx["output_dir"], channel_name, ctx["criteria_type"]
+    )
+    logger.info(
+        f"Started {channel_name} processing for "
+        f"{ctx['criteria_type']} {ctx['comp_type']}"
+    )
 
     try:
-        criteria_type  = ctx["criteria_type"]
-        criteria_value = ctx["criteria_value"]
-        comp_type      = ctx["comp_type"]
         channel_dir    = ctx["channel_dir"]
         final_dir      = ctx["final_dir"]
-        temp_table     = ctx["temp_table"]
+        perm_table     = ctx["perm_table"]
         path_FINAL     = ctx["path_FINAL"]
-
-        if criteria_type == "age":
-            condition = f"b.AGE {'>=': if comp_type == 'greater' else '<'} {criteria_value}"
-            header    = "a.email,b.age"
-        elif criteria_type == "state":
-            if isinstance(criteria_value, str):
-                criteria_value = [x.strip() for x in criteria_value.split(",")]
-            states    = "','".join(criteria_value)
-            condition = f"b.STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
-            header    = "a.email,b.state"
-        else:
-            raise Exception(f"Unsupported criteria_type {criteria_type}")
-
-        profile_table = (
-            "GREEN_LPT.UNIVERSAL_PROFILE" if channel_name == "GREEN" else "INFS_LPT.INFS_PROFILE"
-        )
-
-        # Step 1: Write raw data to S3
-        sql_copy = (
-            f"COPY INTO '{ctx['s3_path']}/' "
-            f"FROM (SELECT {header} FROM {profile_table} a "
-            f"JOIN APT_CUSTOM_GREEN_REA_DATA_DND b ON a.md5hash=b.EMAIL_MD5 "
-            f"WHERE {condition}) "
-            f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
-            f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
-            f"FIELD_OPTIONALLY_ENCLOSED_BY='\"') MAX_FILE_SIZE=490000000;"
-        )
+        path_COMPLETE  = ctx["path_COMPLETE"]
 
         start_time = time.time()
-        update_request_status(request_id, "Pulling Data", channel_status)
-        os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-        logger.info(f"Writing raw data to S3: {ctx['s3_path']}")
-        run_command(["snowsql", "-c", "datateam1", "-q", sql_copy])
 
-        # Step 2: Load S3 data into Snowflake temp table
+        # Step 1: INSERT directly into permanent Snowflake table
         update_request_status(request_id, "Loading to Snowflake", channel_status)
-        _load_s3_to_snowflake_temp(ctx["s3_path"], temp_table, channel_name, criteria_type)
+        _insert_into_perm_table(
+            perm_table, channel_name,
+            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"]
+        )
 
-        # Step 3: Write DISTINCT email from temp table to path_FINAL
-        update_request_status(request_id, "Writing Distinct Emails", channel_status)
-        _write_distinct_email_to_path_FINAL(temp_table, path_FINAL, channel_name)
+        # Step 2: Export FINAL FILE -> path_FINAL
+        update_request_status(request_id, "Exporting Final File", channel_status)
+        _export_final_file(perm_table, path_FINAL, channel_name)
 
-        # Step 4: Download from path_FINAL and combine into local CSV
+        # Step 3: Export COMPLETE DATA FILE -> path_COMPLETE
+        update_request_status(request_id, "Exporting Complete File", channel_status)
+        _export_complete_file(perm_table, path_COMPLETE, channel_name)
+
+        # Step 4: DROP permanent table (both exports done)
+        _drop_perm_table(perm_table)
+
+        # Step 5: Download FINAL FILE from path_FINAL and combine
         update_request_status(request_id, "Combining Data", channel_status)
-        download_dir = channel_dir / f"{channel_name}_FINAL_PATH"
-        logger.info(f"Downloading distinct email data from path_FINAL: {path_FINAL}")
+        download_dir = channel_dir / f"{channel_name}_FINAL_DL"
+        logger.info(f"Downloading FINAL FILE from path_FINAL: {path_FINAL}")
         _download_and_combine(
-            path_FINAL, download_dir, channel_dir, ctx["output_file"], channel_name
+            path_FINAL, download_dir, channel_dir,
+            ctx["output_file"], channel_name
         )
 
         # Move combined file to FINAL_DIR
         tmp_file_path   = channel_dir / ctx["output_file"]
-        final_file_path = final_dir / ctx["output_file"]
+        final_file_path = final_dir   / ctx["output_file"]
         shutil.move(str(tmp_file_path), str(final_file_path))
         record_count = _count_file_lines(str(final_file_path))
         logger.info(
-            f"{channel_name}: {record_count} distinct emails -> FINAL_DIR/{ctx['output_file']}"
+            f"{channel_name}: {record_count} distinct emails "
+            f"-> FINAL_DIR/{ctx['output_file']}"
         )
 
-        # Step 5: FTP upload
+        # Step 6: FTP upload
         update_request_status(request_id, "Posting To FTP", channel_status)
         _post_to_ftp(final_dir, ctx["path_date"], ctx["output_file"])
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status)
         logger.info(
-            f"{channel_name} processing completed in {elapsed:.2f} seconds | "
+            f"{channel_name} processing completed in {elapsed:.2f}s | "
             f"final file: FINAL_DIR/{ctx['output_file']}"
         )
 
         result = _success_result(
-            channel_name, ctx["output_file"], str(final_file_path), elapsed, record_count
+            channel_name, ctx["output_file"],
+            str(final_file_path), elapsed, record_count
         )
         _cleanup_channel_dir(channel_dir)
         return result
@@ -516,100 +629,86 @@ def process_arcamax(request_id):
     ARCAMAX channel processor.
 
     Flow:
-      1. COPY INTO s3_path   (raw data written to S3)
-      2. Load s3_path -> Snowflake TEMPORARY table
-      3. COPY DISTINCT email from temp table -> path_FINAL (S3)
-      4. Download from path_FINAL -> combine -> local CSV in channel_dir
-      5. FTP upload from FINAL_DIR
+      1. INSERT raw data directly into permanent Snowflake table (no S3 raw write)
+      2. Export FINAL FILE  (DISTINCT email, with header)        -> path_FINAL
+      3. Export COMPLETE DATA FILE (email, condition_field)       -> path_COMPLETE
+      4. DROP permanent table
+      5. Download FINAL FILE from path_FINAL -> combine -> FINAL_DIR
+      6. FTP upload from FINAL_DIR
     """
     channel_name   = "ARCAMAX"
     channel_status = "ARCAMAX_STATUS"
     update_request_status(request_id, "Started", channel_status)
     ctx = _build_common_context(request_id, channel_name)
 
-    ch_handler = setup_channel_logging(ctx["output_dir"], channel_name, ctx["criteria_type"])
-
-    logger.info(f"Started {channel_name} processing for {ctx['criteria_type']} {ctx['comp_type']}")
+    ch_handler = setup_channel_logging(
+        ctx["output_dir"], channel_name, ctx["criteria_type"]
+    )
+    logger.info(
+        f"Started {channel_name} processing for "
+        f"{ctx['criteria_type']} {ctx['comp_type']}"
+    )
 
     try:
-        criteria_type  = ctx["criteria_type"]
-        criteria_value = ctx["criteria_value"]
-        comp_type      = ctx["comp_type"]
         channel_dir    = ctx["channel_dir"]
         final_dir      = ctx["final_dir"]
-        temp_table     = ctx["temp_table"]
+        perm_table     = ctx["perm_table"]
         path_FINAL     = ctx["path_FINAL"]
-
-        if criteria_type == "age":
-            date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
-            condition   = (
-                f"birthday IS NOT NULL AND TRY_TO_DATE(birthday) "
-                f"{'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
-            )
-            header = "email,birthday"
-        elif criteria_type == "state":
-            if isinstance(criteria_value, str):
-                criteria_value = [x.strip() for x in criteria_value.split(",")]
-            states    = "','".join(criteria_value)
-            condition = f"STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
-            header    = "email,state"
-        else:
-            raise Exception(f"Unsupported criteria_type {criteria_type}")
-
-        # Step 1: Write raw data to S3
-        sql_copy = (
-            f"COPY INTO '{ctx['s3_path']}/' "
-            f"FROM (SELECT {header} FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
-            f"WHERE {condition}) "
-            f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
-            f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
-            f"FIELD_OPTIONALLY_ENCLOSED_BY='\"') MAX_FILE_SIZE=490000000;"
-        )
+        path_COMPLETE  = ctx["path_COMPLETE"]
 
         start_time = time.time()
-        update_request_status(request_id, "Pulling Data", channel_status)
-        os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-        logger.info(f"Writing raw data to S3: {ctx['s3_path']}")
-        run_command(["snowsql", "-c", "datateam1", "-q", sql_copy])
 
-        # Step 2: Load S3 data into Snowflake temp table
+        # Step 1: INSERT directly into permanent Snowflake table
         update_request_status(request_id, "Loading to Snowflake", channel_status)
-        _load_s3_to_snowflake_temp(ctx["s3_path"], temp_table, channel_name, criteria_type)
+        _insert_into_perm_table(
+            perm_table, channel_name,
+            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"]
+        )
 
-        # Step 3: Write DISTINCT email from temp table to path_FINAL
-        update_request_status(request_id, "Writing Distinct Emails", channel_status)
-        _write_distinct_email_to_path_FINAL(temp_table, path_FINAL, channel_name)
+        # Step 2: Export FINAL FILE -> path_FINAL
+        update_request_status(request_id, "Exporting Final File", channel_status)
+        _export_final_file(perm_table, path_FINAL, channel_name)
 
-        # Step 4: Download from path_FINAL and combine into local CSV
+        # Step 3: Export COMPLETE DATA FILE -> path_COMPLETE
+        update_request_status(request_id, "Exporting Complete File", channel_status)
+        _export_complete_file(perm_table, path_COMPLETE, channel_name)
+
+        # Step 4: DROP permanent table
+        _drop_perm_table(perm_table)
+
+        # Step 5: Download FINAL FILE from path_FINAL and combine
         update_request_status(request_id, "Combining Data", channel_status)
-        download_dir = channel_dir / "ARCAMAX_FINAL_PATH"
-        logger.info(f"Downloading distinct email data from path_FINAL: {path_FINAL}")
+        download_dir = channel_dir / "ARCAMAX_FINAL_DL"
+        logger.info(f"Downloading FINAL FILE from path_FINAL: {path_FINAL}")
         _download_and_combine(
-            path_FINAL, download_dir, channel_dir, ctx["output_file"], channel_name
+            path_FINAL, download_dir, channel_dir,
+            ctx["output_file"], channel_name
         )
 
         # Move combined file to FINAL_DIR
         tmp_file_path   = channel_dir / ctx["output_file"]
-        final_file_path = final_dir / ctx["output_file"]
+        final_file_path = final_dir   / ctx["output_file"]
         shutil.move(str(tmp_file_path), str(final_file_path))
         record_count = _count_file_lines(str(final_file_path))
         logger.info(
-            f"{channel_name}: {record_count} distinct emails -> FINAL_DIR/{ctx['output_file']}"
+            f"{channel_name}: {record_count} distinct emails "
+            f"-> FINAL_DIR/{ctx['output_file']}"
         )
 
-        # Step 5: FTP upload
+        # Step 6: FTP upload
         update_request_status(request_id, "Posting To FTP", channel_status)
         _post_to_ftp(final_dir, ctx["path_date"], ctx["output_file"])
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status)
         logger.info(
-            f"{channel_name} processing completed in {elapsed:.2f} seconds | "
+            f"{channel_name} processing completed in {elapsed:.2f}s | "
             f"final file: FINAL_DIR/{ctx['output_file']}"
         )
 
         result = _success_result(
-            channel_name, ctx["output_file"], str(final_file_path), elapsed, record_count
+            channel_name, ctx["output_file"],
+            str(final_file_path), elapsed, record_count
         )
         _cleanup_channel_dir(channel_dir)
         return result
@@ -629,87 +728,68 @@ def process_orange(request_id):
     ORANGE channel processor.
 
     Flow:
-      1. COPY INTO s3_path   (raw data written to S3)
-      2. Load s3_path -> Snowflake TEMPORARY table (email_address, account_name)
-      3. COPY DISTINCT email_address, account_name from temp table -> path_FINAL (S3)
-      4. Download from path_FINAL -> combine -> local CSV in channel_dir
-      5. suppression -> single email-only CSV in FINAL_DIR
-         mailing     -> ESP-wise split CSVs packed into a ZIP in FINAL_DIR
-      6. FTP upload from FINAL_DIR
+      1. INSERT raw data directly into permanent Snowflake table (no S3 raw write)
+         Schema: (email_address, condition_field, account_name)
+      2. Export FINAL FILE  (DISTINCT email_address, account_name, with header)
+         -> path_FINAL
+      3. Export COMPLETE DATA FILE
+         (email_address, condition_field, account_name, with header)
+         -> path_COMPLETE
+      4. DROP permanent table
+      5. Download FINAL FILE from path_FINAL -> combine -> channel_dir
+      6. Based on request_type:
+           suppression -> email-only CSV in FINAL_DIR
+           mailing     -> ESP-wise split CSVs packed into a ZIP in FINAL_DIR
+      7. FTP upload from FINAL_DIR
     """
     channel_name   = "ORANGE"
     channel_status = "ORANGE_STATUS"
     update_request_status(request_id, "Started", channel_status)
     ctx = _build_common_context(request_id, channel_name)
 
-    ch_handler = setup_channel_logging(ctx["output_dir"], channel_name, ctx["criteria_type"])
-
-    logger.info(f"Started {channel_name} processing for {ctx['criteria_type']} {ctx['comp_type']}")
+    ch_handler = setup_channel_logging(
+        ctx["output_dir"], channel_name, ctx["criteria_type"]
+    )
+    logger.info(
+        f"Started {channel_name} processing for "
+        f"{ctx['criteria_type']} {ctx['comp_type']}"
+    )
 
     try:
-        criteria_type  = ctx["criteria_type"]
-        criteria_value = ctx["criteria_value"]
-        comp_type      = ctx["comp_type"]
         request_type   = ctx["request_type"]
         client_name    = ctx["client_name"]
         channel_dir    = ctx["channel_dir"]
         final_dir      = ctx["final_dir"]
         path_date      = ctx["path_date"]
-        temp_table     = ctx["temp_table"]
+        perm_table     = ctx["perm_table"]
         path_FINAL     = ctx["path_FINAL"]
-
-        if criteria_type == "age":
-            date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
-            condition   = f"dob {'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
-        elif criteria_type == "state":
-            if isinstance(criteria_value, str):
-                criteria_value = [x.strip() for x in criteria_value.split(",")]
-            states    = "','".join(criteria_value)
-            condition = f"STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
-        else:
-            raise Exception(f"Unsupported criteria_type {criteria_type}")
-
-        # Step 1: Write raw data to S3
-        sql_copy = (
-            f"COPY INTO '{ctx['s3_path']}/' "
-            f"FROM ("
-            f"SELECT a.email_address, b.ACCOUNT_NAME "
-            f"FROM ("
-            f"SELECT a.FEED_ID, a.email_address "
-            f"FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a, "
-            f"(SELECT a.email_address, MAX(a.created_at) AS maxdate "
-            f"FROM APT_CUSTOM_ORANGE_TRANSACTION_DND a "
-            f"WHERE {condition} GROUP BY 1) b "
-            f"WHERE a.email_address=b.email_address AND a.created_at=b.maxdate"
-            f") a "
-            f"JOIN APT_ADHOC_JAIDEEP_ZIP_ESP_DETAILS_INCLUDE_ORANGE_20260604 b ON a.FEED_ID=b.FEEDID "
-            f"JOIN APT_CUSTOM_ORANGE_PROFILE_EMAIL_DND c ON a.email_address=c.email_address "
-            f"JOIN APT_CUSTOM_L90_ORANGE_UNIQ_RESPONDERS_UNIQ_DND d ON a.email_address=d.email"
-            f") "
-            f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
-            f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
-            f"FIELD_OPTIONALLY_ENCLOSED_BY='\"') MAX_FILE_SIZE=490000000;"
-        )
+        path_COMPLETE  = ctx["path_COMPLETE"]
 
         start_time = time.time()
-        update_request_status(request_id, "Pulling Data", channel_status)
-        os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-        logger.info(f"Writing raw data to S3: {ctx['s3_path']}")
-        run_command(["snowsql", "-c", "datateam1", "-q", sql_copy])
 
-        # Step 2: Load S3 data into Snowflake temp table
+        # Step 1: INSERT directly into permanent Snowflake table
         update_request_status(request_id, "Loading to Snowflake", channel_status)
-        _load_s3_to_snowflake_temp(ctx["s3_path"], temp_table, channel_name, criteria_type)
+        _insert_into_perm_table(
+            perm_table, channel_name,
+            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"]
+        )
 
-        # Step 3: Write DISTINCT email_address, account_name from temp table to path_FINAL
-        update_request_status(request_id, "Writing Distinct Emails", channel_status)
-        _write_distinct_email_to_path_FINAL(temp_table, path_FINAL, channel_name)
+        # Step 2: Export FINAL FILE -> path_FINAL
+        update_request_status(request_id, "Exporting Final File", channel_status)
+        _export_final_file(perm_table, path_FINAL, channel_name)
 
-        # Step 4: Download from path_FINAL and combine into local CSV
+        # Step 3: Export COMPLETE DATA FILE -> path_COMPLETE
+        update_request_status(request_id, "Exporting Complete File", channel_status)
+        _export_complete_file(perm_table, path_COMPLETE, channel_name)
+
+        # Step 4: DROP permanent table
+        _drop_perm_table(perm_table)
+
+        # Step 5: Download FINAL FILE from path_FINAL and combine
         update_request_status(request_id, "Combining Data", channel_status)
-        raw_combined = f"ORANGE_RAW_{path_date}.csv"
-        download_dir = channel_dir / "ORANGE_FINAL_PATH"
-        logger.info(f"Downloading distinct email data from path_FINAL: {path_FINAL}")
+        raw_combined = f"ORANGE_FINAL_{path_date}.csv"
+        download_dir = channel_dir / "ORANGE_FINAL_DL"
+        logger.info(f"Downloading FINAL FILE from path_FINAL: {path_FINAL}")
         _download_and_combine(
             path_FINAL, download_dir, channel_dir, raw_combined, channel_name
         )
@@ -722,12 +802,15 @@ def process_orange(request_id):
             dtype=str,
         )
         total_count = len(df_final)
-        logger.info(f"ORANGE distinct records from path_FINAL: {total_count}")
+        logger.info(f"ORANGE FINAL FILE records: {total_count}")
 
+        # Step 6: Build output file based on request_type
         update_request_status(request_id, "Posting To FTP", channel_status)
 
         if request_type.lower() == "suppression":
-            output_file      = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
+            output_file      = (
+                f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
+            )
             suppression_path = final_dir / output_file
             (
                 df_final[["email_address"]]
@@ -736,29 +819,41 @@ def process_orange(request_id):
             )
             record_count = len(pd.read_csv(str(suppression_path), header=None))
             logger.info(
-                f"ORANGE suppression file: {output_file} ({record_count} records) -> FINAL_DIR"
+                f"ORANGE suppression: {output_file} "
+                f"({record_count} records) -> FINAL_DIR"
             )
             _post_to_ftp(final_dir, path_date, output_file)
             final_file_path = str(suppression_path)
 
-        else:
+        else:  # mailing
             esp_split_dir = channel_dir / "ORANGE_ESP_SPLIT"
             esp_split_dir.mkdir(exist_ok=True)
             esp_names = df_final["account_name"].dropna().unique()
             zip_parts = []
             for esp in esp_names:
-                esp_df   = df_final[df_final["account_name"] == esp][["email_address"]].drop_duplicates()
-                esp_file = esp_split_dir / f"{client_name}_{request_type}_{esp}_{path_date}.csv"
+                esp_df = (
+                    df_final[df_final["account_name"] == esp][["email_address"]]
+                    .drop_duplicates()
+                )
+                esp_file = (
+                    esp_split_dir
+                    / f"{client_name}_{request_type}_{esp}_{path_date}.csv"
+                )
                 esp_df.to_csv(str(esp_file), index=False, header=False)
                 zip_parts.append(esp_file)
-                logger.info(f"ORANGE ESP split: {esp_file.name} ({len(esp_df)} records)")
+                logger.info(
+                    f"ORANGE ESP split: {esp_file.name} ({len(esp_df)} records)"
+                )
 
             zip_name = f"{client_name}_{request_type}_ORANGE_{path_date}.zip"
             zip_path = final_dir / zip_name
             run_command(
                 ["zip", "-j", str(zip_path)] + [str(p) for p in zip_parts]
             )
-            logger.info(f"ORANGE mailing ZIP: {zip_name} ({len(zip_parts)} ESPs) -> FINAL_DIR")
+            logger.info(
+                f"ORANGE mailing ZIP: {zip_name} "
+                f"({len(zip_parts)} ESPs) -> FINAL_DIR"
+            )
             _post_to_ftp(final_dir, path_date, zip_name)
             final_file_path = str(zip_path)
             output_file     = zip_name
@@ -767,12 +862,13 @@ def process_orange(request_id):
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status)
         logger.info(
-            f"ORANGE processing completed in {elapsed:.2f} seconds | "
+            f"ORANGE processing completed in {elapsed:.2f}s | "
             f"final file: FINAL_DIR/{output_file}"
         )
 
         result = _success_result(
-            channel_name, output_file, final_file_path, elapsed, record_count
+            channel_name, output_file,
+            final_file_path, elapsed, record_count
         )
         _cleanup_channel_dir(channel_dir)
         return result
@@ -835,7 +931,10 @@ def process_age_state_request(request_id, channel="ALL"):
             logger.error(f"FAILED: {e}")
     else:
         with ThreadPoolExecutor(max_workers=len(channels_to_run)) as executor:
-            future_map = {executor.submit(process_channel, ch): ch for ch in channels_to_run}
+            future_map = {
+                executor.submit(process_channel, ch): ch
+                for ch in channels_to_run
+            }
             for future in as_completed(future_map):
                 ch = future_map[future]
                 try:
