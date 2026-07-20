@@ -88,6 +88,13 @@ CHANNELS = ["GREEN", "BLUE", "ARCAMAX", "ORANGE"]
 
 _FMT = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s")
 
+# ---------------------------------------------------------------------------
+# DB retry constants
+# ---------------------------------------------------------------------------
+
+_DB_RETRY_ATTEMPTS   = 3    # total tries (1 original + 2 retries)
+_DB_RETRY_BASE_DELAY = 2    # seconds; doubles on each retry: 2s, 4s
+
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -156,11 +163,49 @@ def get_dob_cutoff(min_age, comp_type):
 
 
 def get_db():
+    """Open a fresh pymysql connection (no retry — use get_db_with_retry)."""
     return pymysql.connect(**DB_CONFIG)
 
 
+def get_db_with_retry(log=None):
+    """
+    Open a pymysql connection with exponential-backoff retry.
+
+    Retries up to _DB_RETRY_ATTEMPTS times on OperationalError (covers
+    errno 2013 'Lost connection' and errno 2003 'Can't connect').
+    Waits _DB_RETRY_BASE_DELAY * 2^attempt seconds between tries.
+
+    Parameters
+    ----------
+    log : logging.Logger or None
+        If provided, warning messages are emitted on each failed attempt.
+
+    Returns
+    -------
+    pymysql.Connection
+    """
+    last_exc = None
+    for attempt in range(_DB_RETRY_ATTEMPTS):
+        try:
+            return pymysql.connect(**DB_CONFIG)
+        except pymysql.err.OperationalError as exc:
+            last_exc = exc
+            if attempt < _DB_RETRY_ATTEMPTS - 1:
+                delay = _DB_RETRY_BASE_DELAY * (2 ** attempt)
+                msg = (
+                    f"DB connect failed (attempt {attempt + 1}/{_DB_RETRY_ATTEMPTS}): "
+                    f"{exc} — retrying in {delay}s"
+                )
+                if log:
+                    log.warning(msg)
+                else:
+                    print(msg)
+                time.sleep(delay)
+    raise last_exc
+
+
 def fetch_request_details(request_id):
-    conn = get_db()
+    conn = get_db_with_retry()
     try:
         with conn.cursor(pymysql.cursors.DictCursor) as cur:
             cur.execute(
@@ -185,21 +230,46 @@ def fetch_request_details(request_id):
 
 
 def update_request_status(request_id, status, status_column, log):
-    """Update DB status and write to the supplied logger."""
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"UPDATE requests SET {status_column}=%s WHERE id=%s",
-                (status, request_id),
-            )
-        conn.commit()
-        log.info(f"{status_column} -> '{status}'  (request_id={request_id})")
-    except Exception:
-        log.exception(f"Failed updating {status_column}")
-        raise
-    finally:
-        conn.close()
+    """
+    Update DB status with retry and write to the supplied logger.
+
+    Uses get_db_with_retry so transient connection resets (errno 104 /
+    OperationalError 2013) do not crash the channel immediately.
+    Retries up to _DB_RETRY_ATTEMPTS times on OperationalError.
+    """
+    last_exc = None
+    for attempt in range(_DB_RETRY_ATTEMPTS):
+        try:
+            conn = get_db_with_retry(log)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"UPDATE requests SET {status_column}=%s WHERE id=%s",
+                        (status, request_id),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            log.info(f"{status_column} -> '{status}'  (request_id={request_id})")
+            return  # success
+        except pymysql.err.OperationalError as exc:
+            last_exc = exc
+            if attempt < _DB_RETRY_ATTEMPTS - 1:
+                delay = _DB_RETRY_BASE_DELAY * (2 ** attempt)
+                log.warning(
+                    f"update_request_status failed (attempt {attempt + 1}/"
+                    f"{_DB_RETRY_ATTEMPTS}): {exc} — retrying in {delay}s"
+                )
+                time.sleep(delay)
+        except Exception:
+            log.exception(f"Failed updating {status_column}")
+            raise
+    # All retries exhausted
+    log.error(
+        f"update_request_status gave up after {_DB_RETRY_ATTEMPTS} attempts: "
+        f"{last_exc}"
+    )
+    raise last_exc
 
 
 def _build_common_context(request_id, channel_name, run_dir: Path):
@@ -971,7 +1041,7 @@ def process_age_state_request(request_id, channel="ALL"):
                     log_main.error(f"[{ch}] FAILED: {exc}")
 
     overall_status = "failed" if failed else "completed"
-    conn = get_db()
+    conn = get_db_with_retry(log_main)
     try:
         with conn.cursor() as cur:
             cur.execute(
