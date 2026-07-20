@@ -4,36 +4,53 @@ AGE STATE Processing - unique request-driven channel execution.
 Supports single-channel or all-channel execution, with parallel execution
 only when multiple channels are requested.
 
-Output directory layout per run:
+Run directory layout
+--------------------
 
     <output_dir>/run_age_<YYYYMMDD_HHMMSS>/
         logs/
-            age_<YYYYMMDD_HHMMSS>.log           <- combined log (all channels)
-            GREEN_age_<YYYYMMDD_HHMMSS>.log     <- per-channel log
+            age_<YYYYMMDD_HHMMSS>.log          <- MAIN log  (orchestrator only)
+            GREEN_age_<YYYYMMDD_HHMMSS>.log    <- GREEN channel log (all GREEN work)
             BLUE_age_<YYYYMMDD_HHMMSS>.log
             ARCAMAX_age_<YYYYMMDD_HHMMSS>.log
             ORANGE_age_<YYYYMMDD_HHMMSS>.log
-        FINAL_DIR/
-            <client>_<request_type>_GREEN_<date>.csv
+        FINAL_FILES/
+            <client>_<request_type>_GREEN_<date>.csv   <- final deliverables only
             <client>_<request_type>_BLUE_<date>.csv
-            ...  (final files; never deleted)
-        GREEN/   <- temp channel working dir; deleted after FTP
-        BLUE/
-        ARCAMAX/
-        ORANGE/
+            ...
+        GREEN_tmp/    <- temp working dir; deleted after final file moved to FINAL_FILES
+        BLUE_tmp/
+        ARCAMAX_tmp/
+        ORANGE_tmp/
 
-Processing flow per channel:
-  1. INSERT raw query results directly into a permanent Snowflake table
+Log routing rules
+-----------------
+  age_main logger   → age_<ts>.log ONLY
+      • All log.info/error/exception calls inside process_age_state_request
+      • Explicit channel summary lines (started / completed / failed) written
+        by the orchestrator so the main log has a high-level picture
+      • propagate = False  →  nothing leaks into root logger
+
+  age_<CHANNEL> logger  → <CH>_age_<ts>.log ONLY
+      • Every log call inside process_green_blue / process_arcamax / process_orange
+        and all helpers they invoke (_insert_into_perm_table, _export_*, _drop_*, etc.)
+      • propagate = False  →  channel logs never bleed into main log
+      • Channel processors receive their logger as a parameter; helpers also receive it
+
+Processing flow per channel
+---------------------------
+  1. INSERT raw query results directly into permanent Snowflake table
        APT_CPA_<CHANNEL>_<YYYYMMDD>  (no S3 write for raw data)
   2. Export FINAL FILE  -> path_FINAL  (S3)
-       DISTINCT email (with header)                 [GREEN / BLUE / ARCAMAX]
-       DISTINCT email_address, account_name (header)[ORANGE]
+       DISTINCT email (with header)                  [GREEN / BLUE / ARCAMAX]
+       DISTINCT email_address, account_name (header) [ORANGE]
   3. Export COMPLETE DATA FILE -> path_COMPLETE (S3)
-       email, condition_field                        [GREEN / BLUE / ARCAMAX]
-       email_address, condition_field, account_name  [ORANGE]
-  4. DROP the permanent table (no re-load needed; both files already exported)
-  5. Download FINAL FILE from path_FINAL -> combine -> FINAL_DIR
-  6. FTP upload from FINAL_DIR
+       email, condition_field                         [GREEN / BLUE / ARCAMAX]
+       email_address, condition_field, account_name   [ORANGE]
+  4. DROP the permanent table
+  5. Download FINAL FILE from path_FINAL -> combine -> <CH>_tmp/
+  6. Move combined file to FINAL_FILES/  (temp dir deleted after move)
+  7. FTP upload from FINAL_FILES/
      ORANGE suppression: email-only CSV
      ORANGE mailing    : ESP-wise split CSVs in a ZIP
 """
@@ -69,51 +86,62 @@ DB_CONFIG = {
 
 CHANNELS = ["GREEN", "BLUE", "ARCAMAX", "ORANGE"]
 
-# Module-level logger; replaced per-run by setup_logging().
-logger = logging.getLogger("age_processor")
+_FMT = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s")
 
 
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
 
-def _make_handler(log_path):
+def _file_handler(log_path: Path) -> logging.FileHandler:
     """Create a FileHandler with the standard formatter."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(str(log_path))
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s")
-    )
-    return handler
+    h = logging.FileHandler(str(log_path))
+    h.setFormatter(_FMT)
+    return h
 
 
-def setup_logging(output_dir, criteria_type):
+def setup_main_logging(run_dir: Path, criteria_type: str) -> logging.Logger:
     """
-    Set up the shared 'age_processor' logger with a single combined log file
-    under <output_dir>/logs/<criteria_type>_<timestamp>.log.
+    Create (or reset) the MAIN logger 'age_main'.
+
+    Writes to:  <run_dir>/logs/age_<YYYYMMDD_HHMMSS>.log
+
+    propagate=False ensures nothing from this logger leaks into root or any
+    channel logger, and channel messages never appear here unless the
+    orchestrator explicitly calls logger_main.info(...).
     """
-    log_date = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = Path(output_dir) / "logs" / f"{criteria_type}_{log_date}.log"
-    _logger  = logging.getLogger("age_processor")
-    _logger.setLevel(logging.INFO)
-    _logger.handlers.clear()
-    _logger.addHandler(_make_handler(log_file))
-    return _logger
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = run_dir / "logs" / f"age_{ts}.log"
+
+    lg = logging.getLogger("age_main")
+    lg.setLevel(logging.INFO)
+    lg.propagate = False
+    lg.handlers.clear()
+    lg.addHandler(_file_handler(log_file))
+    return lg
 
 
-def setup_channel_logging(output_dir, channel_name, criteria_type):
+def setup_channel_logging(run_dir: Path, channel_name: str,
+                           criteria_type: str) -> logging.Logger:
     """
-    Add a per-channel FileHandler to the shared 'age_processor' logger.
-    Returns the handler so the caller can remove it when the channel finishes.
+    Create (or reset) a per-channel logger  'age_<CHANNEL>'.
+
+    Writes to:  <run_dir>/logs/<CHANNEL>_age_<YYYYMMDD_HHMMSS>.log
+
+    propagate=False ensures channel logs never bleed into the main log or
+    root logger.  All work done inside a channel processor (and the helpers
+    it calls) must use this logger.
     """
-    log_date = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = (
-        Path(output_dir) / "logs"
-        / f"{channel_name.upper()}_{criteria_type}_{log_date}.log"
-    )
-    handler = _make_handler(log_file)
-    logging.getLogger("age_processor").addHandler(handler)
-    return handler
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = run_dir / "logs" / f"{channel_name.upper()}_age_{ts}.log"
+
+    lg = logging.getLogger(f"age_{channel_name.upper()}")
+    lg.setLevel(logging.INFO)
+    lg.propagate = False
+    lg.handlers.clear()
+    lg.addHandler(_file_handler(log_file))
+    return lg
 
 
 # ---------------------------------------------------------------------------
@@ -152,14 +180,12 @@ def fetch_request_details(request_id):
                 (request_id,),
             )
             return cur.fetchone()
-    except Exception:
-        logger.exception("Unable to fetch request details")
-        raise
     finally:
         conn.close()
 
 
-def update_request_status(request_id, status, status_column):
+def update_request_status(request_id, status, status_column, log):
+    """Update DB status and write to the supplied logger."""
     conn = get_db()
     try:
         with conn.cursor() as cur:
@@ -168,26 +194,31 @@ def update_request_status(request_id, status, status_column):
                 (status, request_id),
             )
         conn.commit()
-        logger.info(f"{status_column} updated to {status} for request_id={request_id}")
+        log.info(f"{status_column} -> '{status}'  (request_id={request_id})")
     except Exception:
-        logger.exception(f"Failed updating {status_column}")
+        log.exception(f"Failed updating {status_column}")
         raise
     finally:
         conn.close()
 
 
-def _build_common_context(request_id, channel_name):
+def _build_common_context(request_id, channel_name, run_dir: Path):
     """
     Build the shared context dict for a channel run.
+
+    Directory layout inside run_dir
+    --------------------------------
+        run_dir/
+            logs/           <- created by setup_*_logging
+            FINAL_FILES/    <- final deliverables only; never deleted
+            <CH>_tmp/       <- temp dir for S3 download + combine; deleted after use
 
     Snowflake permanent table:
         perm_table  = APT_CPA_<CHANNEL>_<YYYYMMDD>
 
-    S3 layout (no raw-data S3 write; only two export paths):
+    S3 export paths:
         path_FINAL    = S3_BASE/<request_type>/<date>/<request_name>/<channel>_FINAL
-                        DISTINCT email (with header) / DISTINCT email,account_name
         path_COMPLETE = S3_BASE/<request_type>/<date>/<request_name>/<channel>_COMPLETE
-                        Full email + condition field (+ account_name for ORANGE)
     """
     request_data = fetch_request_details(request_id)
     if not request_data:
@@ -199,65 +230,68 @@ def _build_common_context(request_id, channel_name):
     criteria_type  = request_data["criteria_type"]
     criteria_value = request_data["criteria_value"]
     comp_type      = request_data["comp_type"]
-    output_dir     = request_data["output_dir"]
 
-    safe_output_dir = ensure_output_dir(output_dir, criteria_type)
+    # FINAL_FILES lives directly inside run_dir
+    final_files_dir = run_dir / "FINAL_FILES"
+    final_files_dir.mkdir(parents=True, exist_ok=True)
 
-    final_dir = Path(str(safe_output_dir)) / "FINAL_DIR"
-    final_dir.mkdir(parents=True, exist_ok=True)
+    # Per-channel temp working dir inside run_dir
+    channel_tmp = run_dir / f"{channel_name.upper()}_tmp"
+    channel_tmp.mkdir(parents=True, exist_ok=True)
 
-    channel_dir = Path(str(safe_output_dir)) / channel_name.upper()
-    channel_dir.mkdir(parents=True, exist_ok=True)
-
-    path_date = datetime.now().strftime("%Y%m%d")
-
-    # Permanent Snowflake staging table (not TEMPORARY — persists until explicitly DROPped)
+    path_date  = datetime.now().strftime("%Y%m%d")
     perm_table = f"APT_CPA_{channel_name.upper()}_{path_date}"
 
-    # S3 export paths (written FROM the permanent table)
-    path_FINAL    = f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}_FINAL"
-    path_COMPLETE = f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}_COMPLETE"
+    path_FINAL    = (
+        f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}_FINAL"
+    )
+    path_COMPLETE = (
+        f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}_COMPLETE"
+    )
 
     output_file = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
 
     return {
-        "request_data"  : request_data,
-        "client_name"   : client_name,
-        "request_type"  : request_type,
-        "request_name"  : request_name,
-        "criteria_type" : criteria_type,
-        "criteria_value": criteria_value,
-        "comp_type"     : comp_type,
-        "output_dir"    : str(safe_output_dir),
-        "final_dir"     : final_dir,
-        "channel_dir"   : channel_dir,
-        "path_date"     : path_date,
-        "path_FINAL"    : path_FINAL,
-        "path_COMPLETE" : path_COMPLETE,
-        "output_file"   : output_file,
-        "perm_table"    : perm_table,
+        "request_data"   : request_data,
+        "client_name"    : client_name,
+        "request_type"   : request_type,
+        "request_name"   : request_name,
+        "criteria_type"  : criteria_type,
+        "criteria_value" : criteria_value,
+        "comp_type"      : comp_type,
+        "final_files_dir": final_files_dir,   # FINAL_FILES/  <- final files only
+        "channel_tmp"    : channel_tmp,        # <CH>_tmp/     <- deleted after use
+        "path_date"      : path_date,
+        "path_FINAL"     : path_FINAL,
+        "path_COMPLETE"  : path_COMPLETE,
+        "output_file"    : output_file,
+        "perm_table"     : perm_table,
     }
 
 
 def _count_file_lines(file_path):
-    """Fast line count using wc -l (avoids loading file into memory)."""
+    """Fast line count using wc -l."""
     cmd    = f"wc -l < {shlex.quote(file_path)}"
-    result = subprocess.check_output(cmd, shell=True, universal_newlines=True).strip()
+    result = subprocess.check_output(
+        cmd, shell=True, universal_newlines=True
+    ).strip()
     return int(result) if result else 0
 
 
-def _download_and_combine(s3_path, download_dir, work_dir, output_file, channel_name):
+def _download_and_combine(s3_path, download_dir, work_dir,
+                           output_file, channel_name, log):
     """
     Download gzipped S3 parts into *download_dir* and concatenate into one
     pipe-delimited file at <work_dir>/<output_file>.
-    For non-ORANGE channels: strip to first column (email only).
-    For ORANGE: keep all columns.
+    Non-ORANGE: keep col-1 (email) only.  ORANGE: keep all columns.
+    Header row (written by Snowflake COPY INTO HEADER=TRUE) is stripped.
     """
     download_dir = Path(download_dir)
     work_dir     = Path(work_dir)
     download_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    log.info(f"Downloading from S3: {s3_path}  ->  {download_dir}")
     run_command(
         ["aws", "s3", "cp", s3_path, str(download_dir), "--recursive", "--quiet"]
     )
@@ -265,44 +299,42 @@ def _download_and_combine(s3_path, download_dir, work_dir, output_file, channel_
     downloaded = sorted(download_dir.glob("data*"))
     if not downloaded:
         raise RuntimeError(
-            f"aws s3 cp from {s3_path} downloaded 0 files into {download_dir}. "
-            "Check S3 path and IAM permissions."
+            f"aws s3 cp from {s3_path} downloaded 0 files into {download_dir}."
         )
 
     out_path = work_dir / output_file
     if channel_name != "ORANGE":
-        # path_FINAL for non-ORANGE only has email column; take col 1 to be safe
         run_command(
             f"zcat {shlex.quote(str(download_dir) + '/')}data* "
             f"| tail -n +2 "
             f"| cut -d'|' -f1 > {shlex.quote(str(out_path))}"
         )
     else:
-        # path_FINAL for ORANGE has email_address|account_name; skip header row
         run_command(
             f"zcat {shlex.quote(str(download_dir) + '/')}data* "
             f"| tail -n +2 > {shlex.quote(str(out_path))}"
         )
 
     run_command(f"rm -f {str(download_dir / 'data*')}", cwd=str(download_dir))
+    log.info(f"Combined file written: {out_path}")
 
 
 # ---------------------------------------------------------------------------
-# Snowflake table helpers
+# Snowflake helpers  (all accept a 'log' parameter — channel logger)
 # ---------------------------------------------------------------------------
 
 def _insert_into_perm_table(perm_table, channel_name, criteria_type,
-                             criteria_value, comp_type):
+                              criteria_value, comp_type, log):
     """
-    CREATE OR REPLACE the permanent staging table and INSERT query results
-    directly (no S3 write for raw data).
+    CREATE OR REPLACE permanent table and INSERT query results directly.
+    No S3 write for raw data.
 
-    Table schemas
-    -------------
-    GREEN / BLUE  : (email, condition_field)   condition_field = age or state
-    ARCAMAX       : (email, condition_field)   condition_field = birthday or state
-    ORANGE        : (email_address, condition_field, account_name)
-                   condition_field = dob or state
+    Schemas
+    -------
+    GREEN / BLUE  : (email STRING, condition_field STRING)
+    ARCAMAX       : (email STRING, condition_field STRING)
+    ORANGE        : (email_address STRING, condition_field STRING,
+                     account_name STRING)
     """
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
 
@@ -314,17 +346,15 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
         )
         if criteria_type == "age":
             cond_col  = "b.AGE"
-            condition = (
-                f"b.AGE {'>=': if comp_type == 'greater' else '<'} {criteria_value}"
-            )
-        else:  # state
-            cond_col  = "b.STATE"
+            op        = ">=" if comp_type == "greater" else "<"
+            condition = f"b.AGE {op} {criteria_value}"
+        else:
+            cond_col = "b.STATE"
             if isinstance(criteria_value, str):
                 criteria_value = [x.strip() for x in criteria_value.split(",")]
             states    = "','".join(criteria_value)
-            condition = (
-                f"b.STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
-            )
+            kw        = "IN" if comp_type == "include" else "NOT IN"
+            condition = f"b.STATE {kw} ('{states}')"
 
         create_sql = (
             f"CREATE OR REPLACE TABLE {perm_table} "
@@ -342,18 +372,18 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
         if criteria_type == "age":
             date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
             cond_col    = "birthday"
+            op          = "<=" if comp_type == "greater" else ">="
             condition   = (
                 f"birthday IS NOT NULL AND TRY_TO_DATE(birthday) "
-                f"{'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
+                f"{op} '{date_cutoff}'"
             )
-        else:  # state
-            cond_col  = "STATE"
+        else:
+            cond_col = "STATE"
             if isinstance(criteria_value, str):
                 criteria_value = [x.strip() for x in criteria_value.split(",")]
             states    = "','".join(criteria_value)
-            condition = (
-                f"STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
-            )
+            kw        = "IN" if comp_type == "include" else "NOT IN"
+            condition = f"STATE {kw} ('{states}')"
 
         create_sql = (
             f"CREATE OR REPLACE TABLE {perm_table} "
@@ -370,17 +400,15 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
         if criteria_type == "age":
             date_cutoff = get_dob_cutoff(int(criteria_value), comp_type)
             cond_col    = "a.dob"
-            condition   = (
-                f"dob {'<=' if comp_type == 'greater' else '>='} '{date_cutoff}'"
-            )
-        else:  # state
-            cond_col  = "a.STATE"
+            op          = "<=" if comp_type == "greater" else ">="
+            condition   = f"dob {op} '{date_cutoff}'"
+        else:
+            cond_col = "a.STATE"
             if isinstance(criteria_value, str):
                 criteria_value = [x.strip() for x in criteria_value.split(",")]
             states    = "','".join(criteria_value)
-            condition = (
-                f"STATE {'IN' if comp_type == 'include' else 'NOT IN'} ('{states}')"
-            )
+            kw        = "IN" if comp_type == "include" else "NOT IN"
+            condition = f"STATE {kw} ('{states}')"
 
         create_sql = (
             f"CREATE OR REPLACE TABLE {perm_table} "
@@ -407,29 +435,26 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
         )
 
     combined_sql = f"{create_sql} {insert_sql}"
-    logger.info(f"Creating permanent table and inserting data: {perm_table}")
+    log.info(f"Creating permanent table and inserting data: {perm_table}")
     run_command(["snowsql", "-c", "datateam1", "-q", combined_sql])
-    logger.info(f"Data inserted into permanent table {perm_table} successfully")
+    log.info(f"Data inserted into {perm_table} successfully")
 
 
-def _export_final_file(perm_table, path_FINAL, channel_name):
+def _export_final_file(perm_table, path_FINAL, channel_name, log):
     """
-    Export FINAL FILE from the permanent table to path_FINAL (S3).
+    Export FINAL FILE from permanent table -> path_FINAL (S3).
 
-    GREEN / BLUE / ARCAMAX:
-        DISTINCT email  (header: email)
-    ORANGE:
-        DISTINCT email_address, account_name  (header: email,accountname)
-
-    SINGLE_HEADER option writes column names as the first row in the output.
+    GREEN / BLUE / ARCAMAX : DISTINCT email           (header: email)
+    ORANGE                 : DISTINCT email_address, account_name
+                             (header: email_address|account_name)
     """
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
 
-    if channel_name == "ORANGE":
-        select_clause = "DISTINCT email_address, account_name"
-    else:
-        select_clause = "DISTINCT email"
-
+    select_clause = (
+        "DISTINCT email_address, account_name"
+        if channel_name == "ORANGE"
+        else "DISTINCT email"
+    )
     sql = (
         f"COPY INTO '{path_FINAL}/' "
         f"FROM (SELECT {select_clause} FROM {perm_table}) "
@@ -440,28 +465,25 @@ def _export_final_file(perm_table, path_FINAL, channel_name):
         f"HEADER=TRUE "
         f"MAX_FILE_SIZE=490000000;"
     )
-
-    logger.info(f"Exporting FINAL FILE from {perm_table} -> {path_FINAL}")
+    log.info(f"Exporting FINAL FILE: {perm_table} -> {path_FINAL}")
     run_command(["snowsql", "-c", "datateam1", "-q", sql])
-    logger.info("FINAL FILE export complete")
+    log.info("FINAL FILE export complete")
 
 
-def _export_complete_file(perm_table, path_COMPLETE, channel_name):
+def _export_complete_file(perm_table, path_COMPLETE, channel_name, log):
     """
-    Export COMPLETE DATA FILE from the permanent table to path_COMPLETE (S3).
+    Export COMPLETE DATA FILE from permanent table -> path_COMPLETE (S3).
 
-    GREEN / BLUE / ARCAMAX:
-        email, condition_field   (all rows, with header)
-    ORANGE:
-        email_address, condition_field, account_name  (all rows, with header)
+    GREEN / BLUE / ARCAMAX : email, condition_field
+    ORANGE                 : email_address, condition_field, account_name
     """
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
 
-    if channel_name == "ORANGE":
-        select_clause = "email_address, condition_field, account_name"
-    else:
-        select_clause = "email, condition_field"
-
+    select_clause = (
+        "email_address, condition_field, account_name"
+        if channel_name == "ORANGE"
+        else "email, condition_field"
+    )
     sql = (
         f"COPY INTO '{path_COMPLETE}/' "
         f"FROM (SELECT {select_clause} FROM {perm_table}) "
@@ -472,45 +494,45 @@ def _export_complete_file(perm_table, path_COMPLETE, channel_name):
         f"HEADER=TRUE "
         f"MAX_FILE_SIZE=490000000;"
     )
-
-    logger.info(f"Exporting COMPLETE DATA FILE from {perm_table} -> {path_COMPLETE}")
+    log.info(f"Exporting COMPLETE DATA FILE: {perm_table} -> {path_COMPLETE}")
     run_command(["snowsql", "-c", "datateam1", "-q", sql])
-    logger.info("COMPLETE DATA FILE export complete")
+    log.info("COMPLETE DATA FILE export complete")
 
 
-def _drop_perm_table(perm_table):
-    """
-    DROP the permanent staging table after both S3 exports are done.
-    Both FINAL and COMPLETE files are already in S3, so the table is no
-    longer needed and dropping it frees Snowflake storage.
-    """
+def _drop_perm_table(perm_table, log):
+    """DROP the permanent table after both S3 exports are done."""
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
     sql = f"DROP TABLE IF EXISTS {perm_table};"
-    logger.info(f"Dropping permanent table: {perm_table}")
+    log.info(f"Dropping permanent table: {perm_table}")
     run_command(["snowsql", "-c", "datateam1", "-q", sql])
-    logger.info(f"Table {perm_table} dropped successfully")
+    log.info(f"Table {perm_table} dropped successfully")
 
 
-def _post_to_ftp(final_dir, path_date, output_file):
-    """FTP upload from FINAL_DIR."""
+def _post_to_ftp(final_files_dir, path_date, output_file, log):
+    """FTP upload from FINAL_FILES/."""
     ftp_cmd = (
         f'lftp -u "GreenPub,Zet@Welcome1!" ftp://zxds-ftp-02.bo3.e-dialog.com '
         f'-e "mkdir -p /CPA/{path_date};cd /CPA/{path_date};put {output_file};bye"'
     )
-    run_command(ftp_cmd, cwd=str(final_dir))
+    log.info(f"FTP upload: {output_file} -> /CPA/{path_date}")
+    run_command(ftp_cmd, cwd=str(final_files_dir))
+    log.info("FTP upload complete")
 
 
-def _cleanup_channel_dir(channel_dir):
-    """Remove the per-channel TEMP working directory after FTP upload.
-    FINAL_DIR and logs/ are never touched by this function."""
+def _cleanup_channel_tmp(channel_tmp, log):
+    """
+    Remove the per-channel temp directory after the final file has been
+    moved to FINAL_FILES/.  FINAL_FILES/ and logs/ are never touched here.
+    """
     try:
-        shutil.rmtree(str(channel_dir))
-        logger.info(f"Removed temp channel dir: {channel_dir}")
-    except Exception as e:
-        logger.warning(f"Could not remove temp channel dir {channel_dir}: {e}")
+        shutil.rmtree(str(channel_tmp))
+        log.info(f"Removed temp dir: {channel_tmp}")
+    except Exception as exc:
+        log.warning(f"Could not remove temp dir {channel_tmp}: {exc}")
 
 
-def _success_result(channel_name, output_file, final_file_path, elapsed, record_count=0):
+def _success_result(channel_name, output_file, final_file_path, elapsed,
+                    record_count=0):
     return {
         "channel"         : channel_name,
         "file"            : output_file,
@@ -525,308 +547,279 @@ def _success_result(channel_name, output_file, final_file_path, elapsed, record_
 # Channel processors
 # ---------------------------------------------------------------------------
 
-def process_green_blue(request_id, channel_name):
+def process_green_blue(request_id, channel_name, run_dir: Path):
     """
     GREEN and BLUE channel processor.
 
+    All log calls go to the channel logger (age_GREEN / age_BLUE).
+    The main log receives only the channel summary lines written explicitly
+    by process_age_state_request.
+
     Flow:
-      1. INSERT raw data directly into permanent Snowflake table (no S3 raw write)
-      2. Export FINAL FILE  (DISTINCT email, with header)        -> path_FINAL
-      3. Export COMPLETE DATA FILE (email, condition_field)       -> path_COMPLETE
+      1. INSERT directly into permanent Snowflake table
+      2. Export FINAL FILE  (DISTINCT email, header)   -> path_FINAL
+      3. Export COMPLETE DATA FILE (email, cond_field) -> path_COMPLETE
       4. DROP permanent table
-      5. Download FINAL FILE from path_FINAL -> combine -> FINAL_DIR
-      6. FTP upload from FINAL_DIR
+      5. Download path_FINAL -> <CH>_tmp/
+      6. Move combined file to FINAL_FILES/ ; delete <CH>_tmp/
+      7. FTP upload from FINAL_FILES/
     """
     channel_name   = channel_name.upper()
     channel_status = f"{channel_name}_STATUS"
-    update_request_status(request_id, "Started", channel_status)
-    ctx = _build_common_context(request_id, channel_name)
+    log            = setup_channel_logging(run_dir, channel_name, "age")
 
-    ch_handler = setup_channel_logging(
-        ctx["output_dir"], channel_name, ctx["criteria_type"]
-    )
-    logger.info(
-        f"Started {channel_name} processing for "
-        f"{ctx['criteria_type']} {ctx['comp_type']}"
+    log.info(f"=== {channel_name} processing started  (request_id={request_id}) ===")
+    update_request_status(request_id, "Started", channel_status, log)
+
+    ctx = _build_common_context(request_id, channel_name, run_dir)
+    log.info(
+        f"criteria_type={ctx['criteria_type']}  comp_type={ctx['comp_type']}  "
+        f"criteria_value={ctx['criteria_value']}"
     )
 
     try:
-        channel_dir    = ctx["channel_dir"]
-        final_dir      = ctx["final_dir"]
-        perm_table     = ctx["perm_table"]
-        path_FINAL     = ctx["path_FINAL"]
-        path_COMPLETE  = ctx["path_COMPLETE"]
+        channel_tmp      = ctx["channel_tmp"]
+        final_files_dir  = ctx["final_files_dir"]
+        perm_table       = ctx["perm_table"]
+        path_FINAL       = ctx["path_FINAL"]
+        path_COMPLETE    = ctx["path_COMPLETE"]
+        start_time       = time.time()
 
-        start_time = time.time()
-
-        # Step 1: INSERT directly into permanent Snowflake table
-        update_request_status(request_id, "Loading to Snowflake", channel_status)
+        # Step 1
+        update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         _insert_into_perm_table(
             perm_table, channel_name,
-            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"]
+            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
         )
 
-        # Step 2: Export FINAL FILE -> path_FINAL
-        update_request_status(request_id, "Exporting Final File", channel_status)
-        _export_final_file(perm_table, path_FINAL, channel_name)
+        # Step 2
+        update_request_status(request_id, "Exporting Final File", channel_status, log)
+        _export_final_file(perm_table, path_FINAL, channel_name, log)
 
-        # Step 3: Export COMPLETE DATA FILE -> path_COMPLETE
-        update_request_status(request_id, "Exporting Complete File", channel_status)
-        _export_complete_file(perm_table, path_COMPLETE, channel_name)
+        # Step 3
+        update_request_status(request_id, "Exporting Complete File", channel_status, log)
+        _export_complete_file(perm_table, path_COMPLETE, channel_name, log)
 
-        # Step 4: DROP permanent table (both exports done)
-        _drop_perm_table(perm_table)
+        # Step 4
+        _drop_perm_table(perm_table, log)
 
-        # Step 5: Download FINAL FILE from path_FINAL and combine
-        update_request_status(request_id, "Combining Data", channel_status)
-        download_dir = channel_dir / f"{channel_name}_FINAL_DL"
-        logger.info(f"Downloading FINAL FILE from path_FINAL: {path_FINAL}")
+        # Step 5
+        update_request_status(request_id, "Combining Data", channel_status, log)
+        download_dir = channel_tmp / f"{channel_name}_FINAL_DL"
         _download_and_combine(
-            path_FINAL, download_dir, channel_dir,
-            ctx["output_file"], channel_name
+            path_FINAL, download_dir, channel_tmp,
+            ctx["output_file"], channel_name, log
         )
 
-        # Move combined file to FINAL_DIR
-        tmp_file_path   = channel_dir / ctx["output_file"]
-        final_file_path = final_dir   / ctx["output_file"]
+        # Step 6 – move to FINAL_FILES/
+        tmp_file_path   = channel_tmp    / ctx["output_file"]
+        final_file_path = final_files_dir / ctx["output_file"]
         shutil.move(str(tmp_file_path), str(final_file_path))
         record_count = _count_file_lines(str(final_file_path))
-        logger.info(
+        log.info(
             f"{channel_name}: {record_count} distinct emails "
-            f"-> FINAL_DIR/{ctx['output_file']}"
+            f"-> FINAL_FILES/{ctx['output_file']}"
         )
 
-        # Step 6: FTP upload
-        update_request_status(request_id, "Posting To FTP", channel_status)
-        _post_to_ftp(final_dir, ctx["path_date"], ctx["output_file"])
+        # Step 7
+        update_request_status(request_id, "Posting To FTP", channel_status, log)
+        _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
 
         elapsed = time.time() - start_time
-        update_request_status(request_id, "Completed", channel_status)
-        logger.info(
-            f"{channel_name} processing completed in {elapsed:.2f}s | "
-            f"final file: FINAL_DIR/{ctx['output_file']}"
+        update_request_status(request_id, "Completed", channel_status, log)
+        log.info(
+            f"=== {channel_name} processing completed in {elapsed:.2f}s | "
+            f"final file: FINAL_FILES/{ctx['output_file']} ==="
         )
 
         result = _success_result(
             channel_name, ctx["output_file"],
             str(final_file_path), elapsed, record_count
         )
-        _cleanup_channel_dir(channel_dir)
+        _cleanup_channel_tmp(channel_tmp, log)
         return result
 
-    except Exception as e:
-        update_request_status(request_id, "Failed", channel_status)
-        logger.exception(f"{channel_name} processing failed")
-        send_error_email(f"{channel_name} Processing Failed", str(e))
+    except Exception as exc:
+        update_request_status(request_id, "Failed", channel_status, log)
+        log.exception(f"{channel_name} processing failed")
+        send_error_email(f"{channel_name} Processing Failed", str(exc))
         raise
-    finally:
-        logging.getLogger("age_processor").removeHandler(ch_handler)
-        ch_handler.close()
 
 
-def process_arcamax(request_id):
+def process_arcamax(request_id, run_dir: Path):
     """
     ARCAMAX channel processor.
 
-    Flow:
-      1. INSERT raw data directly into permanent Snowflake table (no S3 raw write)
-      2. Export FINAL FILE  (DISTINCT email, with header)        -> path_FINAL
-      3. Export COMPLETE DATA FILE (email, condition_field)       -> path_COMPLETE
-      4. DROP permanent table
-      5. Download FINAL FILE from path_FINAL -> combine -> FINAL_DIR
-      6. FTP upload from FINAL_DIR
+    All log calls go to the age_ARCAMAX channel logger only.
+
+    Flow: same 7-step pattern as GREEN/BLUE.
     """
     channel_name   = "ARCAMAX"
     channel_status = "ARCAMAX_STATUS"
-    update_request_status(request_id, "Started", channel_status)
-    ctx = _build_common_context(request_id, channel_name)
+    log            = setup_channel_logging(run_dir, channel_name, "age")
 
-    ch_handler = setup_channel_logging(
-        ctx["output_dir"], channel_name, ctx["criteria_type"]
-    )
-    logger.info(
-        f"Started {channel_name} processing for "
-        f"{ctx['criteria_type']} {ctx['comp_type']}"
+    log.info(f"=== ARCAMAX processing started  (request_id={request_id}) ===")
+    update_request_status(request_id, "Started", channel_status, log)
+
+    ctx = _build_common_context(request_id, channel_name, run_dir)
+    log.info(
+        f"criteria_type={ctx['criteria_type']}  comp_type={ctx['comp_type']}  "
+        f"criteria_value={ctx['criteria_value']}"
     )
 
     try:
-        channel_dir    = ctx["channel_dir"]
-        final_dir      = ctx["final_dir"]
-        perm_table     = ctx["perm_table"]
-        path_FINAL     = ctx["path_FINAL"]
-        path_COMPLETE  = ctx["path_COMPLETE"]
+        channel_tmp      = ctx["channel_tmp"]
+        final_files_dir  = ctx["final_files_dir"]
+        perm_table       = ctx["perm_table"]
+        path_FINAL       = ctx["path_FINAL"]
+        path_COMPLETE    = ctx["path_COMPLETE"]
+        start_time       = time.time()
 
-        start_time = time.time()
-
-        # Step 1: INSERT directly into permanent Snowflake table
-        update_request_status(request_id, "Loading to Snowflake", channel_status)
+        update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         _insert_into_perm_table(
             perm_table, channel_name,
-            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"]
+            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
         )
 
-        # Step 2: Export FINAL FILE -> path_FINAL
-        update_request_status(request_id, "Exporting Final File", channel_status)
-        _export_final_file(perm_table, path_FINAL, channel_name)
+        update_request_status(request_id, "Exporting Final File", channel_status, log)
+        _export_final_file(perm_table, path_FINAL, channel_name, log)
 
-        # Step 3: Export COMPLETE DATA FILE -> path_COMPLETE
-        update_request_status(request_id, "Exporting Complete File", channel_status)
-        _export_complete_file(perm_table, path_COMPLETE, channel_name)
+        update_request_status(request_id, "Exporting Complete File", channel_status, log)
+        _export_complete_file(perm_table, path_COMPLETE, channel_name, log)
 
-        # Step 4: DROP permanent table
-        _drop_perm_table(perm_table)
+        _drop_perm_table(perm_table, log)
 
-        # Step 5: Download FINAL FILE from path_FINAL and combine
-        update_request_status(request_id, "Combining Data", channel_status)
-        download_dir = channel_dir / "ARCAMAX_FINAL_DL"
-        logger.info(f"Downloading FINAL FILE from path_FINAL: {path_FINAL}")
+        update_request_status(request_id, "Combining Data", channel_status, log)
+        download_dir = channel_tmp / "ARCAMAX_FINAL_DL"
         _download_and_combine(
-            path_FINAL, download_dir, channel_dir,
-            ctx["output_file"], channel_name
+            path_FINAL, download_dir, channel_tmp,
+            ctx["output_file"], channel_name, log
         )
 
-        # Move combined file to FINAL_DIR
-        tmp_file_path   = channel_dir / ctx["output_file"]
-        final_file_path = final_dir   / ctx["output_file"]
+        tmp_file_path   = channel_tmp    / ctx["output_file"]
+        final_file_path = final_files_dir / ctx["output_file"]
         shutil.move(str(tmp_file_path), str(final_file_path))
         record_count = _count_file_lines(str(final_file_path))
-        logger.info(
-            f"{channel_name}: {record_count} distinct emails "
-            f"-> FINAL_DIR/{ctx['output_file']}"
+        log.info(
+            f"ARCAMAX: {record_count} distinct emails "
+            f"-> FINAL_FILES/{ctx['output_file']}"
         )
 
-        # Step 6: FTP upload
-        update_request_status(request_id, "Posting To FTP", channel_status)
-        _post_to_ftp(final_dir, ctx["path_date"], ctx["output_file"])
+        update_request_status(request_id, "Posting To FTP", channel_status, log)
+        _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
 
         elapsed = time.time() - start_time
-        update_request_status(request_id, "Completed", channel_status)
-        logger.info(
-            f"{channel_name} processing completed in {elapsed:.2f}s | "
-            f"final file: FINAL_DIR/{ctx['output_file']}"
+        update_request_status(request_id, "Completed", channel_status, log)
+        log.info(
+            f"=== ARCAMAX processing completed in {elapsed:.2f}s | "
+            f"final file: FINAL_FILES/{ctx['output_file']} ==="
         )
 
         result = _success_result(
             channel_name, ctx["output_file"],
             str(final_file_path), elapsed, record_count
         )
-        _cleanup_channel_dir(channel_dir)
+        _cleanup_channel_tmp(channel_tmp, log)
         return result
 
-    except Exception as e:
-        update_request_status(request_id, "Failed", channel_status)
-        logger.exception(f"{channel_name} processing failed")
-        send_error_email(f"{channel_name} Processing Failed", str(e))
+    except Exception as exc:
+        update_request_status(request_id, "Failed", channel_status, log)
+        log.exception("ARCAMAX processing failed")
+        send_error_email("ARCAMAX Processing Failed", str(exc))
         raise
-    finally:
-        logging.getLogger("age_processor").removeHandler(ch_handler)
-        ch_handler.close()
 
 
-def process_orange(request_id):
+def process_orange(request_id, run_dir: Path):
     """
     ORANGE channel processor.
 
+    All log calls go to the age_ORANGE channel logger only.
+
     Flow:
-      1. INSERT raw data directly into permanent Snowflake table (no S3 raw write)
-         Schema: (email_address, condition_field, account_name)
-      2. Export FINAL FILE  (DISTINCT email_address, account_name, with header)
-         -> path_FINAL
-      3. Export COMPLETE DATA FILE
-         (email_address, condition_field, account_name, with header)
-         -> path_COMPLETE
-      4. DROP permanent table
-      5. Download FINAL FILE from path_FINAL -> combine -> channel_dir
-      6. Based on request_type:
-           suppression -> email-only CSV in FINAL_DIR
-           mailing     -> ESP-wise split CSVs packed into a ZIP in FINAL_DIR
-      7. FTP upload from FINAL_DIR
+      Steps 1-6 same as other channels.
+      Step 7: build output based on request_type:
+        suppression -> email-only CSV in FINAL_FILES/
+        mailing     -> ESP-wise split CSVs packed into ZIP in FINAL_FILES/
+      Step 8: FTP from FINAL_FILES/
     """
     channel_name   = "ORANGE"
     channel_status = "ORANGE_STATUS"
-    update_request_status(request_id, "Started", channel_status)
-    ctx = _build_common_context(request_id, channel_name)
+    log            = setup_channel_logging(run_dir, channel_name, "age")
 
-    ch_handler = setup_channel_logging(
-        ctx["output_dir"], channel_name, ctx["criteria_type"]
-    )
-    logger.info(
-        f"Started {channel_name} processing for "
-        f"{ctx['criteria_type']} {ctx['comp_type']}"
+    log.info(f"=== ORANGE processing started  (request_id={request_id}) ===")
+    update_request_status(request_id, "Started", channel_status, log)
+
+    ctx = _build_common_context(request_id, channel_name, run_dir)
+    log.info(
+        f"criteria_type={ctx['criteria_type']}  comp_type={ctx['comp_type']}  "
+        f"criteria_value={ctx['criteria_value']}  "
+        f"request_type={ctx['request_type']}"
     )
 
     try:
-        request_type   = ctx["request_type"]
-        client_name    = ctx["client_name"]
-        channel_dir    = ctx["channel_dir"]
-        final_dir      = ctx["final_dir"]
-        path_date      = ctx["path_date"]
-        perm_table     = ctx["perm_table"]
-        path_FINAL     = ctx["path_FINAL"]
-        path_COMPLETE  = ctx["path_COMPLETE"]
+        request_type    = ctx["request_type"]
+        client_name     = ctx["client_name"]
+        channel_tmp     = ctx["channel_tmp"]
+        final_files_dir = ctx["final_files_dir"]
+        path_date       = ctx["path_date"]
+        perm_table      = ctx["perm_table"]
+        path_FINAL      = ctx["path_FINAL"]
+        path_COMPLETE   = ctx["path_COMPLETE"]
+        start_time      = time.time()
 
-        start_time = time.time()
-
-        # Step 1: INSERT directly into permanent Snowflake table
-        update_request_status(request_id, "Loading to Snowflake", channel_status)
+        update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         _insert_into_perm_table(
             perm_table, channel_name,
-            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"]
+            ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
         )
 
-        # Step 2: Export FINAL FILE -> path_FINAL
-        update_request_status(request_id, "Exporting Final File", channel_status)
-        _export_final_file(perm_table, path_FINAL, channel_name)
+        update_request_status(request_id, "Exporting Final File", channel_status, log)
+        _export_final_file(perm_table, path_FINAL, channel_name, log)
 
-        # Step 3: Export COMPLETE DATA FILE -> path_COMPLETE
-        update_request_status(request_id, "Exporting Complete File", channel_status)
-        _export_complete_file(perm_table, path_COMPLETE, channel_name)
+        update_request_status(request_id, "Exporting Complete File", channel_status, log)
+        _export_complete_file(perm_table, path_COMPLETE, channel_name, log)
 
-        # Step 4: DROP permanent table
-        _drop_perm_table(perm_table)
+        _drop_perm_table(perm_table, log)
 
-        # Step 5: Download FINAL FILE from path_FINAL and combine
-        update_request_status(request_id, "Combining Data", channel_status)
+        update_request_status(request_id, "Combining Data", channel_status, log)
         raw_combined = f"ORANGE_FINAL_{path_date}.csv"
-        download_dir = channel_dir / "ORANGE_FINAL_DL"
-        logger.info(f"Downloading FINAL FILE from path_FINAL: {path_FINAL}")
+        download_dir = channel_tmp / "ORANGE_FINAL_DL"
         _download_and_combine(
-            path_FINAL, download_dir, channel_dir, raw_combined, channel_name
+            path_FINAL, download_dir, channel_tmp, raw_combined, channel_name, log
         )
 
         df_final = pd.read_csv(
-            str(channel_dir / raw_combined),
+            str(channel_tmp / raw_combined),
             sep="|",
             header=None,
             names=["email_address", "account_name"],
             dtype=str,
         )
         total_count = len(df_final)
-        logger.info(f"ORANGE FINAL FILE records: {total_count}")
+        log.info(f"ORANGE FINAL FILE records loaded: {total_count}")
 
-        # Step 6: Build output file based on request_type
-        update_request_status(request_id, "Posting To FTP", channel_status)
+        update_request_status(request_id, "Posting To FTP", channel_status, log)
 
         if request_type.lower() == "suppression":
             output_file      = (
                 f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
             )
-            suppression_path = final_dir / output_file
+            suppression_path = final_files_dir / output_file
             (
                 df_final[["email_address"]]
                 .drop_duplicates()
                 .to_csv(str(suppression_path), index=False, header=False)
             )
             record_count = len(pd.read_csv(str(suppression_path), header=None))
-            logger.info(
+            log.info(
                 f"ORANGE suppression: {output_file} "
-                f"({record_count} records) -> FINAL_DIR"
+                f"({record_count} records) -> FINAL_FILES/"
             )
-            _post_to_ftp(final_dir, path_date, output_file)
+            _post_to_ftp(final_files_dir, path_date, output_file, log)
             final_file_path = str(suppression_path)
 
         else:  # mailing
-            esp_split_dir = channel_dir / "ORANGE_ESP_SPLIT"
+            esp_split_dir = channel_tmp / "ORANGE_ESP_SPLIT"
             esp_split_dir.mkdir(exist_ok=True)
             esp_names = df_final["account_name"].dropna().unique()
             zip_parts = []
@@ -841,46 +834,43 @@ def process_orange(request_id):
                 )
                 esp_df.to_csv(str(esp_file), index=False, header=False)
                 zip_parts.append(esp_file)
-                logger.info(
+                log.info(
                     f"ORANGE ESP split: {esp_file.name} ({len(esp_df)} records)"
                 )
 
             zip_name = f"{client_name}_{request_type}_ORANGE_{path_date}.zip"
-            zip_path = final_dir / zip_name
+            zip_path = final_files_dir / zip_name
             run_command(
                 ["zip", "-j", str(zip_path)] + [str(p) for p in zip_parts]
             )
-            logger.info(
+            log.info(
                 f"ORANGE mailing ZIP: {zip_name} "
-                f"({len(zip_parts)} ESPs) -> FINAL_DIR"
+                f"({len(zip_parts)} ESPs) -> FINAL_FILES/"
             )
-            _post_to_ftp(final_dir, path_date, zip_name)
+            _post_to_ftp(final_files_dir, path_date, zip_name, log)
             final_file_path = str(zip_path)
             output_file     = zip_name
             record_count    = total_count
 
         elapsed = time.time() - start_time
-        update_request_status(request_id, "Completed", channel_status)
-        logger.info(
-            f"ORANGE processing completed in {elapsed:.2f}s | "
-            f"final file: FINAL_DIR/{output_file}"
+        update_request_status(request_id, "Completed", channel_status, log)
+        log.info(
+            f"=== ORANGE processing completed in {elapsed:.2f}s | "
+            f"final file: FINAL_FILES/{output_file} ==="
         )
 
         result = _success_result(
             channel_name, output_file,
             final_file_path, elapsed, record_count
         )
-        _cleanup_channel_dir(channel_dir)
+        _cleanup_channel_tmp(channel_tmp, log)
         return result
 
-    except Exception as e:
-        update_request_status(request_id, "Failed", channel_status)
-        logger.exception(f"{channel_name} processing failed")
-        send_error_email(f"{channel_name} Processing Failed", str(e))
+    except Exception as exc:
+        update_request_status(request_id, "Failed", channel_status, log)
+        log.exception("ORANGE processing failed")
+        send_error_email("ORANGE Processing Failed", str(exc))
         raise
-    finally:
-        logging.getLogger("age_processor").removeHandler(ch_handler)
-        ch_handler.close()
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +881,16 @@ def process_age_state_request(request_id, channel="ALL"):
     """
     Orchestrate channel processing for a single request.
     channel: "ALL" | "GREEN" | "BLUE" | "ARCAMAX" | "ORANGE"
+
+    LOG ROUTING
+    -----------
+    This function owns the MAIN log (age_main logger).
+    It logs:
+      - Run start / channels to run
+      - Per-channel start / completed / failed summary lines
+      - Overall completion / failure
+    Channel processors own their own loggers; all detailed work logs stay
+    inside the respective <CH>_age_<ts>.log file.
     """
     request_data = fetch_request_details(request_id)
     if not request_data:
@@ -899,23 +899,38 @@ def process_age_state_request(request_id, channel="ALL"):
     output_dir    = request_data["output_dir"]
     criteria_type = request_data["criteria_type"]
 
-    setup_logging(output_dir, criteria_type)
+    # Build run_dir via ensure_output_dir  (creates run_age_YYYYMMDD_HHMMSS/)
+    run_dir = Path(ensure_output_dir(output_dir, criteria_type))
+
+    # Ensure FINAL_FILES/ and logs/ exist inside run_dir
+    (run_dir / "FINAL_FILES").mkdir(parents=True, exist_ok=True)
+    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+
+    # MAIN logger — only this function writes to it (plus explicit summaries below)
+    log_main = setup_main_logging(run_dir, criteria_type)
 
     channels_to_run = CHANNELS if channel.upper() == "ALL" else [channel.upper()]
-    logger.info(
-        f"Started request_id={request_id} for channels={','.join(channels_to_run)}"
+    log_main.info(
+        f"=== process_age_state_request started | "
+        f"request_id={request_id}  channels={','.join(channels_to_run)} ==="
+    )
+    log_main.info(
+        f"run_dir={run_dir}  "
+        f"criteria_type={criteria_type}  "
+        f"criteria_value={request_data['criteria_value']}  "
+        f"comp_type={request_data['comp_type']}"
     )
 
     for ch in channels_to_run:
-        update_request_status(request_id, "Started", f"{ch}_STATUS")
+        update_request_status(request_id, "Queued", f"{ch}_STATUS", log_main)
 
-    def process_channel(ch):
+    def _run_channel(ch):
         if ch in ("GREEN", "BLUE"):
-            return process_green_blue(request_id, ch)
+            return process_green_blue(request_id, ch, run_dir)
         elif ch == "ARCAMAX":
-            return process_arcamax(request_id)
+            return process_arcamax(request_id, run_dir)
         elif ch == "ORANGE":
-            return process_orange(request_id)
+            return process_orange(request_id, run_dir)
         else:
             raise ValueError(f"Unknown channel: {ch}")
 
@@ -924,25 +939,36 @@ def process_age_state_request(request_id, channel="ALL"):
 
     if len(channels_to_run) == 1:
         ch = channels_to_run[0]
+        log_main.info(f"[{ch}] starting")
         try:
-            results[ch] = process_channel(ch)
-        except Exception as e:
+            results[ch] = _run_channel(ch)
+            log_main.info(
+                f"[{ch}] completed | "
+                f"file={results[ch]['file']}  count={results[ch]['count']}  "
+                f"elapsed={results[ch]['elapsed']:.2f}s"
+            )
+        except Exception as exc:
             failed.append(ch)
-            logger.error(f"FAILED: {e}")
+            log_main.error(f"[{ch}] FAILED: {exc}")
+
     else:
         with ThreadPoolExecutor(max_workers=len(channels_to_run)) as executor:
             future_map = {
-                executor.submit(process_channel, ch): ch
+                executor.submit(_run_channel, ch): ch
                 for ch in channels_to_run
             }
             for future in as_completed(future_map):
                 ch = future_map[future]
                 try:
                     results[ch] = future.result()
-                except Exception as e:
+                    log_main.info(
+                        f"[{ch}] completed | "
+                        f"file={results[ch]['file']}  count={results[ch]['count']}  "
+                        f"elapsed={results[ch]['elapsed']:.2f}s"
+                    )
+                except Exception as exc:
                     failed.append(ch)
-                    logger.error(f"FAILED: {e}")
-                    raise
+                    log_main.error(f"[{ch}] FAILED: {exc}")
 
     overall_status = "failed" if failed else "completed"
     conn = get_db()
@@ -955,6 +981,13 @@ def process_age_state_request(request_id, channel="ALL"):
         conn.commit()
     finally:
         conn.close()
+
+    log_main.info(
+        f"=== process_age_state_request {overall_status.upper()} | "
+        f"request_id={request_id}  "
+        f"succeeded={[c for c in channels_to_run if c not in failed]}  "
+        f"failed={failed} ==="
+    )
 
     if not failed:
         send_success_email(
