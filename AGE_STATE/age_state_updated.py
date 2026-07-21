@@ -25,17 +25,17 @@ Run directory layout
 
 Log routing rules
 -----------------
-  age_main logger   → age_<ts>.log ONLY
-      • All log.info/error/exception calls inside process_age_state_request
-      • Explicit channel summary lines (started / completed / failed) written
+  age_main logger   -> age_<ts>.log ONLY
+      - All log.info/error/exception calls inside process_age_state_request
+      - Explicit channel summary lines (started / completed / failed) written
         by the orchestrator so the main log has a high-level picture
-      • propagate = False  →  nothing leaks into root logger
+      - propagate = False  ->  nothing leaks into root logger
 
-  age_<CHANNEL> logger  → <CH>_age_<ts>.log ONLY
-      • Every log call inside process_green_blue / process_arcamax / process_orange
+  age_<CHANNEL> logger  -> <CH>_age_<ts>.log ONLY
+      - Every log call inside process_green_blue / process_arcamax / process_orange
         and all helpers they invoke (_insert_into_perm_table, _export_*, _drop_*, etc.)
-      • propagate = False  →  channel logs never bleed into main log
-      • Channel processors receive their logger as a parameter; helpers also receive it
+      - propagate = False  ->  channel logs never bleed into main log
+      - Channel processors receive their logger as a parameter; helpers also receive it
 
 Processing flow per channel
 ---------------------------
@@ -56,6 +56,7 @@ Processing flow per channel
 """
 
 import os
+import re
 import time
 import shutil
 import logging
@@ -97,6 +98,22 @@ _DB_RETRY_BASE_DELAY = 2    # seconds; doubles on each retry: 2s, 4s
 
 
 # ---------------------------------------------------------------------------
+# Step banner helper  (makes log files easy to scan)
+# ---------------------------------------------------------------------------
+
+def _step(log, step_num, total_steps, description, channel_name=""):
+    """
+    Emit a clearly visible step-banner line so every stage is traceable.
+    Example:
+        [GREEN] ── STEP 1/7 ──  Loading data into Snowflake permanent table
+    """
+    prefix = f"[{channel_name}] " if channel_name else ""
+    log.info(
+        f"{prefix}{'─' * 4} STEP {step_num}/{total_steps} {'─' * 4}  {description}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
 
@@ -111,12 +128,8 @@ def _file_handler(log_path: Path) -> logging.FileHandler:
 def setup_main_logging(run_dir: Path, criteria_type: str) -> logging.Logger:
     """
     Create (or reset) the MAIN logger 'age_main'.
-
     Writes to:  <run_dir>/logs/age_<YYYYMMDD_HHMMSS>.log
-
-    propagate=False ensures nothing from this logger leaks into root or any
-    channel logger, and channel messages never appear here unless the
-    orchestrator explicitly calls logger_main.info(...).
+    propagate=False ensures nothing leaks into root or channel loggers.
     """
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = run_dir / "logs" / f"age_{ts}.log"
@@ -132,13 +145,9 @@ def setup_main_logging(run_dir: Path, criteria_type: str) -> logging.Logger:
 def setup_channel_logging(run_dir: Path, channel_name: str,
                            criteria_type: str) -> logging.Logger:
     """
-    Create (or reset) a per-channel logger  'age_<CHANNEL>'.
-
+    Create (or reset) a per-channel logger 'age_<CHANNEL>'.
     Writes to:  <run_dir>/logs/<CHANNEL>_age_<YYYYMMDD_HHMMSS>.log
-
-    propagate=False ensures channel logs never bleed into the main log or
-    root logger.  All work done inside a channel processor (and the helpers
-    it calls) must use this logger.
+    propagate=False ensures channel logs never bleed into main log.
     """
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = run_dir / "logs" / f"{channel_name.upper()}_age_{ts}.log"
@@ -170,19 +179,7 @@ def get_db():
 def get_db_with_retry(log=None):
     """
     Open a pymysql connection with exponential-backoff retry.
-
-    Retries up to _DB_RETRY_ATTEMPTS times on OperationalError (covers
-    errno 2013 'Lost connection' and errno 2003 'Can't connect').
-    Waits _DB_RETRY_BASE_DELAY * 2^attempt seconds between tries.
-
-    Parameters
-    ----------
-    log : logging.Logger or None
-        If provided, warning messages are emitted on each failed attempt.
-
-    Returns
-    -------
-    pymysql.Connection
+    Retries up to _DB_RETRY_ATTEMPTS times on OperationalError.
     """
     last_exc = None
     for attempt in range(_DB_RETRY_ATTEMPTS):
@@ -232,9 +229,6 @@ def fetch_request_details(request_id):
 def update_request_status(request_id, status, status_column, log):
     """
     Update DB status with retry and write to the supplied logger.
-
-    Uses get_db_with_retry so transient connection resets (errno 104 /
-    OperationalError 2013) do not crash the channel immediately.
     Retries up to _DB_RETRY_ATTEMPTS times on OperationalError.
     """
     last_exc = None
@@ -250,7 +244,7 @@ def update_request_status(request_id, status, status_column, log):
                 conn.commit()
             finally:
                 conn.close()
-            log.info(f"{status_column} -> '{status}'  (request_id={request_id})")
+            log.info(f"DB STATUS UPDATE: {status_column} -> '{status}'  (request_id={request_id})")
             return  # success
         except pymysql.err.OperationalError as exc:
             last_exc = exc
@@ -264,7 +258,6 @@ def update_request_status(request_id, status, status_column, log):
         except Exception:
             log.exception(f"Failed updating {status_column}")
             raise
-    # All retries exhausted
     log.error(
         f"update_request_status gave up after {_DB_RETRY_ATTEMPTS} attempts: "
         f"{last_exc}"
@@ -275,20 +268,6 @@ def update_request_status(request_id, status, status_column, log):
 def _build_common_context(request_id, channel_name, run_dir: Path):
     """
     Build the shared context dict for a channel run.
-
-    Directory layout inside run_dir
-    --------------------------------
-        run_dir/
-            logs/           <- created by setup_*_logging
-            FINAL_FILES/    <- final deliverables only; never deleted
-            <CH>_tmp/       <- temp dir for S3 download + combine; deleted after use
-
-    Snowflake permanent table:
-        perm_table  = APT_CPA_<CHANNEL>_<YYYYMMDD>
-
-    S3 export paths:
-        path_FINAL    = S3_BASE/<request_type>/<date>/<request_name>/<channel>_FINAL
-        path_COMPLETE = S3_BASE/<request_type>/<date>/<request_name>/<channel>_COMPLETE
     """
     request_data = fetch_request_details(request_id)
     if not request_data:
@@ -301,11 +280,9 @@ def _build_common_context(request_id, channel_name, run_dir: Path):
     criteria_value = request_data["criteria_value"]
     comp_type      = request_data["comp_type"]
 
-    # FINAL_FILES lives directly inside run_dir
     final_files_dir = run_dir / "FINAL_FILES"
     final_files_dir.mkdir(parents=True, exist_ok=True)
 
-    # Per-channel temp working dir inside run_dir
     channel_tmp = run_dir / f"{channel_name.upper()}_tmp"
     channel_tmp.mkdir(parents=True, exist_ok=True)
 
@@ -329,8 +306,8 @@ def _build_common_context(request_id, channel_name, run_dir: Path):
         "criteria_type"  : criteria_type,
         "criteria_value" : criteria_value,
         "comp_type"      : comp_type,
-        "final_files_dir": final_files_dir,   # FINAL_FILES/  <- final files only
-        "channel_tmp"    : channel_tmp,        # <CH>_tmp/     <- deleted after use
+        "final_files_dir": final_files_dir,
+        "channel_tmp"    : channel_tmp,
         "path_date"      : path_date,
         "path_FINAL"     : path_FINAL,
         "path_COMPLETE"  : path_COMPLETE,
@@ -340,12 +317,72 @@ def _build_common_context(request_id, channel_name, run_dir: Path):
 
 
 def _count_file_lines(file_path):
-    """Fast line count using wc -l."""
-    cmd    = f"wc -l < {shlex.quote(file_path)}"
+    """Fast line count using wc -l (excludes header if present)."""
+    cmd    = f"wc -l < {shlex.quote(str(file_path))}"
     result = subprocess.check_output(
         cmd, shell=True, universal_newlines=True
     ).strip()
     return int(result) if result else 0
+
+
+def _count_s3_rows(s3_path, log):
+    """
+    Count total unloaded rows across all gzipped part files at *s3_path*.
+    Uses 'aws s3 ls' to list parts then zcat | wc -l (minus header per file).
+    Returns an integer count, or -1 if counting fails (non-fatal).
+    """
+    try:
+        ls_out = subprocess.check_output(
+            ["aws", "s3", "ls", s3_path + "/"],
+            universal_newlines=True,
+        )
+        part_keys = [
+            line.split()[-1]
+            for line in ls_out.strip().splitlines()
+            if line.strip()
+        ]
+        if not part_keys:
+            log.warning(f"_count_s3_rows: no objects found at {s3_path}/")
+            return 0
+
+        # Build a one-liner: download each part via aws s3 cp - and zcat | wc -l
+        total = 0
+        bucket_prefix = s3_path.rstrip("/")
+        for key in part_keys:
+            cmd = (
+                f'aws s3 cp "{bucket_prefix}/{key}" - '
+                f'| zcat | tail -n +2 | wc -l'
+            )
+            row_str = subprocess.check_output(
+                cmd, shell=True, universal_newlines=True
+            ).strip()
+            total += int(row_str) if row_str else 0
+        return total
+    except Exception as exc:
+        log.warning(f"_count_s3_rows failed (non-fatal): {exc}")
+        return -1
+
+
+def _query_snowflake_count(table_name, log):
+    """
+    Run SELECT COUNT(*) FROM <table> via snowsql and return the integer.
+    Returns -1 if the query fails (non-fatal).
+    """
+    try:
+        os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
+        sql    = f"SELECT COUNT(*) FROM {table_name};"
+        output = subprocess.check_output(
+            ["snowsql", "-c", "datateam1", "-q", sql, "-o", "output_format=csv",
+             "-o", "header=false", "-o", "timing=false"],
+            universal_newlines=True,
+            stderr=subprocess.DEVNULL,
+        )
+        # Extract first numeric token from output
+        match = re.search(r"(\d+)", output)
+        return int(match.group(1)) if match else -1
+    except Exception as exc:
+        log.warning(f"_query_snowflake_count failed (non-fatal): {exc}")
+        return -1
 
 
 def _download_and_combine(s3_path, download_dir, work_dir,
@@ -361,7 +398,11 @@ def _download_and_combine(s3_path, download_dir, work_dir,
     download_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info(f"Downloading from S3: {s3_path}  ->  {download_dir}")
+    log.info(f"  S3 source   : {s3_path}")
+    log.info(f"  Download dir: {download_dir}")
+    log.info(f"  Output file : {work_dir / output_file}")
+    log.info("  Starting aws s3 cp (recursive) ...")
+
     run_command(
         ["aws", "s3", "cp", s3_path, str(download_dir), "--recursive", "--quiet"]
     )
@@ -371,6 +412,8 @@ def _download_and_combine(s3_path, download_dir, work_dir,
         raise RuntimeError(
             f"aws s3 cp from {s3_path} downloaded 0 files into {download_dir}."
         )
+    log.info(f"  Downloaded {len(downloaded)} part file(s): "
+             f"{[p.name for p in downloaded]}")
 
     out_path = work_dir / output_file
     if channel_name != "ORANGE":
@@ -386,7 +429,10 @@ def _download_and_combine(s3_path, download_dir, work_dir,
         )
 
     run_command(f"rm -f {str(download_dir / 'data*')}", cwd=str(download_dir))
-    log.info(f"Combined file written: {out_path}")
+
+    combined_count = _count_file_lines(str(out_path))
+    log.info(f"  Combined file written: {out_path}  |  rows in file: {combined_count:,}")
+    return combined_count
 
 
 # ---------------------------------------------------------------------------
@@ -494,20 +540,27 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
         )
 
     combined_sql = f"{create_sql} {insert_sql}"
-    log.info(f"Creating permanent table and inserting data: {perm_table}")
-    log.info(f"Creating table query {create_sql}")
-    log.info(f"Insert query: {insert_sql}")
+    log.info(f"  Target table : {perm_table}")
+    log.info(f"  CREATE SQL   : {create_sql}")
+    log.info(f"  INSERT SQL   : {insert_sql}")
+    log.info("  Executing CREATE + INSERT via snowsql ...")
+
     run_command(["snowsql", "-c", "datateam1", "-q", combined_sql])
-    log.info(f"Data inserted into {perm_table} successfully")
+    log.info("  CREATE + INSERT executed successfully")
+
+    # Verify row count in perm table
+    inserted_rows = _query_snowflake_count(perm_table, log)
+    if inserted_rows >= 0:
+        log.info(f"  Rows inserted into {perm_table}: {inserted_rows:,}")
+    else:
+        log.warning(f"  Could not verify row count for {perm_table} (count query failed)")
 
 
 def _export_final_file(perm_table, path_FINAL, channel_name, log):
     """
     Export FINAL FILE from permanent table -> path_FINAL (S3).
-
     GREEN / BLUE / ARCAMAX : DISTINCT email           (header: email)
     ORANGE                 : DISTINCT email_address, account_name
-                             (header: email_address|account_name)
     """
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
 
@@ -526,15 +579,25 @@ def _export_final_file(perm_table, path_FINAL, channel_name, log):
         f"HEADER=TRUE "
         f"MAX_FILE_SIZE=490000000;"
     )
-    log.info(f"Exporting FINAL FILE: {perm_table} -> {path_FINAL}")
+    log.info(f"  Source table : {perm_table}")
+    log.info(f"  S3 target    : {path_FINAL}/")
+    log.info(f"  SELECT clause: {select_clause}")
+    log.info("  Executing COPY INTO (FINAL FILE) via snowsql ...")
+
     run_command(["snowsql", "-c", "datateam1", "-q", sql])
-    log.info("FINAL FILE export complete")
+    log.info("  COPY INTO (FINAL FILE) completed successfully")
+
+    # Count rows exported to S3 for FINAL
+    final_s3_rows = _count_s3_rows(path_FINAL, log)
+    if final_s3_rows >= 0:
+        log.info(f"  Rows unloaded to FINAL S3 path: {final_s3_rows:,}")
+    else:
+        log.warning("  Could not verify FINAL FILE S3 row count (non-fatal)")
 
 
 def _export_complete_file(perm_table, path_COMPLETE, channel_name, log):
     """
     Export COMPLETE DATA FILE from permanent table -> path_COMPLETE (S3).
-
     GREEN / BLUE / ARCAMAX : email, condition_field
     ORANGE                 : email_address, condition_field, account_name
     """
@@ -555,29 +618,49 @@ def _export_complete_file(perm_table, path_COMPLETE, channel_name, log):
         f"HEADER=TRUE "
         f"MAX_FILE_SIZE=490000000;"
     )
-    log.info(f"Exporting COMPLETE DATA FILE: {perm_table} -> {path_COMPLETE}")
+    log.info(f"  Source table : {perm_table}")
+    log.info(f"  S3 target    : {path_COMPLETE}/")
+    log.info(f"  SELECT clause: {select_clause}")
+    log.info("  Executing COPY INTO (COMPLETE FILE) via snowsql ...")
+
     run_command(["snowsql", "-c", "datateam1", "-q", sql])
-    log.info("COMPLETE DATA FILE export complete")
+    log.info("  COPY INTO (COMPLETE FILE) completed successfully")
+
+    # Count rows exported to S3 for COMPLETE
+    complete_s3_rows = _count_s3_rows(path_COMPLETE, log)
+    if complete_s3_rows >= 0:
+        log.info(f"  Rows unloaded to COMPLETE S3 path: {complete_s3_rows:,}")
+    else:
+        log.warning("  Could not verify COMPLETE FILE S3 row count (non-fatal)")
 
 
 def _drop_perm_table(perm_table, log):
     """DROP the permanent table after both S3 exports are done."""
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
     sql = f"DROP TABLE IF EXISTS {perm_table};"
-    log.info(f"Dropping permanent table: {perm_table}")
+    log.info(f"  Dropping permanent table: {perm_table}")
     run_command(["snowsql", "-c", "datateam1", "-q", sql])
-    log.info(f"Table {perm_table} dropped successfully")
+    log.info(f"  Table {perm_table} dropped successfully")
 
 
 def _post_to_ftp(final_files_dir, path_date, output_file, log):
-    """FTP upload from FINAL_FILES/."""
+    """FTP upload from FINAL_FILES/ and verify."""
+    ftp_dest = f"/CPA/{path_date}/{output_file}"
     ftp_cmd = (
         f'lftp -u "GreenPub,Zet@Welcome1!" ftp://zxds-ftp-02.bo3.e-dialog.com '
         f'-e "mkdir -p /CPA/{path_date};cd /CPA/{path_date};put {output_file};bye"'
     )
-    log.info(f"FTP upload: {output_file} -> /CPA/{path_date}")
+    local_path = Path(final_files_dir) / output_file
+    local_size = local_path.stat().st_size if local_path.exists() else -1
+
+    log.info(f"  FTP destination : {ftp_dest}")
+    log.info(f"  Local file size : {local_size:,} bytes  ({local_path})")
+    log.info("  Starting lftp upload ...")
+
     run_command(ftp_cmd, cwd=str(final_files_dir))
-    log.info("FTP upload complete")
+
+    log.info(f"  FTP upload completed successfully -> {ftp_dest}")
+    log.info(f"  File '{output_file}' has been posted to FTP at /CPA/{path_date}/")
 
 
 def _cleanup_channel_tmp(channel_tmp, log):
@@ -587,9 +670,9 @@ def _cleanup_channel_tmp(channel_tmp, log):
     """
     try:
         shutil.rmtree(str(channel_tmp))
-        log.info(f"Removed temp dir: {channel_tmp}")
+        log.info(f"  Removed temp dir: {channel_tmp}")
     except Exception as exc:
-        log.warning(f"Could not remove temp dir {channel_tmp}: {exc}")
+        log.warning(f"  Could not remove temp dir {channel_tmp}: {exc}")
 
 
 def _success_result(channel_name, output_file, final_file_path, elapsed,
@@ -611,87 +694,102 @@ def _success_result(channel_name, output_file, final_file_path, elapsed,
 def process_green_blue(request_id, channel_name, run_dir: Path):
     """
     GREEN and BLUE channel processor.
-
-    All log calls go to the channel logger (age_GREEN / age_BLUE).
-    The main log receives only the channel summary lines written explicitly
-    by process_age_state_request.
-
-    Flow:
-      1. INSERT directly into permanent Snowflake table
-      2. Export FINAL FILE  (DISTINCT email, header)   -> path_FINAL
-      3. Export COMPLETE DATA FILE (email, cond_field) -> path_COMPLETE
-      4. DROP permanent table
-      5. Download path_FINAL -> <CH>_tmp/
-      6. Move combined file to FINAL_FILES/ ; delete <CH>_tmp/
-      7. FTP upload from FINAL_FILES/
+    7-step flow with verbose step banners and row-count logging at every stage.
     """
+    TOTAL_STEPS    = 7
     channel_name   = channel_name.upper()
     channel_status = f"{channel_name}_STATUS"
     log            = setup_channel_logging(run_dir, channel_name, "age")
 
-    log.info(f"=== {channel_name} processing started  (request_id={request_id}) ===")
+    log.info("=" * 70)
+    log.info(f"  {channel_name} CHANNEL PROCESSING STARTED")
+    log.info(f"  request_id : {request_id}")
+    log.info(f"  run_dir    : {run_dir}")
+    log.info("=" * 70)
     update_request_status(request_id, "Started", channel_status, log)
 
     ctx = _build_common_context(request_id, channel_name, run_dir)
     log.info(
-        f"criteria_type={ctx['criteria_type']}  comp_type={ctx['comp_type']}  "
-        f"criteria_value={ctx['criteria_value']}"
+        f"  criteria_type  = {ctx['criteria_type']}\n"
+        f"  comp_type      = {ctx['comp_type']}\n"
+        f"  criteria_value = {ctx['criteria_value']}\n"
+        f"  perm_table     = {ctx['perm_table']}\n"
+        f"  path_FINAL     = {ctx['path_FINAL']}\n"
+        f"  path_COMPLETE  = {ctx['path_COMPLETE']}\n"
+        f"  output_file    = {ctx['output_file']}"
     )
 
     try:
-        channel_tmp      = ctx["channel_tmp"]
-        final_files_dir  = ctx["final_files_dir"]
-        perm_table       = ctx["perm_table"]
-        path_FINAL       = ctx["path_FINAL"]
-        path_COMPLETE    = ctx["path_COMPLETE"]
-        start_time       = time.time()
+        channel_tmp     = ctx["channel_tmp"]
+        final_files_dir = ctx["final_files_dir"]
+        perm_table      = ctx["perm_table"]
+        path_FINAL      = ctx["path_FINAL"]
+        path_COMPLETE   = ctx["path_COMPLETE"]
+        start_time      = time.time()
 
-        # Step 1
+        # ── STEP 1/7 ──────────────────────────────────────────────────────
+        _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         _insert_into_perm_table(
             perm_table, channel_name,
             ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
         )
+        log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
 
-        # Step 2
+        # ── STEP 2/7 ──────────────────────────────────────────────────────
+        _step(log, 2, TOTAL_STEPS, "Exporting FINAL FILE (DISTINCT emails) to S3", channel_name)
         update_request_status(request_id, "Exporting Final File", channel_status, log)
         _export_final_file(perm_table, path_FINAL, channel_name, log)
+        log.info(f"  STEP 2 DONE: FINAL FILE exported to S3 -> {path_FINAL}")
 
-        # Step 3
+        # ── STEP 3/7 ──────────────────────────────────────────────────────
+        _step(log, 3, TOTAL_STEPS, "Exporting COMPLETE DATA FILE (email + condition_field) to S3", channel_name)
         update_request_status(request_id, "Exporting Complete File", channel_status, log)
         _export_complete_file(perm_table, path_COMPLETE, channel_name, log)
+        log.info(f"  STEP 3 DONE: COMPLETE FILE exported to S3 -> {path_COMPLETE}")
 
-        # Step 4
+        # ── STEP 4/7 ──────────────────────────────────────────────────────
+        _step(log, 4, TOTAL_STEPS, f"Dropping permanent Snowflake table {perm_table}", channel_name)
         _drop_perm_table(perm_table, log)
+        log.info(f"  STEP 4 DONE: Table {perm_table} dropped")
 
-        # Step 5
+        # ── STEP 5/7 ──────────────────────────────────────────────────────
+        _step(log, 5, TOTAL_STEPS, "Downloading FINAL FILE parts from S3 + combining", channel_name)
         update_request_status(request_id, "Combining Data", channel_status, log)
-        download_dir = channel_tmp / f"{channel_name}_FINAL_DL"
-        _download_and_combine(
+        download_dir   = channel_tmp / f"{channel_name}_FINAL_DL"
+        combined_count = _download_and_combine(
             path_FINAL, download_dir, channel_tmp,
             ctx["output_file"], channel_name, log
         )
+        log.info(f"  STEP 5 DONE: Combined file rows (emails): {combined_count:,}")
 
-        # Step 6 – move to FINAL_FILES/
-        tmp_file_path   = channel_tmp    / ctx["output_file"]
+        # ── STEP 6/7 ──────────────────────────────────────────────────────
+        _step(log, 6, TOTAL_STEPS, "Moving combined file to FINAL_FILES/", channel_name)
+        tmp_file_path   = channel_tmp     / ctx["output_file"]
         final_file_path = final_files_dir / ctx["output_file"]
         shutil.move(str(tmp_file_path), str(final_file_path))
         record_count = _count_file_lines(str(final_file_path))
         log.info(
-            f"{channel_name}: {record_count} distinct emails "
-            f"-> FINAL_FILES/{ctx['output_file']}"
+            f"  STEP 6 DONE: Final file -> FINAL_FILES/{ctx['output_file']}\n"
+            f"               Distinct email rows in final file: {record_count:,}"
         )
 
-        # Step 7
+        # ── STEP 7/7 ──────────────────────────────────────────────────────
+        _step(log, 7, TOTAL_STEPS, f"FTP upload -> /CPA/{ctx['path_date']}/{ctx['output_file']}", channel_name)
         update_request_status(request_id, "Posting To FTP", channel_status, log)
         _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
+        log.info(f"  STEP 7 DONE: FTP upload successful")
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status, log)
-        log.info(
-            f"=== {channel_name} processing completed in {elapsed:.2f}s | "
-            f"final file: FINAL_FILES/{ctx['output_file']} ==="
-        )
+
+        log.info("=" * 70)
+        log.info(f"  {channel_name} CHANNEL PROCESSING COMPLETED SUCCESSFULLY")
+        log.info(f"  Total elapsed   : {elapsed:.2f}s")
+        log.info(f"  Final file      : FINAL_FILES/{ctx['output_file']}")
+        log.info(f"  Final row count : {record_count:,}")
+        log.info(f"  FTP path        : /CPA/{ctx['path_date']}/{ctx['output_file']}")
+        log.info("=" * 70)
 
         result = _success_result(
             channel_name, ctx["output_file"],
@@ -702,7 +800,10 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
 
     except Exception as exc:
         update_request_status(request_id, "Failed", channel_status, log)
-        log.exception(f"{channel_name} processing failed")
+        log.exception(
+            f"{channel_name} processing FAILED at the above step. "
+            f"Exception: {exc}"
+        )
         send_error_email(f"{channel_name} Processing Failed", str(exc))
         raise
 
@@ -710,71 +811,102 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
 def process_arcamax(request_id, run_dir: Path):
     """
     ARCAMAX channel processor.
-
-    All log calls go to the age_ARCAMAX channel logger only.
-
-    Flow: same 7-step pattern as GREEN/BLUE.
+    7-step flow with verbose step banners and row-count logging at every stage.
     """
+    TOTAL_STEPS    = 7
     channel_name   = "ARCAMAX"
     channel_status = "ARCAMAX_STATUS"
     log            = setup_channel_logging(run_dir, channel_name, "age")
 
-    log.info(f"=== ARCAMAX processing started  (request_id={request_id}) ===")
+    log.info("=" * 70)
+    log.info(f"  {channel_name} CHANNEL PROCESSING STARTED")
+    log.info(f"  request_id : {request_id}")
+    log.info(f"  run_dir    : {run_dir}")
+    log.info("=" * 70)
     update_request_status(request_id, "Started", channel_status, log)
 
     ctx = _build_common_context(request_id, channel_name, run_dir)
     log.info(
-        f"criteria_type={ctx['criteria_type']}  comp_type={ctx['comp_type']}  "
-        f"criteria_value={ctx['criteria_value']}"
+        f"  criteria_type  = {ctx['criteria_type']}\n"
+        f"  comp_type      = {ctx['comp_type']}\n"
+        f"  criteria_value = {ctx['criteria_value']}\n"
+        f"  perm_table     = {ctx['perm_table']}\n"
+        f"  path_FINAL     = {ctx['path_FINAL']}\n"
+        f"  path_COMPLETE  = {ctx['path_COMPLETE']}\n"
+        f"  output_file    = {ctx['output_file']}"
     )
 
     try:
-        channel_tmp      = ctx["channel_tmp"]
-        final_files_dir  = ctx["final_files_dir"]
-        perm_table       = ctx["perm_table"]
-        path_FINAL       = ctx["path_FINAL"]
-        path_COMPLETE    = ctx["path_COMPLETE"]
-        start_time       = time.time()
+        channel_tmp     = ctx["channel_tmp"]
+        final_files_dir = ctx["final_files_dir"]
+        perm_table      = ctx["perm_table"]
+        path_FINAL      = ctx["path_FINAL"]
+        path_COMPLETE   = ctx["path_COMPLETE"]
+        start_time      = time.time()
 
+        # ── STEP 1/7 ──────────────────────────────────────────────────────
+        _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         _insert_into_perm_table(
             perm_table, channel_name,
             ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
         )
+        log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
 
+        # ── STEP 2/7 ──────────────────────────────────────────────────────
+        _step(log, 2, TOTAL_STEPS, "Exporting FINAL FILE (DISTINCT emails) to S3", channel_name)
         update_request_status(request_id, "Exporting Final File", channel_status, log)
         _export_final_file(perm_table, path_FINAL, channel_name, log)
+        log.info(f"  STEP 2 DONE: FINAL FILE exported to S3 -> {path_FINAL}")
 
+        # ── STEP 3/7 ──────────────────────────────────────────────────────
+        _step(log, 3, TOTAL_STEPS, "Exporting COMPLETE DATA FILE (email + condition_field) to S3", channel_name)
         update_request_status(request_id, "Exporting Complete File", channel_status, log)
         _export_complete_file(perm_table, path_COMPLETE, channel_name, log)
+        log.info(f"  STEP 3 DONE: COMPLETE FILE exported to S3 -> {path_COMPLETE}")
 
+        # ── STEP 4/7 ──────────────────────────────────────────────────────
+        _step(log, 4, TOTAL_STEPS, f"Dropping permanent Snowflake table {perm_table}", channel_name)
         _drop_perm_table(perm_table, log)
+        log.info(f"  STEP 4 DONE: Table {perm_table} dropped")
 
+        # ── STEP 5/7 ──────────────────────────────────────────────────────
+        _step(log, 5, TOTAL_STEPS, "Downloading FINAL FILE parts from S3 + combining", channel_name)
         update_request_status(request_id, "Combining Data", channel_status, log)
-        download_dir = channel_tmp / "ARCAMAX_FINAL_DL"
-        _download_and_combine(
+        download_dir   = channel_tmp / "ARCAMAX_FINAL_DL"
+        combined_count = _download_and_combine(
             path_FINAL, download_dir, channel_tmp,
             ctx["output_file"], channel_name, log
         )
+        log.info(f"  STEP 5 DONE: Combined file rows (emails): {combined_count:,}")
 
-        tmp_file_path   = channel_tmp    / ctx["output_file"]
+        # ── STEP 6/7 ──────────────────────────────────────────────────────
+        _step(log, 6, TOTAL_STEPS, "Moving combined file to FINAL_FILES/", channel_name)
+        tmp_file_path   = channel_tmp     / ctx["output_file"]
         final_file_path = final_files_dir / ctx["output_file"]
         shutil.move(str(tmp_file_path), str(final_file_path))
         record_count = _count_file_lines(str(final_file_path))
         log.info(
-            f"ARCAMAX: {record_count} distinct emails "
-            f"-> FINAL_FILES/{ctx['output_file']}"
+            f"  STEP 6 DONE: Final file -> FINAL_FILES/{ctx['output_file']}\n"
+            f"               Distinct email rows in final file: {record_count:,}"
         )
 
+        # ── STEP 7/7 ──────────────────────────────────────────────────────
+        _step(log, 7, TOTAL_STEPS, f"FTP upload -> /CPA/{ctx['path_date']}/{ctx['output_file']}", channel_name)
         update_request_status(request_id, "Posting To FTP", channel_status, log)
         _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
+        log.info(f"  STEP 7 DONE: FTP upload successful")
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status, log)
-        log.info(
-            f"=== ARCAMAX processing completed in {elapsed:.2f}s | "
-            f"final file: FINAL_FILES/{ctx['output_file']} ==="
-        )
+
+        log.info("=" * 70)
+        log.info(f"  {channel_name} CHANNEL PROCESSING COMPLETED SUCCESSFULLY")
+        log.info(f"  Total elapsed   : {elapsed:.2f}s")
+        log.info(f"  Final file      : FINAL_FILES/{ctx['output_file']}")
+        log.info(f"  Final row count : {record_count:,}")
+        log.info(f"  FTP path        : /CPA/{ctx['path_date']}/{ctx['output_file']}")
+        log.info("=" * 70)
 
         result = _success_result(
             channel_name, ctx["output_file"],
@@ -785,7 +917,10 @@ def process_arcamax(request_id, run_dir: Path):
 
     except Exception as exc:
         update_request_status(request_id, "Failed", channel_status, log)
-        log.exception("ARCAMAX processing failed")
+        log.exception(
+            f"ARCAMAX processing FAILED at the above step. "
+            f"Exception: {exc}"
+        )
         send_error_email("ARCAMAX Processing Failed", str(exc))
         raise
 
@@ -793,28 +928,31 @@ def process_arcamax(request_id, run_dir: Path):
 def process_orange(request_id, run_dir: Path):
     """
     ORANGE channel processor.
-
-    All log calls go to the age_ORANGE channel logger only.
-
-    Flow:
-      Steps 1-6 same as other channels.
-      Step 7: build output based on request_type:
-        suppression -> email-only CSV in FINAL_FILES/
-        mailing     -> ESP-wise split CSVs packed into ZIP in FINAL_FILES/
-      Step 8: FTP from FINAL_FILES/
+    8-step flow with verbose step banners and row-count logging at every stage.
+    Step 7 branches: suppression -> email-only CSV | mailing -> ESP ZIP.
     """
+    TOTAL_STEPS    = 8
     channel_name   = "ORANGE"
     channel_status = "ORANGE_STATUS"
     log            = setup_channel_logging(run_dir, channel_name, "age")
 
-    log.info(f"=== ORANGE processing started  (request_id={request_id}) ===")
+    log.info("=" * 70)
+    log.info(f"  {channel_name} CHANNEL PROCESSING STARTED")
+    log.info(f"  request_id : {request_id}")
+    log.info(f"  run_dir    : {run_dir}")
+    log.info("=" * 70)
     update_request_status(request_id, "Started", channel_status, log)
 
     ctx = _build_common_context(request_id, channel_name, run_dir)
     log.info(
-        f"criteria_type={ctx['criteria_type']}  comp_type={ctx['comp_type']}  "
-        f"criteria_value={ctx['criteria_value']}  "
-        f"request_type={ctx['request_type']}"
+        f"  criteria_type  = {ctx['criteria_type']}\n"
+        f"  comp_type      = {ctx['comp_type']}\n"
+        f"  criteria_value = {ctx['criteria_value']}\n"
+        f"  request_type   = {ctx['request_type']}\n"
+        f"  perm_table     = {ctx['perm_table']}\n"
+        f"  path_FINAL     = {ctx['path_FINAL']}\n"
+        f"  path_COMPLETE  = {ctx['path_COMPLETE']}\n"
+        f"  output_file    = {ctx['output_file']}"
     )
 
     try:
@@ -828,27 +966,44 @@ def process_orange(request_id, run_dir: Path):
         path_COMPLETE   = ctx["path_COMPLETE"]
         start_time      = time.time()
 
+        # ── STEP 1/8 ──────────────────────────────────────────────────────
+        _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
         _insert_into_perm_table(
             perm_table, channel_name,
             ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
         )
+        log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
 
+        # ── STEP 2/8 ──────────────────────────────────────────────────────
+        _step(log, 2, TOTAL_STEPS, "Exporting FINAL FILE (DISTINCT email_address, account_name) to S3", channel_name)
         update_request_status(request_id, "Exporting Final File", channel_status, log)
         _export_final_file(perm_table, path_FINAL, channel_name, log)
+        log.info(f"  STEP 2 DONE: FINAL FILE exported to S3 -> {path_FINAL}")
 
+        # ── STEP 3/8 ──────────────────────────────────────────────────────
+        _step(log, 3, TOTAL_STEPS, "Exporting COMPLETE DATA FILE (email_address, condition_field, account_name) to S3", channel_name)
         update_request_status(request_id, "Exporting Complete File", channel_status, log)
         _export_complete_file(perm_table, path_COMPLETE, channel_name, log)
+        log.info(f"  STEP 3 DONE: COMPLETE FILE exported to S3 -> {path_COMPLETE}")
 
+        # ── STEP 4/8 ──────────────────────────────────────────────────────
+        _step(log, 4, TOTAL_STEPS, f"Dropping permanent Snowflake table {perm_table}", channel_name)
         _drop_perm_table(perm_table, log)
+        log.info(f"  STEP 4 DONE: Table {perm_table} dropped")
 
+        # ── STEP 5/8 ──────────────────────────────────────────────────────
+        _step(log, 5, TOTAL_STEPS, "Downloading FINAL FILE parts from S3 + combining", channel_name)
         update_request_status(request_id, "Combining Data", channel_status, log)
         raw_combined = f"ORANGE_FINAL_{path_date}.csv"
         download_dir = channel_tmp / "ORANGE_FINAL_DL"
-        _download_and_combine(
+        combined_count = _download_and_combine(
             path_FINAL, download_dir, channel_tmp, raw_combined, channel_name, log
         )
+        log.info(f"  STEP 5 DONE: Combined raw rows downloaded: {combined_count:,}")
 
+        # ── STEP 6/8 ──────────────────────────────────────────────────────
+        _step(log, 6, TOTAL_STEPS, "Loading combined file into DataFrame for processing", channel_name)
         df_final = pd.read_csv(
             str(channel_tmp / raw_combined),
             sep="|",
@@ -856,9 +1011,17 @@ def process_orange(request_id, run_dir: Path):
             names=["email_address", "account_name"],
             dtype=str,
         )
-        total_count = len(df_final)
-        log.info(f"ORANGE FINAL FILE records loaded: {total_count}")
+        total_count  = len(df_final)
+        esp_breakdown = df_final.groupby("account_name")["email_address"].count().to_dict()
+        log.info(f"  STEP 6 DONE: Records loaded into DataFrame: {total_count:,}")
+        log.info(f"  ESP breakdown (account_name -> row count):")
+        for esp_name, esp_cnt in sorted(esp_breakdown.items(), key=lambda x: -x[1]):
+            log.info(f"    {esp_name}: {esp_cnt:,} rows")
 
+        # ── STEP 7/8 ──────────────────────────────────────────────────────
+        _step(log, 7, TOTAL_STEPS,
+              f"Building output files (request_type={request_type})",
+              channel_name)
         update_request_status(request_id, "Posting To FTP", channel_status, log)
 
         if request_type.lower() == "suppression":
@@ -866,24 +1029,23 @@ def process_orange(request_id, run_dir: Path):
                 f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
             )
             suppression_path = final_files_dir / output_file
-            (
-                df_final[["email_address"]]
-                .drop_duplicates()
-                .to_csv(str(suppression_path), index=False, header=False)
-            )
-            record_count = len(pd.read_csv(str(suppression_path), header=None))
+            deduped          = df_final[["email_address"]].drop_duplicates()
+            deduped.to_csv(str(suppression_path), index=False, header=False)
+            record_count = len(deduped)
             log.info(
-                f"ORANGE suppression: {output_file} "
-                f"({record_count} records) -> FINAL_FILES/"
+                f"  Suppression file: {output_file}\n"
+                f"  Raw rows        : {total_count:,}\n"
+                f"  Deduped rows    : {record_count:,}"
             )
-            _post_to_ftp(final_files_dir, path_date, output_file, log)
             final_file_path = str(suppression_path)
+            log.info(f"  STEP 7 DONE: Suppression CSV written -> FINAL_FILES/{output_file}")
 
         else:  # mailing
             esp_split_dir = channel_tmp / "ORANGE_ESP_SPLIT"
             esp_split_dir.mkdir(exist_ok=True)
-            esp_names = df_final["account_name"].dropna().unique()
-            zip_parts = []
+            esp_names  = df_final["account_name"].dropna().unique()
+            zip_parts  = []
+            total_esp_rows = 0
             for esp in esp_names:
                 esp_df = (
                     df_final[df_final["account_name"] == esp][["email_address"]]
@@ -895,8 +1057,9 @@ def process_orange(request_id, run_dir: Path):
                 )
                 esp_df.to_csv(str(esp_file), index=False, header=False)
                 zip_parts.append(esp_file)
+                total_esp_rows += len(esp_df)
                 log.info(
-                    f"ORANGE ESP split: {esp_file.name} ({len(esp_df)} records)"
+                    f"  ESP split: {esp_file.name}  |  rows: {len(esp_df):,}"
                 )
 
             zip_name = f"{client_name}_{request_type}_ORANGE_{path_date}.zip"
@@ -904,21 +1067,31 @@ def process_orange(request_id, run_dir: Path):
             run_command(
                 ["zip", "-j", str(zip_path)] + [str(p) for p in zip_parts]
             )
-            log.info(
-                f"ORANGE mailing ZIP: {zip_name} "
-                f"({len(zip_parts)} ESPs) -> FINAL_FILES/"
-            )
-            _post_to_ftp(final_files_dir, path_date, zip_name, log)
+            record_count    = total_esp_rows
             final_file_path = str(zip_path)
             output_file     = zip_name
-            record_count    = total_count
+            log.info(
+                f"  Mailing ZIP     : {zip_name}\n"
+                f"  ESPs packed     : {len(zip_parts)}\n"
+                f"  Total email rows: {record_count:,}"
+            )
+            log.info(f"  STEP 7 DONE: Mailing ZIP written -> FINAL_FILES/{zip_name}")
+
+        # ── STEP 8/8 ──────────────────────────────────────────────────────
+        _step(log, 8, TOTAL_STEPS, f"FTP upload -> /CPA/{path_date}/{output_file}", channel_name)
+        _post_to_ftp(final_files_dir, path_date, output_file, log)
+        log.info(f"  STEP 8 DONE: FTP upload successful")
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status, log)
-        log.info(
-            f"=== ORANGE processing completed in {elapsed:.2f}s | "
-            f"final file: FINAL_FILES/{output_file} ==="
-        )
+
+        log.info("=" * 70)
+        log.info(f"  {channel_name} CHANNEL PROCESSING COMPLETED SUCCESSFULLY")
+        log.info(f"  Total elapsed   : {elapsed:.2f}s")
+        log.info(f"  Final file      : FINAL_FILES/{output_file}")
+        log.info(f"  Final row count : {record_count:,}")
+        log.info(f"  FTP path        : /CPA/{path_date}/{output_file}")
+        log.info("=" * 70)
 
         result = _success_result(
             channel_name, output_file,
@@ -929,7 +1102,10 @@ def process_orange(request_id, run_dir: Path):
 
     except Exception as exc:
         update_request_status(request_id, "Failed", channel_status, log)
-        log.exception("ORANGE processing failed")
+        log.exception(
+            f"ORANGE processing FAILED at the above step. "
+            f"Exception: {exc}"
+        )
         send_error_email("ORANGE Processing Failed", str(exc))
         raise
 
@@ -942,16 +1118,6 @@ def process_age_state_request(request_id, channel="ALL"):
     """
     Orchestrate channel processing for a single request.
     channel: "ALL" | "GREEN" | "BLUE" | "ARCAMAX" | "ORANGE"
-
-    LOG ROUTING
-    -----------
-    This function owns the MAIN log (age_main logger).
-    It logs:
-      - Run start / channels to run
-      - Per-channel start / completed / failed summary lines
-      - Overall completion / failure
-    Channel processors own their own loggers; all detailed work logs stay
-    inside the respective <CH>_age_<ts>.log file.
     """
     request_data = fetch_request_details(request_id)
     if not request_data:
@@ -960,30 +1126,28 @@ def process_age_state_request(request_id, channel="ALL"):
     output_dir    = request_data["output_dir"]
     criteria_type = request_data["criteria_type"]
 
-    # Build run_dir via ensure_output_dir  (creates run_age_YYYYMMDD_HHMMSS/)
     run_dir = Path(ensure_output_dir(output_dir, criteria_type))
 
-    # Ensure FINAL_FILES/ and logs/ exist inside run_dir
     (run_dir / "FINAL_FILES").mkdir(parents=True, exist_ok=True)
     (run_dir / "logs").mkdir(parents=True, exist_ok=True)
 
-    # MAIN logger — only this function writes to it (plus explicit summaries below)
     log_main = setup_main_logging(run_dir, criteria_type)
 
     channels_to_run = CHANNELS if channel.upper() == "ALL" else [channel.upper()]
-    log_main.info(
-        f"=== process_age_state_request started | "
-        f"request_id={request_id}  channels={','.join(channels_to_run)} ==="
-    )
-    log_main.info(
-        f"run_dir={run_dir}  "
-        f"criteria_type={criteria_type}  "
-        f"criteria_value={request_data['criteria_value']}  "
-        f"comp_type={request_data['comp_type']}"
-    )
+
+    log_main.info("=" * 70)
+    log_main.info("  AGE STATE PROCESSING — ORCHESTRATOR STARTED")
+    log_main.info(f"  request_id     : {request_id}")
+    log_main.info(f"  channels       : {', '.join(channels_to_run)}")
+    log_main.info(f"  criteria_type  : {criteria_type}")
+    log_main.info(f"  criteria_value : {request_data['criteria_value']}")
+    log_main.info(f"  comp_type      : {request_data['comp_type']}")
+    log_main.info(f"  run_dir        : {run_dir}")
+    log_main.info("=" * 70)
 
     for ch in channels_to_run:
         update_request_status(request_id, "Queued", f"{ch}_STATUS", log_main)
+        log_main.info(f"  [{ch}] status set to Queued")
 
     def _run_channel(ch):
         if ch in ("GREEN", "BLUE"):
@@ -1000,19 +1164,24 @@ def process_age_state_request(request_id, channel="ALL"):
 
     if len(channels_to_run) == 1:
         ch = channels_to_run[0]
-        log_main.info(f"[{ch}] starting")
+        log_main.info(f"  [{ch}] single-channel mode — starting now")
         try:
             results[ch] = _run_channel(ch)
             log_main.info(
-                f"[{ch}] completed | "
-                f"file={results[ch]['file']}  count={results[ch]['count']}  "
+                f"  [{ch}] COMPLETED | "
+                f"file={results[ch]['file']}  "
+                f"count={results[ch]['count']:,}  "
                 f"elapsed={results[ch]['elapsed']:.2f}s"
             )
         except Exception as exc:
             failed.append(ch)
-            log_main.error(f"[{ch}] FAILED: {exc}")
+            log_main.error(f"  [{ch}] FAILED: {exc}")
 
     else:
+        log_main.info(
+            f"  Parallel mode — launching {len(channels_to_run)} channels "
+            f"via ThreadPoolExecutor"
+        )
         with ThreadPoolExecutor(max_workers=len(channels_to_run)) as executor:
             future_map = {
                 executor.submit(_run_channel, ch): ch
@@ -1023,13 +1192,14 @@ def process_age_state_request(request_id, channel="ALL"):
                 try:
                     results[ch] = future.result()
                     log_main.info(
-                        f"[{ch}] completed | "
-                        f"file={results[ch]['file']}  count={results[ch]['count']}  "
+                        f"  [{ch}] COMPLETED | "
+                        f"file={results[ch]['file']}  "
+                        f"count={results[ch]['count']:,}  "
                         f"elapsed={results[ch]['elapsed']:.2f}s"
                     )
                 except Exception as exc:
                     failed.append(ch)
-                    log_main.error(f"[{ch}] FAILED: {exc}")
+                    log_main.error(f"  [{ch}] FAILED: {exc}")
 
     overall_status = "failed" if failed else "completed"
     conn = get_db_with_retry(log_main)
@@ -1040,15 +1210,30 @@ def process_age_state_request(request_id, channel="ALL"):
                 (overall_status, request_id),
             )
         conn.commit()
+        log_main.info(
+            f"  DB overall_status updated to '{overall_status}' "
+            f"(request_id={request_id})"
+        )
     finally:
         conn.close()
 
+    log_main.info("=" * 70)
     log_main.info(
-        f"=== process_age_state_request {overall_status.upper()} | "
-        f"request_id={request_id}  "
-        f"succeeded={[c for c in channels_to_run if c not in failed]}  "
-        f"failed={failed} ==="
+        f"  AGE STATE PROCESSING — ORCHESTRATOR {overall_status.upper()}"
     )
+    log_main.info(f"  request_id : {request_id}")
+    log_main.info(
+        f"  succeeded  : {[c for c in channels_to_run if c not in failed]}"
+    )
+    log_main.info(f"  failed     : {failed}")
+    if results:
+        log_main.info("  Channel summary:")
+        for ch, r in results.items():
+            log_main.info(
+                f"    {ch}: file={r['file']}  rows={r['count']:,}  "
+                f"elapsed={r['elapsed']:.2f}s  status={r['status']}"
+            )
+    log_main.info("=" * 70)
 
     if not failed:
         send_success_email(

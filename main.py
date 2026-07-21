@@ -48,7 +48,7 @@ def main():
     req_type = args.request_type
 
     if criteria in ("age", "state"):
-        from AGE_STATE.age_state_new import process_age_state_request
+        from AGE_STATE.age_state_updated import process_age_state_request
         if args.request_id is None:
             print("[ERROR] --request-id is required for age/state criteria", file=sys.stderr)
             sys.exit(1)
