@@ -507,6 +507,8 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
     else:
         log.warning(f"  Could not verify row count for {perm_table} (count query failed)")
 
+    return inserted_rows
+
 
 def _export_complete_final_file(export_type, perm_table, export_path, channel_name, log):
     """
@@ -648,10 +650,27 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
         # ── STEP 1/7 ──────────────────────────────────────────────────────
         _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
-        _insert_into_perm_table(
+        inserted_count  = _insert_into_perm_table(
             perm_table, channel_name,
             ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
         )
+
+        if inserted_count == 0:
+            update_request_status(request_id, "No Data Retrieved", channel_status, log)
+            log.warning(
+                f"  NO DATA RETRIEVED: 0 rows inserted into {perm_table}. "
+                f"Skipping remaining steps for {channel_name}."
+            )
+            _drop_perm_table(perm_table, log)
+            return {
+                "channel": channel_name,
+                "file": None,
+                "final_file_path": None,
+                "status": "NO_DATA",
+                "elapsed": time.time() - start_time,
+                "count": 0,
+            }
+
         log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
 
         # ── STEP 2/7 ──────────────────────────────────────────────────────
@@ -765,10 +784,27 @@ def process_arcamax(request_id, run_dir: Path):
         # ── STEP 1/7 ──────────────────────────────────────────────────────
         _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
-        _insert_into_perm_table(
+        inserted_count = _insert_into_perm_table(
             perm_table, channel_name,
             ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
         )
+
+        if inserted_count == 0:
+            update_request_status(request_id, "No Data Retrieved", channel_status, log)
+            log.warning(
+                f"  NO DATA RETRIEVED: 0 rows inserted into {perm_table}. "
+                f"Skipping remaining steps for {channel_name}."
+            )
+            _drop_perm_table(perm_table, log)
+            return {
+                "channel": channel_name,
+                "file": None,
+                "final_file_path": None,
+                "status": "NO_DATA",
+                "elapsed": time.time() - start_time,
+                "count": 0,
+            }
+
         log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
 
         # ── STEP 2/7 ──────────────────────────────────────────────────────
@@ -887,10 +923,27 @@ def process_orange(request_id, run_dir: Path):
         # ── STEP 1/8 ──────────────────────────────────────────────────────
         _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
-        _insert_into_perm_table(
+        inserted_count = _insert_into_perm_table(
             perm_table, channel_name,
             ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
         )
+
+        if inserted_count == 0:
+            update_request_status(request_id, "No Data Retrieved", channel_status, log)
+            log.warning(
+                f"  NO DATA RETRIEVED: 0 rows inserted into {perm_table}. "
+                f"Skipping remaining steps for {channel_name}."
+            )
+            _drop_perm_table(perm_table, log)
+            return {
+                "channel": channel_name,
+                "file": None,
+                "final_file_path": None,
+                "status": "NO_DATA",
+                "elapsed": time.time() - start_time,
+                "count": 0,
+            }
+
         log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
 
         # ── STEP 2/8 ──────────────────────────────────────────────────────
@@ -961,7 +1014,8 @@ def process_orange(request_id, run_dir: Path):
         else:  # mailing
             esp_split_dir = channel_tmp / "ORANGE_ESP_SPLIT"
             esp_split_dir.mkdir(exist_ok=True)
-            esp_names  = df_final["account_name"].dropna().unique()
+            esp_names  = df_final["account_name"].dropna().astype(str).str.strip()
+            esp_names = esp_names[esp_names.str.lower() != "account_name"].unique().tolist()
             zip_parts  = []
             total_esp_rows = 0
             for esp in esp_names:
@@ -973,7 +1027,7 @@ def process_orange(request_id, run_dir: Path):
                     esp_split_dir
                     / f"{client_name}_{request_type}_{esp}_{path_date}.csv"
                 )
-                esp_df.to_csv(str(esp_file), index=False, header=False)
+                esp_df.to_csv(str(esp_file), index=False, header=True)
                 zip_parts.append(esp_file)
                 total_esp_rows += len(esp_df)
                 log.info(
@@ -1085,12 +1139,16 @@ def process_age_state_request(request_id, channel="ALL"):
         log_main.info(f"  [{ch}] single-channel mode — starting now")
         try:
             results[ch] = _run_channel(ch)
-            log_main.info(
-                f"  [{ch}] COMPLETED | "
-                f"file={results[ch]['file']}  "
-                f"count={results[ch]['count']:,}  "
-                f"elapsed={results[ch]['elapsed']:.2f}s"
-            )
+            if results[ch].get("status") == "NO_DATA":
+                log_main.warning(
+                    f"[{ch}] NO DATA | file=None count=0 elapsed={results[ch]['elapsed']:.2f}s"
+                )
+            else:
+                log_main.info(
+                    f"[{ch}] completed | "
+                    f"file={results[ch]['file']} count={results[ch]['count']} "
+                    f"elapsed={results[ch]['elapsed']:.2f}s"
+                )
         except Exception as exc:
             failed.append(ch)
             log_main.error(f"  [{ch}] FAILED: {exc}")
@@ -1109,12 +1167,16 @@ def process_age_state_request(request_id, channel="ALL"):
                 ch = future_map[future]
                 try:
                     results[ch] = future.result()
-                    log_main.info(
-                        f"  [{ch}] COMPLETED | "
-                        f"file={results[ch]['file']}  "
-                        f"count={results[ch]['count']:,}  "
-                        f"elapsed={results[ch]['elapsed']:.2f}s"
-                    )
+                    if results[ch].get("status") == "NO_DATA":
+                        log_main.warning(
+                            f"[{ch}] NO DATA | file=None count=0 elapsed={results[ch]['elapsed']:.2f}s"
+                        )
+                    else:
+                        log_main.info(
+                            f"[{ch}] completed | "
+                            f"file={results[ch]['file']} count={results[ch]['count']} "
+                            f"elapsed={results[ch]['elapsed']:.2f}s"
+                        )
                 except Exception as exc:
                     failed.append(ch)
                     log_main.error(f"  [{ch}] FAILED: {exc}")
@@ -1161,4 +1223,3 @@ def process_age_state_request(request_id, channel="ALL"):
         )
 
     return results
-
