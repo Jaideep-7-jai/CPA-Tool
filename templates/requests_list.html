@@ -87,6 +87,10 @@
               data-filename-blue="{{ r.BLUE_FILENAME }}"
               data-filename-arcamax="{{ r.ARCAMAX_FILENAME }}"
               data-filename-orange="{{ r.ORANGE_FILENAME }}"
+              data-filepath-green="{{ r.GREEN_FILEPATH }}"
+              data-filepath-blue="{{ r.BLUE_FILEPATH }}"
+              data-filepath-arcamax="{{ r.ARCAMAX_FILEPATH }}"
+              data-filepath-orange="{{ r.ORANGE_FILEPATH }}"
               data-uuid="{{ r.request_uuid }}">
 
             <td><strong>{{ r.request_name }}</strong></td>
@@ -109,7 +113,8 @@
                       data-status="{{ r.GREEN_STATUS or 'Pending' }}"
                       data-ftp="{{ r.GREEN_FTP }}"
                       data-filecount="{{ r.GREEN_FILECOUNT }}"
-                      data-filename="{{ r.GREEN_FILENAME }}">{{ r.GREEN_STATUS or 'Pending' }}</span>
+                      data-filename="{{ r.GREEN_FILENAME }}"
+                      data-filepath="{{ r.GREEN_FILEPATH }}">{{ r.GREEN_STATUS or 'Pending' }}</span>
               {% else %}<span class="muted small">N/A</span>{% endif %}
             </td>
 
@@ -122,7 +127,8 @@
                       data-status="{{ r.BLUE_STATUS or 'Pending' }}"
                       data-ftp="{{ r.BLUE_FTP }}"
                       data-filecount="{{ r.BLUE_FILECOUNT }}"
-                      data-filename="{{ r.BLUE_FILENAME }}">{{ r.BLUE_STATUS or 'Pending' }}</span>
+                      data-filename="{{ r.BLUE_FILENAME }}"
+                      data-filepath="{{ r.BLUE_FILEPATH }}">{{ r.BLUE_STATUS or 'Pending' }}</span>
               {% else %}<span class="muted small">N/A</span>{% endif %}
             </td>
 
@@ -135,7 +141,8 @@
                       data-status="{{ r.ARCAMAX_STATUS or 'Pending' }}"
                       data-ftp="{{ r.ARCAMAX_FTP }}"
                       data-filecount="{{ r.ARCAMAX_FILECOUNT }}"
-                      data-filename="{{ r.ARCAMAX_FILENAME }}">{{ r.ARCAMAX_STATUS or 'Pending' }}</span>
+                      data-filename="{{ r.ARCAMAX_FILENAME }}"
+                      data-filepath="{{ r.ARCAMAX_FILEPATH }}">{{ r.ARCAMAX_STATUS or 'Pending' }}</span>
               {% else %}<span class="muted small">N/A</span>{% endif %}
             </td>
 
@@ -148,7 +155,8 @@
                       data-status="{{ r.ORANGE_STATUS or 'Pending' }}"
                       data-ftp="{{ r.ORANGE_FTP }}"
                       data-filecount="{{ r.ORANGE_FILECOUNT }}"
-                      data-filename="{{ r.ORANGE_FILENAME }}">{{ r.ORANGE_STATUS or 'Pending' }}</span>
+                      data-filename="{{ r.ORANGE_FILENAME }}"
+                      data-filepath="{{ r.ORANGE_FILEPATH }}">{{ r.ORANGE_STATUS or 'Pending' }}</span>
               {% else %}<span class="muted small">N/A</span>{% endif %}
             </td>
 
@@ -225,15 +233,23 @@ const COLORS = {
 
 let hideTimer;
 
+// ── Channel name -> row data-attribute key mapping ────────────
+function getRowDatasetKey(channel, attr) {
+  // e.g. channel="ARCAMAX", attr="filepath" -> "filepathArcamax"
+  const ch = channel.charAt(0).toUpperCase() + channel.slice(1).toLowerCase();
+  return attr + ch;
+}
+
 // ── Fetch filedetails from DB and show popup ──────────────────
 function showPopup(badge) {
   clearTimeout(hideTimer);
   const channel   = badge.dataset.channel  || '';
   const status    = (badge.dataset.status  || '').trim();
-  // Get file details: prefer data attributes, fallback to API
+  // Get file details from data attributes
   const ftp       = (badge.dataset.ftp      || '').trim();
   const filecount = (badge.dataset.filecount || '').trim();
   const filename  = (badge.dataset.filename  || '').trim();
+  const filepath  = (badge.dataset.filepath  || '').trim();
   if (!status || status === '-') return;
 
   const key    = status.toLowerCase().replace(/ /g,'_');
@@ -259,12 +275,12 @@ function showPopup(badge) {
   }
 
   // If we already have data attributes populated, render immediately
-  if (ftp || filecount || filename) {
-    renderPopupBody(ftp, filecount, filename);
+  if (ftp || filecount || filename || filepath) {
+    renderPopupBody(ftp, filecount, filename, filepath);
     return;
   }
 
-  // Otherwise try fetching from /api/filedetails/<uuid> for this row's channel
+  // Otherwise fetch from /api/filedetails/<uuid> for this row's channel
   const tr   = badge.closest('tr');
   const uuid = tr ? tr.dataset.uuid : null;
   if (!uuid) {
@@ -278,7 +294,6 @@ function showPopup(badge) {
     .then(r => r.json())
     .then(data => {
       const items = (data.items || []).filter(fd => {
-        // match by channel if available
         const ch = (fd.channel || '').toUpperCase();
         return !ch || ch === channel.toUpperCase();
       });
@@ -286,23 +301,24 @@ function showPopup(badge) {
         popBody.innerHTML = '<div class="popup-no-data">Completed — no file details recorded</div>';
         return;
       }
-      // Show first matching entry
       const fd = items[0];
-      const ftpVal  = fd.path      || '';
-      const fcVal   = String(fd.file_count !== undefined ? fd.file_count : (fd.row_count || 0));
-      const fnVal   = fd.filename  || '';
-      renderPopupBody(ftpVal, fcVal, fnVal);
+      const ftpVal      = fd.ftp_path  || '';
+      const fcVal       = String(fd.file_count !== undefined ? fd.file_count : (fd.row_count || 0));
+      const fnVal       = fd.filename  || '';
+      const fpVal       = fd.path      || '';
+      renderPopupBody(ftpVal, fcVal, fnVal, fpVal);
     })
     .catch(() => {
       popBody.innerHTML = '<div class="popup-no-data">Completed — no file details recorded</div>';
     });
 }
 
-function renderPopupBody(ftp, filecount, filename) {
+function renderPopupBody(ftp, filecount, filename, filepath) {
   let html = '';
-  if (ftp)       html += row('FTP Path',   ftp,       true);
   if (filecount) html += row('File Count', filecount, false);
   if (filename)  html += row('File Name',  filename,  true);
+  if (filepath)  html += row('File Path',  filepath,  true);
+  if (ftp)       html += row('FTP Path',   ftp,       true);
   if (!html)     html  = '<div class="popup-no-data">Completed — no file details recorded</div>';
   popBody.innerHTML = html;
   popBody.querySelectorAll('.popup-copy-btn').forEach(btn => {

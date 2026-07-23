@@ -47,6 +47,8 @@ _CHANNEL_COLUMNS = {
     "GREEN_FTP",    "BLUE_FTP",    "ARCAMAX_FTP",    "ORANGE_FTP",
     "GREEN_FILECOUNT",  "BLUE_FILECOUNT",  "ARCAMAX_FILECOUNT",  "ORANGE_FILECOUNT",
     "GREEN_FILENAME",   "BLUE_FILENAME",   "ARCAMAX_FILENAME",   "ORANGE_FILENAME",
+    # ── NEW: absolute local file path for each channel output file ──
+    "GREEN_FILEPATH",   "BLUE_FILEPATH",   "ARCAMAX_FILEPATH",   "ORANGE_FILEPATH",
 }
 
 # All recognised channel names (excluding ALL)
@@ -120,6 +122,10 @@ def init_db():
                     BLUE_FILENAME   VARCHAR(500) NULL,
                     ARCAMAX_FILENAME VARCHAR(500) NULL,
                     ORANGE_FILENAME VARCHAR(500) NULL,
+                    GREEN_FILEPATH  VARCHAR(500) NULL,
+                    BLUE_FILEPATH   VARCHAR(500) NULL,
+                    ARCAMAX_FILEPATH VARCHAR(500) NULL,
+                    ORANGE_FILEPATH VARCHAR(500) NULL,
                     command_text    TEXT NULL,
                     log_file        VARCHAR(500) NULL,
                     stdout_text     MEDIUMTEXT NULL,
@@ -150,6 +156,11 @@ def init_db():
             _add_column_if_missing(cur, "requests", "BLUE_FILENAME",    "VARCHAR(500) NULL")
             _add_column_if_missing(cur, "requests", "ARCAMAX_FILENAME", "VARCHAR(500) NULL")
             _add_column_if_missing(cur, "requests", "ORANGE_FILENAME",  "VARCHAR(500) NULL")
+            # ── NEW filepath columns ────────────────────────────────────────
+            _add_column_if_missing(cur, "requests", "GREEN_FILEPATH",   "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "BLUE_FILEPATH",    "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "ARCAMAX_FILEPATH", "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "ORANGE_FILEPATH",  "VARCHAR(500) NULL")
 
 
             cur.execute("""
@@ -388,7 +399,8 @@ def fetch_all_requests(limit=200):
                     r.APPTNESS_STATUS,
                     r.GREEN_FTP,    r.BLUE_FTP,    r.ARCAMAX_FTP,    r.ORANGE_FTP,
                     r.GREEN_FILECOUNT, r.BLUE_FILECOUNT, r.ARCAMAX_FILECOUNT, r.ORANGE_FILECOUNT,
-                    r.GREEN_FILENAME,  r.BLUE_FILENAME,  r.ARCAMAX_FILENAME,  r.ORANGE_FILENAME
+                    r.GREEN_FILENAME,  r.BLUE_FILENAME,  r.ARCAMAX_FILENAME,  r.ORANGE_FILENAME,
+                    r.GREEN_FILEPATH,  r.BLUE_FILEPATH,  r.ARCAMAX_FILEPATH,  r.ORANGE_FILEPATH
                 FROM requests r
                 JOIN users u ON u.id = r.created_by
                 ORDER BY r.id DESC
@@ -431,6 +443,10 @@ def fetch_all_requests(limit=200):
                     "BLUE_FILENAME":    row[30] or "",
                     "ARCAMAX_FILENAME": row[31] or "",
                     "ORANGE_FILENAME":  row[32] or "",
+                    "GREEN_FILEPATH":   row[33] or "",
+                    "BLUE_FILEPATH":    row[34] or "",
+                    "ARCAMAX_FILEPATH": row[35] or "",
+                    "ORANGE_FILEPATH":  row[36] or "",
                 })
             return results
     finally:
@@ -626,8 +642,8 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
     """
     Read filedetails.json produced by send_success_email, upsert it into
     the filedetails table, AND update the per-channel columns on the
-    requests table (GREEN_STATUS, GREEN_FILENAME, GREEN_FILECOUNT, etc.)
-    so the UI shows real values instead of N/A.
+    requests table (GREEN_STATUS, GREEN_FILENAME, GREEN_FILECOUNT,
+    GREEN_FILEPATH, etc.) so the UI shows real values instead of N/A.
 
     Only channels that are NOT already 'NOT_SELECTED' are overwritten,
     preserving the NOT_SELECTED sentinel for channels that were never run.
@@ -690,10 +706,13 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
 
             fname     = fd.get("filename", "")
             row_count = fd.get("file_count") or fd.get("row_count") or ""
+            # 'path' is the absolute local file path written by build_file_details_json
+            filepath  = fd.get("path", "")
 
             channel_updates[f"{ch}_STATUS"]    = "completed"
             channel_updates[f"{ch}_FILENAME"]  = fname
             channel_updates[f"{ch}_FILECOUNT"] = str(row_count) if row_count else ""
+            channel_updates[f"{ch}_FILEPATH"]  = filepath
 
         if channel_updates:
             update_request_db(request_uuid, **channel_updates)
