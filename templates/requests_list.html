@@ -21,7 +21,6 @@
       <option value="state">State</option>
       <option value="zips">Zips</option>
     </select>
-    <!-- Change #2: Status filter now includes per-channel statuses from DB -->
     <select id="statusFilter" class="filter-select">
       <option value="">All Statuses</option>
       <option value="completed">Completed</option>
@@ -54,7 +53,6 @@
             <th>Value</th>
             <th>Comp</th>
             <th>Channel</th>
-            <!-- Change #4: per-channel statuses shown on collapsed row -->
             <th>Green</th>
             <th>Blue</th>
             <th>Arcamax</th>
@@ -66,89 +64,103 @@
         </thead>
         <tbody id="requestsBody">
           {% for r in requests %}
-          {# Build list of selected channels for this request #}
-          {% set selected_channels = r.channel.split(',') if r.channel else [] %}
+          {% set sel = r.channel.split(',') if r.channel else [] %}
+          {% set is_all = (r.channel == 'ALL') %}
 
-          <!-- Change #3 & #4: Main data row — click Request Name to expand/collapse -->
-          <tr class="req-row" data-uuid="{{ r.request_uuid }}"
+          <tr class="req-row"
               data-channels="{{ r.channel }}"
-              data-status-green="{{ r.GREEN_STATUS or '' }}"
-              data-status-blue="{{ r.BLUE_STATUS or '' }}"
-              data-status-arcamax="{{ r.ARCAMAX_STATUS or '' }}"
-              data-status-orange="{{ r.ORANGE_STATUS or '' }}"
-              data-ftp-green="{{ r.GREEN_FTP or '' }}"
-              data-ftp-blue="{{ r.BLUE_FTP or '' }}"
-              data-ftp-arcamax="{{ r.ARCAMAX_FTP or '' }}"
-              data-ftp-orange="{{ r.ORANGE_FTP or '' }}"
-              data-filecount-green="{{ r.GREEN_FILECOUNT or '' }}"
-              data-filecount-blue="{{ r.BLUE_FILECOUNT or '' }}"
-              data-filecount-arcamax="{{ r.ARCAMAX_FILECOUNT or '' }}"
-              data-filecount-orange="{{ r.ORANGE_FILECOUNT or '' }}"
-              data-filename-green="{{ r.GREEN_FILENAME or '' }}"
-              data-filename-blue="{{ r.BLUE_FILENAME or '' }}"
-              data-filename-arcamax="{{ r.ARCAMAX_FILENAME or '' }}"
-              data-filename-orange="{{ r.ORANGE_FILENAME or '' }}">
-            <!-- Clickable request name -->
-            <td>
-              <span class="req-name-toggle" title="Click to expand channel details">
-                <span class="toggle-arrow">▶</span>
-                <strong>{{ r.request_name }}</strong>
-              </span>
-            </td>
+              data-status-green="{{ r.GREEN_STATUS }}"
+              data-status-blue="{{ r.BLUE_STATUS }}"
+              data-status-arcamax="{{ r.ARCAMAX_STATUS }}"
+              data-status-orange="{{ r.ORANGE_STATUS }}"
+              data-ftp-green="{{ r.GREEN_FTP }}"
+              data-ftp-blue="{{ r.BLUE_FTP }}"
+              data-ftp-arcamax="{{ r.ARCAMAX_FTP }}"
+              data-ftp-orange="{{ r.ORANGE_FTP }}"
+              data-filecount-green="{{ r.GREEN_FILECOUNT }}"
+              data-filecount-blue="{{ r.BLUE_FILECOUNT }}"
+              data-filecount-arcamax="{{ r.ARCAMAX_FILECOUNT }}"
+              data-filecount-orange="{{ r.ORANGE_FILECOUNT }}"
+              data-filename-green="{{ r.GREEN_FILENAME }}"
+              data-filename-blue="{{ r.BLUE_FILENAME }}"
+              data-filename-arcamax="{{ r.ARCAMAX_FILENAME }}"
+              data-filename-orange="{{ r.ORANGE_FILENAME }}">
+
+            <td><strong>{{ r.request_name }}</strong></td>
             <td><span class="badge-type {{ r.request_type|lower }}">{{ r.request_type }}</span></td>
             <td><span class="badge-criteria">{{ r.criteria_type|upper }}</span></td>
             <td class="muted small">{{ r.criteria_value or '-' }}</td>
             <td class="muted small">{{ r.comp_type }}</td>
             <td>
-              {% for ch in selected_channels %}
+              {% for ch in sel %}
                 <span class="tag">{{ ch.strip() }}</span>
               {% endfor %}
             </td>
-            <!-- Change #4: per-channel status shown on main row too -->
+
+            {# Green status cell #}
             <td>
-              {% if 'GREEN' in selected_channels or 'ALL' in selected_channels %}
-                <span class="badge-status {{ (r.GREEN_STATUS or 'pending')|lower }}">{{ r.GREEN_STATUS or '-' }}</span>
+              {% if is_all or 'GREEN' in sel %}
+                {% set st = r.GREEN_STATUS|lower if r.GREEN_STATUS else 'pending' %}
+                <span class="badge-status {{ st }} has-popup"
+                      data-channel="GREEN"
+                      data-status="{{ r.GREEN_STATUS }}"
+                      data-ftp="{{ r.GREEN_FTP }}"
+                      data-filecount="{{ r.GREEN_FILECOUNT }}"
+                      data-filename="{{ r.GREEN_FILENAME }}">{{ r.GREEN_STATUS or '-' }}</span>
               {% else %}
                 <span class="muted">N/A</span>
               {% endif %}
             </td>
+
+            {# Blue status cell #}
             <td>
-              {% if 'BLUE' in selected_channels or 'ALL' in selected_channels %}
-                <span class="badge-status {{ (r.BLUE_STATUS or 'pending')|lower }}">{{ r.BLUE_STATUS or '-' }}</span>
+              {% if is_all or 'BLUE' in sel %}
+                {% set st = r.BLUE_STATUS|lower if r.BLUE_STATUS else 'pending' %}
+                <span class="badge-status {{ st }} has-popup"
+                      data-channel="BLUE"
+                      data-status="{{ r.BLUE_STATUS }}"
+                      data-ftp="{{ r.BLUE_FTP }}"
+                      data-filecount="{{ r.BLUE_FILECOUNT }}"
+                      data-filename="{{ r.BLUE_FILENAME }}">{{ r.BLUE_STATUS or '-' }}</span>
               {% else %}
                 <span class="muted">N/A</span>
               {% endif %}
             </td>
+
+            {# Arcamax status cell #}
             <td>
-              {% if 'ARCAMAX' in selected_channels or 'ALL' in selected_channels %}
-                <span class="badge-status {{ (r.ARCAMAX_STATUS or 'pending')|lower }}">{{ r.ARCAMAX_STATUS or '-' }}</span>
+              {% if is_all or 'ARCAMAX' in sel %}
+                {% set st = r.ARCAMAX_STATUS|lower if r.ARCAMAX_STATUS else 'pending' %}
+                <span class="badge-status {{ st }} has-popup"
+                      data-channel="ARCAMAX"
+                      data-status="{{ r.ARCAMAX_STATUS }}"
+                      data-ftp="{{ r.ARCAMAX_FTP }}"
+                      data-filecount="{{ r.ARCAMAX_FILECOUNT }}"
+                      data-filename="{{ r.ARCAMAX_FILENAME }}">{{ r.ARCAMAX_STATUS or '-' }}</span>
               {% else %}
                 <span class="muted">N/A</span>
               {% endif %}
             </td>
+
+            {# Orange status cell #}
             <td>
-              {% if 'ORANGE' in selected_channels or 'ALL' in selected_channels %}
-                <span class="badge-status {{ (r.ORANGE_STATUS or 'pending')|lower }}">{{ r.ORANGE_STATUS or '-' }}</span>
+              {% if is_all or 'ORANGE' in sel %}
+                {% set st = r.ORANGE_STATUS|lower if r.ORANGE_STATUS else 'pending' %}
+                <span class="badge-status {{ st }} has-popup"
+                      data-channel="ORANGE"
+                      data-status="{{ r.ORANGE_STATUS }}"
+                      data-ftp="{{ r.ORANGE_FTP }}"
+                      data-filecount="{{ r.ORANGE_FILECOUNT }}"
+                      data-filename="{{ r.ORANGE_FILENAME }}">{{ r.ORANGE_STATUS or '-' }}</span>
               {% else %}
                 <span class="muted">N/A</span>
               {% endif %}
             </td>
+
             <td><span class="badge {{ r.overall_status|lower }}">{{ r.overall_status }}</span></td>
             <td>{{ r.username }}</td>
             <td class="muted small">{{ r.created_at }}</td>
           </tr>
-
-          <!-- Change #3: Expandable detail row (hidden by default) -->
-          <tr class="req-detail-row hidden" id="detail-{{ r.request_uuid }}">
-            <td colspan="13">
-              <div class="channel-detail-panel">
-                <div class="channel-cards" id="cards-{{ r.request_uuid }}">
-                  <!-- Populated by JS based on selected channels -->
-                </div>
-              </div>
-            </td>
-          </tr>
-
           {% else %}
           <tr><td colspan="13" class="text-center muted">No requests found.</td></tr>
           {% endfor %}
@@ -158,145 +170,155 @@
   </section>
 </div>
 
+<!-- Hover popup (single shared element, moved by JS) -->
+<div id="statusPopup" class="status-popup" role="tooltip" aria-hidden="true">
+  <div class="popup-header">
+    <span class="popup-channel-name"></span>
+    <span class="popup-status-badge"></span>
+  </div>
+  <div class="popup-body"></div>
+</div>
+
 <style>
-/* Expandable row styles */
-.req-name-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  cursor: pointer;
-  color: var(--color-primary, #01696f);
-  text-decoration: underline dotted;
-  text-underline-offset: 3px;
+/* ── Hover popup ──────────────────────────────────────────── */
+.has-popup { cursor: pointer; position: relative; }
+
+.status-popup {
+  position: fixed;
+  z-index: 9999;
+  background: #fff;
+  border: 1px solid #d4d1ca;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.13);
+  padding: 12px 14px;
+  min-width: 230px;
+  max-width: 340px;
+  font-size: .84rem;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity .15s ease, transform .15s ease;
+  white-space: normal;
 }
-.req-name-toggle:hover strong {
-  text-decoration: underline;
+.status-popup.visible {
+  pointer-events: auto;
+  opacity: 1;
+  transform: translateY(0);
 }
-.toggle-arrow {
-  display: inline-block;
-  font-size: 0.65rem;
-  transition: transform 0.2s ease;
-  color: var(--color-text-muted, #7a7974);
-}
-.req-row.expanded .toggle-arrow {
-  transform: rotate(90deg);
-}
-.req-detail-row.hidden {
-  display: none;
-}
-.req-detail-row td {
-  padding: 0 !important;
-  background: var(--color-surface, #f9f8f5);
-}
-.channel-detail-panel {
-  padding: 0.75rem 1.25rem 1rem;
-  border-top: 1px solid var(--color-divider, #dcd9d5);
-  border-bottom: 2px solid var(--color-primary, #01696f);
-  background: var(--color-surface, #f9f8f5);
-}
-.channel-cards {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  margin-top: 0.5rem;
-}
-.channel-card {
-  background: var(--color-bg, #f7f6f2);
-  border: 1px solid var(--color-border, #d4d1ca);
-  border-radius: 8px;
-  padding: 0.75rem 1rem;
-  min-width: 200px;
-  flex: 1 1 200px;
-  max-width: 300px;
-}
-.channel-card-header {
+.popup-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 0.5rem;
+  margin-bottom: 9px;
+  padding-bottom: 7px;
+  border-bottom: 1px solid #edeae5;
 }
-.channel-card-name {
-  font-weight: 600;
-  font-size: 0.9rem;
+.popup-channel-name {
+  font-weight: 700;
+  font-size: .88rem;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--color-text, #28251d);
+  letter-spacing: .04em;
+  color: #28251d;
 }
-.channel-card-body {
-  font-size: 0.82rem;
-  color: var(--color-text-muted, #7a7974);
+.popup-status-badge {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: .78rem;
+  font-weight: 700;
+}
+.popup-body { color: #6e6b63; }
+.popup-row {
   display: flex;
-  flex-direction: column;
-  gap: 0.3rem;
+  gap: 6px;
+  margin-bottom: 5px;
+  align-items: flex-start;
+  line-height: 1.4;
 }
-.channel-card-body .detail-row {
-  display: flex;
-  gap: 0.4rem;
+.popup-label {
+  font-weight: 600;
+  color: #28251d;
+  min-width: 76px;
+  flex-shrink: 0;
 }
-.channel-card-body .detail-label {
-  font-weight: 500;
-  color: var(--color-text, #28251d);
-  min-width: 80px;
+.popup-value {
+  word-break: break-all;
+  color: #28251d;
 }
-.channel-no-data {
-  color: var(--color-text-faint, #bab9b4);
+.popup-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+  padding: 1px 7px;
+  border-radius: 5px;
+  border: 1px solid #d4d1ca;
+  background: #f7f6f2;
+  cursor: pointer;
+  font-size: .75rem;
+  color: #01696f;
+  font-weight: 600;
+  transition: background .15s;
+  pointer-events: auto;
+}
+.popup-copy-btn:hover { background: #e6f0ef; }
+.popup-copy-btn.copied { color: #437a22; border-color: #437a22; }
+.popup-no-data {
+  color: #bab9b4;
   font-style: italic;
-  font-size: 0.82rem;
-  margin-top: 0.25rem;
+  font-size: .82rem;
+  text-align: center;
+  padding: 4px 0;
 }
-.channel-card.no-data-card {
-  border-style: dashed;
-  opacity: 0.7;
-}
+
+/* Badge status colours — ensure all variants defined */
+.badge-status { display:inline-block; padding:3px 9px; border-radius:999px; font-size:.82rem; font-weight:700; }
+.badge-status.completed  { background:#d8e8d0; color:#225011; }
+.badge-status.completed\ { background:#d8e8d0; color:#225011; }
+.badge-status.failed     { background:#ecd3e3; color:#6b1f50; }
+.badge-status.inprogress { background:#d8ecee; color:#0b4b50; }
+.badge-status.pending    { background:#ebebeb; color:#6e6b63; }
+.badge-status.not_selected { background:#f3f0ec; color:#bab9b4; }
 </style>
 {% endblock %}
 
 {% block scripts %}
 <script>
 // ── Client-side filtering ─────────────────────────────────────────────────────
-const search    = document.getElementById('searchInput');
-const typeF     = document.getElementById('typeFilter');
-const critF     = document.getElementById('criteriaFilter');
-const statF     = document.getElementById('statusFilter');
-const chanF     = document.getElementById('channelFilter');
-const tbody     = document.getElementById('requestsBody');
-const countEl   = document.getElementById('rowCount');
+const search  = document.getElementById('searchInput');
+const typeF   = document.getElementById('typeFilter');
+const critF   = document.getElementById('criteriaFilter');
+const statF   = document.getElementById('statusFilter');
+const chanF   = document.getElementById('channelFilter');
+const tbody   = document.getElementById('requestsBody');
+const countEl = document.getElementById('rowCount');
 
 function filterRows() {
   const q    = search.value.toLowerCase();
   const type = typeF.value.toLowerCase();
   const crit = critF.value.toLowerCase();
   const stat = statF.value.toLowerCase();
-  const chan = chanF.value.toUpperCase();
+  const chan  = chanF.value.toUpperCase();
   let visible = 0;
 
   document.querySelectorAll('.req-row').forEach(tr => {
     const txt      = tr.textContent.toLowerCase();
     const channels = (tr.dataset.channels || '').toUpperCase();
-
-    // Change #2: status filter checks all channel statuses too
-    const allStatuses = [
+    const allStats = [
       tr.dataset.statusGreen,
       tr.dataset.statusBlue,
       tr.dataset.statusArcamax,
       tr.dataset.statusOrange
     ].join(' ').toLowerCase();
 
-    const matchStat = !stat || txt.includes(stat) || allStatuses.includes(stat);
+    const matchStat = !stat || txt.includes(stat) || allStats.includes(stat);
     const matchChan = !chan || channels.includes(chan);
-
     const show = (!q    || txt.includes(q))
               && (!type || txt.includes(type))
               && (!crit || txt.includes(crit))
-              && matchStat
-              && matchChan;
+              && matchStat && matchChan;
 
     tr.style.display = show ? '' : 'none';
-
-    // Also hide/show detail row together
-    const detailRow = document.getElementById('detail-' + tr.dataset.uuid);
-    if (detailRow) detailRow.style.display = show ? (detailRow.classList.contains('hidden') ? 'none' : '') : 'none';
-
     if (show) visible++;
   });
   countEl.textContent = `(${visible})`;
@@ -306,85 +328,154 @@ function filterRows() {
 filterRows();
 
 
-// ── Change #3: Expandable channel detail rows ────────────────────────────────
-const ALL_CHANNELS = ['GREEN', 'BLUE', 'ORANGE', 'ARCAMAX'];
+// ── Hover popup on status badges ────────────────────────────────────────────
+const popup        = document.getElementById('statusPopup');
+const popChanName  = popup.querySelector('.popup-channel-name');
+const popStatus    = popup.querySelector('.popup-status-badge');
+const popBody      = popup.querySelector('.popup-body');
 
-const STATUS_COLOR = {
-  completed:  '#437a22',
-  failed:     '#a12c7b',
-  inprogress: '#006494',
-  pending:    '#7a7974',
-  '':         '#7a7974'
+const STATUS_BADGE_CLASS = {
+  completed:   'completed',
+  failed:      'failed',
+  inprogress:  'inprogress',
+  not_selected:'not_selected',
+  '':          'pending'
 };
 
-function buildChannelCard(tr, channel) {
-  const ch    = channel.toLowerCase();
-  const status     = (tr.dataset['status' + ch.charAt(0).toUpperCase() + ch.slice(1)] || '').toLowerCase();
-  const ftp        = tr.dataset['ftp'        + ch.charAt(0).toUpperCase() + ch.slice(1)] || '';
-  const filecount  = tr.dataset['filecount'  + ch.charAt(0).toUpperCase() + ch.slice(1)] || '';
-  const filename   = tr.dataset['filename'   + ch.charAt(0).toUpperCase() + ch.slice(1)] || '';
+const STATUS_BADGE_COLOR = {
+  completed:   { bg:'#d8e8d0', color:'#225011' },
+  failed:      { bg:'#ecd3e3', color:'#6b1f50' },
+  inprogress:  { bg:'#d8ecee', color:'#0b4b50' },
+  not_selected:{ bg:'#f3f0ec', color:'#bab9b4' },
+  '':          { bg:'#ebebeb', color:'#6e6b63' }
+};
 
+let hideTimer = null;
+
+function showPopup(badge) {
+  clearTimeout(hideTimer);
+
+  const channel  = badge.dataset.channel  || '';
+  const status   = (badge.dataset.status  || '').trim();
+  const ftp      = (badge.dataset.ftp     || '').trim();
+  const filecount= (badge.dataset.filecount|| '').trim();
+  const filename = (badge.dataset.filename || '').trim();
+
+  const statusKey = status.toLowerCase().replace(/ /g,'_');
+  const isCompleted = statusKey === 'completed';
   const hasData = ftp || filecount || filename;
-  const statusColor = STATUS_COLOR[status] || STATUS_COLOR[''];
 
-  const statusBadge = `<span class="badge-status ${status || 'pending'}" style="font-size:0.75rem;padding:2px 7px">${status || '-'}</span>`;
+  // Only show popup if status is set (not empty / N/A)
+  if (!status || status === '-') return;
 
+  // Build header
+  popChanName.textContent = channel;
+  const colors = STATUS_BADGE_COLOR[statusKey] || STATUS_BADGE_COLOR[''];
+  popStatus.textContent = status;
+  popStatus.style.background = colors.bg;
+  popStatus.style.color = colors.color;
+
+  // Build body
   let bodyHtml = '';
-  if (hasData) {
-    bodyHtml = `
-      ${ftp       ? `<div class="detail-row"><span class="detail-label">FTP Path:</span><span>${ftp}</span></div>` : ''}
-      ${filecount ? `<div class="detail-row"><span class="detail-label">File Count:</span><span>${filecount}</span></div>` : ''}
-      ${filename  ? `<div class="detail-row"><span class="detail-label">File Name:</span><span>${filename}</span></div>` : ''}
-    `;
+  if (isCompleted && hasData) {
+    if (ftp) {
+      bodyHtml += `
+        <div class="popup-row">
+          <span class="popup-label">FTP Path</span>
+          <span>
+            <span class="popup-value">${escHtml(ftp)}</span><br>
+            <button class="popup-copy-btn" data-copy="${escAttr(ftp)}">&#x2398; Copy</button>
+          </span>
+        </div>`;
+    }
+    if (filecount) {
+      bodyHtml += `
+        <div class="popup-row">
+          <span class="popup-label">File Count</span>
+          <span class="popup-value">${escHtml(filecount)}</span>
+        </div>`;
+    }
+    if (filename) {
+      bodyHtml += `
+        <div class="popup-row">
+          <span class="popup-label">File Name</span>
+          <span>
+            <span class="popup-value">${escHtml(filename)}</span><br>
+            <button class="popup-copy-btn" data-copy="${escAttr(filename)}">&#x2398; Copy</button>
+          </span>
+        </div>`;
+    }
+    if (!bodyHtml) {
+      bodyHtml = `<div class="popup-no-data">Completed – no file details recorded</div>`;
+    }
+  } else if (isCompleted && !hasData) {
+    bodyHtml = `<div class="popup-no-data">Completed – no file details recorded</div>`;
   } else {
-    bodyHtml = `<div class="channel-no-data">No file details available</div>`;
+    // Not completed: show status info only, no file details
+    bodyHtml = `<div class="popup-no-data">No file details available for this status</div>`;
   }
 
-  return `
-    <div class="channel-card ${hasData ? '' : 'no-data-card'}">
-      <div class="channel-card-header">
-        <span class="channel-card-name">${channel}</span>
-        ${statusBadge}
-      </div>
-      <div class="channel-card-body">${bodyHtml}</div>
-    </div>
-  `;
+  popBody.innerHTML = bodyHtml;
+
+  // Wire copy buttons (inside popup, so pointer-events work)
+  popBody.querySelectorAll('.popup-copy-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const text = btn.dataset.copy;
+      navigator.clipboard.writeText(text).then(() => {
+        btn.textContent = '✔ Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.innerHTML = '&#x2398; Copy'; btn.classList.remove('copied'); }, 1800);
+      }).catch(() => {
+        // Fallback for older browsers
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        btn.textContent = '✔ Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.innerHTML = '&#x2398; Copy'; btn.classList.remove('copied'); }, 1800);
+      });
+    });
+  });
+
+  // Position popup near badge
+  const rect = badge.getBoundingClientRect();
+  popup.style.left = `${Math.min(rect.left + window.scrollX, window.innerWidth - 360)}px`;
+  popup.style.top  = `${rect.bottom + window.scrollY + 6}px`;
+  popup.setAttribute('aria-hidden', 'false');
+  popup.classList.add('visible');
 }
 
-document.querySelectorAll('.req-name-toggle').forEach(toggle => {
-  toggle.addEventListener('click', () => {
-    const tr         = toggle.closest('.req-row');
-    const uuid       = tr.dataset.uuid;
-    const detailRow  = document.getElementById('detail-' + uuid);
-    const cardsEl    = document.getElementById('cards-'  + uuid);
-    const isExpanded = tr.classList.contains('expanded');
+function hidePopup() {
+  hideTimer = setTimeout(() => {
+    popup.classList.remove('visible');
+    popup.setAttribute('aria-hidden', 'true');
+  }, 150);
+}
 
-    if (isExpanded) {
-      tr.classList.remove('expanded');
-      detailRow.classList.add('hidden');
-      detailRow.style.display = 'none';
-      return;
-    }
-
-    // Build channel cards based on selected channels for this request
-    const rawChannels = (tr.dataset.channels || '').trim();
-    let channels = [];
-    if (rawChannels === 'ALL') {
-      channels = ALL_CHANNELS;
-    } else {
-      channels = rawChannels.split(',').map(c => c.trim()).filter(c => ALL_CHANNELS.includes(c));
-    }
-
-    if (channels.length === 0) {
-      cardsEl.innerHTML = '<p class="muted" style="font-size:0.85rem">No channel data found for this request.</p>';
-    } else {
-      cardsEl.innerHTML = channels.map(ch => buildChannelCard(tr, ch)).join('');
-    }
-
-    tr.classList.add('expanded');
-    detailRow.classList.remove('hidden');
-    detailRow.style.display = '';
-  });
+// Attach events to all has-popup badges
+document.querySelectorAll('.has-popup').forEach(badge => {
+  badge.addEventListener('mouseenter', () => showPopup(badge));
+  badge.addEventListener('mouseleave', hidePopup);
+  badge.addEventListener('focus',      () => showPopup(badge));
+  badge.addEventListener('blur',       hidePopup);
 });
+
+// Keep popup open when hovering over it
+popup.addEventListener('mouseenter', () => clearTimeout(hideTimer));
+popup.addEventListener('mouseleave', hidePopup);
+
+// Helpers
+function escHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function escAttr(str) {
+  return str.replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
 </script>
 {% endblock %}
