@@ -6,38 +6,40 @@
 {% block content %}
 <div class="analytics-container">
 
-  <!-- Filters -->
-  <section class="filters-bar">
-    <input type="text" id="searchInput" placeholder="🔍 Search by name, type, criteria..." class="filter-input">
-    <select id="typeFilter" class="filter-select">
-      <option value="">All Types</option>
-      <option value="Suppression">Suppression</option>
-      <option value="Mailing">Mailing</option>
-      <option value="Doordash">Doordash</option>
-    </select>
-    <select id="criteriaFilter" class="filter-select">
-      <option value="">All Criteria</option>
-      <option value="age">Age</option>
-      <option value="state">State</option>
-      <option value="zips">Zips</option>
-    </select>
-    <select id="statusFilter" class="filter-select">
-      <option value="">All Statuses</option>
-      <option value="completed">Completed</option>
-      <option value="failed">Failed</option>
-      <option value="inprogress">In Progress</option>
-      <option value="pending">Pending</option>
-    </select>
-    <select id="channelFilter" class="filter-select">
-      <option value="">All Channels</option>
-      <option value="GREEN">Green</option>
-      <option value="BLUE">Blue</option>
-      <option value="ORANGE">Orange</option>
-      <option value="ARCAMAX">Arcamax</option>
-      <option value="ALL">All (combined)</option>
-    </select>
+  <!-- ── Summary strip ── -->
+  <section class="cards-section" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr))">
+    <div class="metric-card" title="Total requests">
+      <div class="metric-icon">📋</div>
+      <div class="metric-value" id="mc_total">{{ requests|length }}</div>
+      <div class="metric-label">Total</div>
+    </div>
+    <div class="metric-card success">
+      <div class="metric-icon">✅</div>
+      <div class="metric-value" id="mc_completed">{{ requests|selectattr('overall_status','equalto','completed')|list|length }}</div>
+      <div class="metric-label">Completed</div>
+    </div>
+    <div class="metric-card failed">
+      <div class="metric-icon">❌</div>
+      <div class="metric-value" id="mc_failed">{{ requests|selectattr('overall_status','equalto','failed')|list|length }}</div>
+      <div class="metric-label">Failed</div>
+    </div>
+    <div class="metric-card inprogress">
+      <div class="metric-icon">⚙️</div>
+      <div class="metric-value" id="mc_inprog">{{ requests|selectattr('overall_status','equalto','inprogress')|list|length }}</div>
+      <div class="metric-label">In Progress</div>
+    </div>
   </section>
 
+  <!-- ── Filters ── -->
+  <section class="filters-bar">
+    <input  type="text"   id="searchInput"   placeholder="🔍  Search name, value, user..." class="filter-input">
+    <select id="typeFilter"     class="filter-select"><option value="">All Types</option><option>Suppression</option><option>Mailing</option><option>Doordash</option></select>
+    <select id="criteriaFilter" class="filter-select"><option value="">All Criteria</option><option value="age">Age</option><option value="state">State</option><option value="zips">Zips</option></select>
+    <select id="statusFilter"   class="filter-select"><option value="">All Statuses</option><option value="completed">Completed</option><option value="failed">Failed</option><option value="inprogress">In Progress</option></select>
+    <select id="channelFilter"  class="filter-select"><option value="">All Channels</option><option value="GREEN">Green</option><option value="BLUE">Blue</option><option value="ORANGE">Orange</option><option value="ARCAMAX">Arcamax</option><option value="ALL">ALL</option></select>
+  </section>
+
+  <!-- ── Table ── -->
   <section class="table-section">
     <div class="table-header">
       <h3>All Requests <span id="rowCount" class="row-count"></span></h3>
@@ -47,16 +49,17 @@
       <table class="requests-table" id="requestsTable">
         <thead>
           <tr>
+            <th>#</th>
             <th>Request Name</th>
             <th>Type</th>
             <th>Criteria</th>
             <th>Value</th>
             <th>Comp</th>
             <th>Channel</th>
-            <th>Green</th>
-            <th>Blue</th>
-            <th>Arcamax</th>
-            <th>Orange</th>
+            <th>🟢 Green</th>
+            <th>🔵 Blue</th>
+            <th>⚡ Arcamax</th>
+            <th>🟠 Orange</th>
             <th>Overall</th>
             <th>Created By</th>
             <th>Created At</th>
@@ -86,396 +89,243 @@
               data-filename-arcamax="{{ r.ARCAMAX_FILENAME }}"
               data-filename-orange="{{ r.ORANGE_FILENAME }}">
 
-            <td><strong>{{ r.request_name }}</strong></td>
+            <td class="muted small" style="font-variant-numeric:tabular-nums">{{ loop.index }}</td>
+            <td><strong title="{{ r.request_name }}">{{ r.request_name }}</strong></td>
             <td><span class="badge-type {{ r.request_type|lower }}">{{ r.request_type }}</span></td>
             <td><span class="badge-criteria">{{ r.criteria_type|upper }}</span></td>
-            <td class="muted small">{{ r.criteria_value or '-' }}</td>
+            <td class="muted small">{{ r.criteria_value or '—' }}</td>
             <td class="muted small">{{ r.comp_type }}</td>
             <td>
-              {% for ch in sel %}
-                <span class="tag">{{ ch.strip() }}</span>
-              {% endfor %}
+              {% for ch in sel %}<span class="tag">{{ ch.strip() }}</span>{% endfor %}
             </td>
 
-            {# Green status cell #}
+            {# Green #}
             <td>
               {% if is_all or 'GREEN' in sel %}
                 {% set st = r.GREEN_STATUS|lower if r.GREEN_STATUS else 'pending' %}
                 <span class="badge-status {{ st }} has-popup"
-                      data-channel="GREEN"
-                      data-status="{{ r.GREEN_STATUS }}"
-                      data-ftp="{{ r.GREEN_FTP }}"
-                      data-filecount="{{ r.GREEN_FILECOUNT }}"
-                      data-filename="{{ r.GREEN_FILENAME }}">{{ r.GREEN_STATUS or '-' }}</span>
-              {% else %}
-                <span class="muted">N/A</span>
-              {% endif %}
+                      data-channel="GREEN" data-status="{{ r.GREEN_STATUS }}"
+                      data-ftp="{{ r.GREEN_FTP }}" data-filecount="{{ r.GREEN_FILECOUNT }}"
+                      data-filename="{{ r.GREEN_FILENAME }}"
+                      tabindex="0" aria-label="Green status: {{ r.GREEN_STATUS or 'pending' }}">
+                  {{ r.GREEN_STATUS or '—' }}
+                </span>
+              {% else %}<span class="muted small">N/A</span>{% endif %}
             </td>
 
-            {# Blue status cell #}
+            {# Blue #}
             <td>
               {% if is_all or 'BLUE' in sel %}
                 {% set st = r.BLUE_STATUS|lower if r.BLUE_STATUS else 'pending' %}
                 <span class="badge-status {{ st }} has-popup"
-                      data-channel="BLUE"
-                      data-status="{{ r.BLUE_STATUS }}"
-                      data-ftp="{{ r.BLUE_FTP }}"
-                      data-filecount="{{ r.BLUE_FILECOUNT }}"
-                      data-filename="{{ r.BLUE_FILENAME }}">{{ r.BLUE_STATUS or '-' }}</span>
-              {% else %}
-                <span class="muted">N/A</span>
-              {% endif %}
+                      data-channel="BLUE" data-status="{{ r.BLUE_STATUS }}"
+                      data-ftp="{{ r.BLUE_FTP }}" data-filecount="{{ r.BLUE_FILECOUNT }}"
+                      data-filename="{{ r.BLUE_FILENAME }}"
+                      tabindex="0" aria-label="Blue status: {{ r.BLUE_STATUS or 'pending' }}">
+                  {{ r.BLUE_STATUS or '—' }}
+                </span>
+              {% else %}<span class="muted small">N/A</span>{% endif %}
             </td>
 
-            {# Arcamax status cell #}
+            {# Arcamax #}
             <td>
               {% if is_all or 'ARCAMAX' in sel %}
                 {% set st = r.ARCAMAX_STATUS|lower if r.ARCAMAX_STATUS else 'pending' %}
                 <span class="badge-status {{ st }} has-popup"
-                      data-channel="ARCAMAX"
-                      data-status="{{ r.ARCAMAX_STATUS }}"
-                      data-ftp="{{ r.ARCAMAX_FTP }}"
-                      data-filecount="{{ r.ARCAMAX_FILECOUNT }}"
-                      data-filename="{{ r.ARCAMAX_FILENAME }}">{{ r.ARCAMAX_STATUS or '-' }}</span>
-              {% else %}
-                <span class="muted">N/A</span>
-              {% endif %}
+                      data-channel="ARCAMAX" data-status="{{ r.ARCAMAX_STATUS }}"
+                      data-ftp="{{ r.ARCAMAX_FTP }}" data-filecount="{{ r.ARCAMAX_FILECOUNT }}"
+                      data-filename="{{ r.ARCAMAX_FILENAME }}"
+                      tabindex="0" aria-label="Arcamax status: {{ r.ARCAMAX_STATUS or 'pending' }}">
+                  {{ r.ARCAMAX_STATUS or '—' }}
+                </span>
+              {% else %}<span class="muted small">N/A</span>{% endif %}
             </td>
 
-            {# Orange status cell #}
+            {# Orange #}
             <td>
               {% if is_all or 'ORANGE' in sel %}
                 {% set st = r.ORANGE_STATUS|lower if r.ORANGE_STATUS else 'pending' %}
                 <span class="badge-status {{ st }} has-popup"
-                      data-channel="ORANGE"
-                      data-status="{{ r.ORANGE_STATUS }}"
-                      data-ftp="{{ r.ORANGE_FTP }}"
-                      data-filecount="{{ r.ORANGE_FILECOUNT }}"
-                      data-filename="{{ r.ORANGE_FILENAME }}">{{ r.ORANGE_STATUS or '-' }}</span>
-              {% else %}
-                <span class="muted">N/A</span>
-              {% endif %}
+                      data-channel="ORANGE" data-status="{{ r.ORANGE_STATUS }}"
+                      data-ftp="{{ r.ORANGE_FTP }}" data-filecount="{{ r.ORANGE_FILECOUNT }}"
+                      data-filename="{{ r.ORANGE_FILENAME }}"
+                      tabindex="0" aria-label="Orange status: {{ r.ORANGE_STATUS or 'pending' }}">
+                  {{ r.ORANGE_STATUS or '—' }}
+                </span>
+              {% else %}<span class="muted small">N/A</span>{% endif %}
             </td>
 
-            <td><span class="badge {{ r.overall_status|lower }}">{{ r.overall_status }}</span></td>
+            <td>
+              <span class="badge {{ r.overall_status|lower }}">
+                {% if r.overall_status == 'completed' %}✓{% elif r.overall_status == 'failed' %}✗{% elif r.overall_status == 'inprogress' %}⟳{% endif %}
+                {{ r.overall_status }}
+              </span>
+            </td>
             <td>{{ r.username }}</td>
-            <td class="muted small">{{ r.created_at }}</td>
+            <td class="muted small" style="font-variant-numeric:tabular-nums">{{ r.created_at }}</td>
           </tr>
           {% else %}
-          <tr><td colspan="13" class="text-center muted">No requests found.</td></tr>
+          <tr><td colspan="14" class="text-center muted" style="padding:40px">
+            No requests found. <a href="{{ url_for('new_request') }}" style="color:var(--primary);font-weight:700">Create one →</a>
+          </td></tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
   </section>
+
 </div>
 
-<!-- Hover popup (single shared element, moved by JS) -->
+<!-- Shared hover popup -->
 <div id="statusPopup" class="status-popup" role="tooltip" aria-hidden="true">
   <div class="popup-header">
     <span class="popup-channel-name"></span>
-    <span class="popup-status-badge"></span>
+    <span class="popup-status-badge" style="display:inline-block;padding:2px 9px;border-radius:999px;font-size:.75rem;font-weight:700;"></span>
   </div>
   <div class="popup-body"></div>
 </div>
-
-<style>
-/* ── Hover popup ──────────────────────────────────────────── */
-.has-popup { cursor: pointer; position: relative; }
-
-.status-popup {
-  position: fixed;
-  z-index: 9999;
-  background: #fff;
-  border: 1px solid #d4d1ca;
-  border-radius: 10px;
-  box-shadow: 0 8px 24px rgba(0,0,0,.13);
-  padding: 12px 14px;
-  min-width: 230px;
-  max-width: 340px;
-  font-size: .84rem;
-  pointer-events: none;
-  opacity: 0;
-  transform: translateY(4px);
-  transition: opacity .15s ease, transform .15s ease;
-  white-space: normal;
-}
-.status-popup.visible {
-  pointer-events: auto;
-  opacity: 1;
-  transform: translateY(0);
-}
-.popup-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 9px;
-  padding-bottom: 7px;
-  border-bottom: 1px solid #edeae5;
-}
-.popup-channel-name {
-  font-weight: 700;
-  font-size: .88rem;
-  text-transform: uppercase;
-  letter-spacing: .04em;
-  color: #28251d;
-}
-.popup-status-badge {
-  display: inline-block;
-  padding: 2px 9px;
-  border-radius: 999px;
-  font-size: .78rem;
-  font-weight: 700;
-}
-.popup-body { color: #6e6b63; }
-.popup-row {
-  display: flex;
-  gap: 6px;
-  margin-bottom: 5px;
-  align-items: flex-start;
-  line-height: 1.4;
-}
-.popup-label {
-  font-weight: 600;
-  color: #28251d;
-  min-width: 76px;
-  flex-shrink: 0;
-}
-.popup-value {
-  word-break: break-all;
-  color: #28251d;
-}
-.popup-copy-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  margin-top: 2px;
-  padding: 1px 7px;
-  border-radius: 5px;
-  border: 1px solid #d4d1ca;
-  background: #f7f6f2;
-  cursor: pointer;
-  font-size: .75rem;
-  color: #01696f;
-  font-weight: 600;
-  transition: background .15s;
-  pointer-events: auto;
-}
-.popup-copy-btn:hover { background: #e6f0ef; }
-.popup-copy-btn.copied { color: #437a22; border-color: #437a22; }
-.popup-no-data {
-  color: #bab9b4;
-  font-style: italic;
-  font-size: .82rem;
-  text-align: center;
-  padding: 4px 0;
-}
-
-/* Badge status colours — ensure all variants defined */
-.badge-status { display:inline-block; padding:3px 9px; border-radius:999px; font-size:.82rem; font-weight:700; }
-.badge-status.completed  { background:#d8e8d0; color:#225011; }
-.badge-status.completed\ { background:#d8e8d0; color:#225011; }
-.badge-status.failed     { background:#ecd3e3; color:#6b1f50; }
-.badge-status.inprogress { background:#d8ecee; color:#0b4b50; }
-.badge-status.pending    { background:#ebebeb; color:#6e6b63; }
-.badge-status.not_selected { background:#f3f0ec; color:#bab9b4; }
-</style>
 {% endblock %}
 
 {% block scripts %}
 <script>
-// ── Client-side filtering ─────────────────────────────────────────────────────
-const search  = document.getElementById('searchInput');
-const typeF   = document.getElementById('typeFilter');
-const critF   = document.getElementById('criteriaFilter');
-const statF   = document.getElementById('statusFilter');
-const chanF   = document.getElementById('channelFilter');
-const tbody   = document.getElementById('requestsBody');
-const countEl = document.getElementById('rowCount');
+// ── Filtering ──────────────────────────────────────────────────────
+const searchEl = document.getElementById('searchInput');
+const typeEl   = document.getElementById('typeFilter');
+const critEl   = document.getElementById('criteriaFilter');
+const statEl   = document.getElementById('statusFilter');
+const chanEl   = document.getElementById('channelFilter');
+const countEl  = document.getElementById('rowCount');
 
 function filterRows() {
-  const q    = search.value.toLowerCase();
-  const type = typeF.value.toLowerCase();
-  const crit = critF.value.toLowerCase();
-  const stat = statF.value.toLowerCase();
-  const chan  = chanF.value.toUpperCase();
-  let visible = 0;
-
+  const q    = searchEl.value.toLowerCase();
+  const type = typeEl.value.toLowerCase();
+  const crit = critEl.value.toLowerCase();
+  const stat = statEl.value.toLowerCase();
+  const chan  = chanEl.value.toUpperCase();
+  let n = 0;
   document.querySelectorAll('.req-row').forEach(tr => {
-    const txt      = tr.textContent.toLowerCase();
-    const channels = (tr.dataset.channels || '').toUpperCase();
-    const allStats = [
-      tr.dataset.statusGreen,
-      tr.dataset.statusBlue,
-      tr.dataset.statusArcamax,
-      tr.dataset.statusOrange
-    ].join(' ').toLowerCase();
-
-    const matchStat = !stat || txt.includes(stat) || allStats.includes(stat);
-    const matchChan = !chan || channels.includes(chan);
-    const show = (!q    || txt.includes(q))
-              && (!type || txt.includes(type))
-              && (!crit || txt.includes(crit))
-              && matchStat && matchChan;
-
+    const txt = tr.textContent.toLowerCase();
+    const ch  = (tr.dataset.channels || '').toUpperCase();
+    const allSt = [tr.dataset.statusGreen, tr.dataset.statusBlue,
+                   tr.dataset.statusArcamax, tr.dataset.statusOrange].join(' ').toLowerCase();
+    const show =
+      (!q    || txt.includes(q))
+      && (!type || txt.includes(type))
+      && (!crit || txt.includes(crit))
+      && (!stat || txt.includes(stat) || allSt.includes(stat))
+      && (!chan  || ch.includes(chan));
     tr.style.display = show ? '' : 'none';
-    if (show) visible++;
+    if (show) n++;
   });
-  countEl.textContent = `(${visible})`;
+  countEl.textContent = `(${n})`;
 }
-
-[search, typeF, critF, statF, chanF].forEach(el => el.addEventListener('input', filterRows));
+[searchEl, typeEl, critEl, statEl, chanEl].forEach(el => el.addEventListener('input', filterRows));
 filterRows();
 
+// ── Hover Popup ────────────────────────────────────────────────────
+const popup   = document.getElementById('statusPopup');
+const pChan   = popup.querySelector('.popup-channel-name');
+const pBadge  = popup.querySelector('.popup-status-badge');
+const pBody   = popup.querySelector('.popup-body');
 
-// ── Hover popup on status badges ────────────────────────────────────────────
-const popup        = document.getElementById('statusPopup');
-const popChanName  = popup.querySelector('.popup-channel-name');
-const popStatus    = popup.querySelector('.popup-status-badge');
-const popBody      = popup.querySelector('.popup-body');
-
-const STATUS_BADGE_CLASS = {
-  completed:   'completed',
-  failed:      'failed',
-  inprogress:  'inprogress',
-  not_selected:'not_selected',
-  '':          'pending'
+const BADGE_STYLES = {
+  completed:    { bg:'#e8f5e9', color:'#2e7d32' },
+  failed:       { bg:'#fce4ec', color:'#8e1a4a' },
+  inprogress:   { bg:'#e3f2fd', color:'#0b5394' },
+  not_selected: { bg:'#f3f0ec', color:'#b5b3ae' },
+  '':           { bg:'#f3f0ec', color:'#6b6860' }
 };
 
-const STATUS_BADGE_COLOR = {
-  completed:   { bg:'#d8e8d0', color:'#225011' },
-  failed:      { bg:'#ecd3e3', color:'#6b1f50' },
-  inprogress:  { bg:'#d8ecee', color:'#0b4b50' },
-  not_selected:{ bg:'#f3f0ec', color:'#bab9b4' },
-  '':          { bg:'#ebebeb', color:'#6e6b63' }
+const CHAN_COLORS = {
+  GREEN:   '#2e7d32',
+  BLUE:    '#0b5394',
+  ORANGE:  '#b45309',
+  ARCAMAX: '#6b21a8'
 };
 
-let hideTimer = null;
+let hideTimer;
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function escA(s){ return String(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
 function showPopup(badge) {
   clearTimeout(hideTimer);
+  const channel   = badge.dataset.channel || '';
+  const status    = (badge.dataset.status   || '').trim();
+  const ftp       = (badge.dataset.ftp      || '').trim();
+  const filecount = (badge.dataset.filecount|| '').trim();
+  const filename  = (badge.dataset.filename || '').trim();
 
-  const channel  = badge.dataset.channel  || '';
-  const status   = (badge.dataset.status  || '').trim();
-  const ftp      = (badge.dataset.ftp     || '').trim();
-  const filecount= (badge.dataset.filecount|| '').trim();
-  const filename = (badge.dataset.filename || '').trim();
-
-  const statusKey = status.toLowerCase().replace(/ /g,'_');
-  const isCompleted = statusKey === 'completed';
-  const hasData = ftp || filecount || filename;
-
-  // Only show popup if status is set (not empty / N/A)
   if (!status || status === '-') return;
 
-  // Build header
-  popChanName.textContent = channel;
-  const colors = STATUS_BADGE_COLOR[statusKey] || STATUS_BADGE_COLOR[''];
-  popStatus.textContent = status;
-  popStatus.style.background = colors.bg;
-  popStatus.style.color = colors.color;
+  const key = status.toLowerCase().replace(/ /g,'_');
+  const isCompleted = key === 'completed';
 
-  // Build body
-  let bodyHtml = '';
-  if (isCompleted && hasData) {
-    if (ftp) {
-      bodyHtml += `
-        <div class="popup-row">
-          <span class="popup-label">FTP Path</span>
-          <span>
-            <span class="popup-value">${escHtml(ftp)}</span><br>
-            <button class="popup-copy-btn" data-copy="${escAttr(ftp)}">&#x2398; Copy</button>
-          </span>
-        </div>`;
-    }
-    if (filecount) {
-      bodyHtml += `
-        <div class="popup-row">
-          <span class="popup-label">File Count</span>
-          <span class="popup-value">${escHtml(filecount)}</span>
-        </div>`;
-    }
-    if (filename) {
-      bodyHtml += `
-        <div class="popup-row">
-          <span class="popup-label">File Name</span>
-          <span>
-            <span class="popup-value">${escHtml(filename)}</span><br>
-            <button class="popup-copy-btn" data-copy="${escAttr(filename)}">&#x2398; Copy</button>
-          </span>
-        </div>`;
-    }
-    if (!bodyHtml) {
-      bodyHtml = `<div class="popup-no-data">Completed – no file details recorded</div>`;
-    }
-  } else if (isCompleted && !hasData) {
-    bodyHtml = `<div class="popup-no-data">Completed – no file details recorded</div>`;
+  // Header
+  pChan.textContent = channel;
+  pChan.style.color = CHAN_COLORS[channel] || '#1a1814';
+  const s = BADGE_STYLES[key] || BADGE_STYLES[''];
+  pBadge.textContent = status;
+  pBadge.style.background = s.bg;
+  pBadge.style.color = s.color;
+
+  // Body
+  let html = '';
+  if (isCompleted && (ftp || filecount || filename)) {
+    if (ftp) html += `<div class="popup-row"><span class="popup-label">FTP Path</span><span><span class="popup-value">${esc(ftp)}</span><br><button class="popup-copy-btn" data-copy="${escA(ftp)}">⎘ Copy</button></span></div>`;
+    if (filecount) html += `<div class="popup-row"><span class="popup-label">File Count</span><span class="popup-value">${esc(filecount)}</span></div>`;
+    if (filename)  html += `<div class="popup-row"><span class="popup-label">File Name</span><span><span class="popup-value">${esc(filename)}</span><br><button class="popup-copy-btn" data-copy="${escA(filename)}">⎘ Copy</button></span></div>`;
+  } else if (isCompleted) {
+    html = `<div class="popup-no-data">Completed — no file details recorded</div>`;
   } else {
-    // Not completed: show status info only, no file details
-    bodyHtml = `<div class="popup-no-data">No file details available for this status</div>`;
+    html = `<div class="popup-no-data">No file details for this status</div>`;
   }
+  pBody.innerHTML = html;
 
-  popBody.innerHTML = bodyHtml;
-
-  // Wire copy buttons (inside popup, so pointer-events work)
-  popBody.querySelectorAll('.popup-copy-btn').forEach(btn => {
-    btn.addEventListener('click', (e) => {
+  pBody.querySelectorAll('.popup-copy-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
       e.stopPropagation();
-      const text = btn.dataset.copy;
-      navigator.clipboard.writeText(text).then(() => {
+      const txt = btn.dataset.copy;
+      navigator.clipboard.writeText(txt).then(() => {
         btn.textContent = '✔ Copied!';
         btn.classList.add('copied');
-        setTimeout(() => { btn.innerHTML = '&#x2398; Copy'; btn.classList.remove('copied'); }, 1800);
+        setTimeout(() => { btn.innerHTML = '⎘ Copy'; btn.classList.remove('copied'); }, 1800);
       }).catch(() => {
-        // Fallback for older browsers
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.select();
+        const ta = Object.assign(document.createElement('textarea'), { value: txt });
+        Object.assign(ta.style, { position:'fixed', opacity:'0' });
+        document.body.append(ta); ta.select();
         document.execCommand('copy');
-        document.body.removeChild(ta);
+        ta.remove();
         btn.textContent = '✔ Copied!';
         btn.classList.add('copied');
-        setTimeout(() => { btn.innerHTML = '&#x2398; Copy'; btn.classList.remove('copied'); }, 1800);
+        setTimeout(() => { btn.innerHTML = '⎘ Copy'; btn.classList.remove('copied'); }, 1800);
       });
     });
   });
 
-  // Position popup near badge
-  const rect = badge.getBoundingClientRect();
-  popup.style.left = `${Math.min(rect.left + window.scrollX, window.innerWidth - 360)}px`;
-  popup.style.top  = `${rect.bottom + window.scrollY + 6}px`;
-  popup.setAttribute('aria-hidden', 'false');
+  // Position
+  const r = badge.getBoundingClientRect();
+  const left = Math.min(r.left + window.scrollX, window.innerWidth - 370);
+  popup.style.left = `${Math.max(left, 8)}px`;
+  popup.style.top  = `${r.bottom + window.scrollY + 6}px`;
+  popup.setAttribute('aria-hidden','false');
   popup.classList.add('visible');
 }
 
 function hidePopup() {
   hideTimer = setTimeout(() => {
     popup.classList.remove('visible');
-    popup.setAttribute('aria-hidden', 'true');
-  }, 150);
+    popup.setAttribute('aria-hidden','true');
+  }, 140);
 }
 
-// Attach events to all has-popup badges
-document.querySelectorAll('.has-popup').forEach(badge => {
-  badge.addEventListener('mouseenter', () => showPopup(badge));
-  badge.addEventListener('mouseleave', hidePopup);
-  badge.addEventListener('focus',      () => showPopup(badge));
-  badge.addEventListener('blur',       hidePopup);
+document.querySelectorAll('.has-popup').forEach(b => {
+  b.addEventListener('mouseenter', () => showPopup(b));
+  b.addEventListener('mouseleave', hidePopup);
+  b.addEventListener('focus',      () => showPopup(b));
+  b.addEventListener('blur',       hidePopup);
 });
-
-// Keep popup open when hovering over it
 popup.addEventListener('mouseenter', () => clearTimeout(hideTimer));
 popup.addEventListener('mouseleave', hidePopup);
-
-// Helpers
-function escHtml(str) {
-  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-function escAttr(str) {
-  return str.replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-}
 </script>
 {% endblock %}

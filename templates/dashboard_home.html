@@ -6,63 +6,85 @@
 {% block content %}
 <div class="analytics-container">
 
-  <!-- Metric Cards -->
+  <!-- ── Metric Cards ── -->
   <section class="cards-section">
-    <div class="metric-card">
-      <div class="metric-value" id="totalRequests">{{ stats.total }}</div>
+    <div class="metric-card" title="Total requests submitted">
+      <div class="metric-icon">📦</div>
+      <div class="metric-value" id="totalVal">{{ stats.total }}</div>
       <div class="metric-label">Total Requests</div>
+      <div class="metric-sublabel">All time</div>
+      <div class="metric-progress">
+        <div class="progress-track"><div class="progress-fill" style="width:100%"></div></div>
+      </div>
     </div>
-    <div class="metric-card success">
-      <div class="metric-value" id="completedCount">{{ stats.completed }}</div>
+
+    <div class="metric-card success" title="Successfully completed requests">
+      <div class="metric-icon">✅</div>
+      <div class="metric-value" id="compVal">{{ stats.completed }}</div>
       <div class="metric-label">Completed</div>
-      <div class="metric-sublabel">{{ stats.completed_pct }}%</div>
+      <div class="metric-sublabel">{{ stats.completed_pct }}% success rate</div>
+      <div class="metric-progress">
+        <div class="progress-track"><div class="progress-fill" style="width:{{ stats.completed_pct }}%"></div></div>
+      </div>
     </div>
-    <div class="metric-card failed">
-      <div class="metric-value" id="failedCount">{{ stats.failed }}</div>
+
+    <div class="metric-card failed" title="Failed requests">
+      <div class="metric-icon">❌</div>
+      <div class="metric-value" id="failVal">{{ stats.failed }}</div>
       <div class="metric-label">Failed</div>
-      <div class="metric-sublabel">{{ stats.failed_pct }}%</div>
+      <div class="metric-sublabel">{{ stats.failed_pct }}% failure rate</div>
+      <div class="metric-progress">
+        <div class="progress-track"><div class="progress-fill" style="width:{{ stats.failed_pct }}%"></div></div>
+      </div>
     </div>
-    <div class="metric-card inprogress">
+
+    <div class="metric-card inprogress" title="Currently running">
+      <div class="metric-icon">⚙️</div>
       <div class="metric-value">{{ stats.inprogress }}</div>
       <div class="metric-label">In Progress</div>
+      <div class="metric-sublabel">Running now</div>
+      <div class="metric-progress">
+        <div class="progress-track"><div class="progress-fill" style="width:{{ [stats.inprogress * 10, 100]|min }}%"></div></div>
+      </div>
     </div>
   </section>
 
-  <!-- Charts -->
+  <!-- ── Charts ── -->
   <section class="charts-section">
     <div class="chart-card">
       <h3>Requests by Type</h3>
-      <canvas id="requestsTypeChart"></canvas>
+      <canvas id="requestsTypeChart" height="220"></canvas>
     </div>
     <div class="chart-card">
-      <h3>Requests by Criteria</h3>
-      <canvas id="requestsCriteriaChart"></canvas>
+      <h3>Criteria Distribution</h3>
+      <canvas id="requestsCriteriaChart" height="220"></canvas>
     </div>
     <div class="chart-card">
-      <h3>Success vs Failed by Request Type</h3>
-      <canvas id="successFailureChart"></canvas>
+      <h3>Success vs Failed by Type</h3>
+      <canvas id="successFailureChart" height="220"></canvas>
     </div>
     <div class="chart-card">
       <h3>Channel Distribution</h3>
-      <canvas id="channelChart"></canvas>
+      <canvas id="channelChart" height="220"></canvas>
     </div>
   </section>
 
-  <!-- Recent Requests -->
+  <!-- ── Recent Requests Table ── -->
   <section class="table-section">
     <div class="table-header">
-      <h3>Recent Requests</h3>
+      <h3>Recent Requests <span class="row-count" id="recentCount"></span></h3>
       <a href="{{ url_for('requests_list') }}" class="view-all-btn">View All →</a>
     </div>
     <div class="table-scroll">
-      <table class="requests-table">
+      <table class="requests-table" id="recentTable">
         <thead>
           <tr>
+            <th>#</th>
             <th>Request Name</th>
             <th>Type</th>
             <th>Criteria</th>
             <th>Channel</th>
-            <th>Status</th>
+            <th>Overall Status</th>
             <th>Created By</th>
             <th>Created At</th>
           </tr>
@@ -70,16 +92,32 @@
         <tbody>
           {% for r in recent %}
           <tr>
+            <td class="muted small" style="font-variant-numeric:tabular-nums">{{ loop.index }}</td>
             <td><strong>{{ r.request_name }}</strong></td>
             <td><span class="badge-type {{ r.request_type|lower }}">{{ r.request_type }}</span></td>
             <td><span class="badge-criteria">{{ r.criteria_type|upper }}</span></td>
-            <td>{{ r.channel }}</td>
-            <td><span class="badge {{ r.overall_status|lower }}">{{ r.overall_status }}</span></td>
+            <td>
+              {% for ch in r.channel.split(',') %}
+                <span class="tag">{{ ch.strip() }}</span>
+              {% endfor %}
+            </td>
+            <td>
+              <span class="badge {{ r.overall_status|lower }}"
+                    title="Overall job status">
+                {% if r.overall_status == 'completed' %}✓{% elif r.overall_status == 'failed' %}✗{% elif r.overall_status == 'inprogress' %}⟳{% endif %}
+                {{ r.overall_status }}
+              </span>
+            </td>
             <td>{{ r.username }}</td>
-            <td>{{ r.created_at }}</td>
+            <td class="muted small" style="font-variant-numeric:tabular-nums">{{ r.created_at }}</td>
           </tr>
           {% else %}
-          <tr><td colspan="7" class="text-center muted">No requests yet. <a href="{{ url_for('new_request') }}">Create one →</a></td></tr>
+          <tr>
+            <td colspan="8" class="text-center muted" style="padding:32px">
+              No requests yet.
+              <a href="{{ url_for('new_request') }}" style="color:var(--primary);font-weight:700">Create one →</a>
+            </td>
+          </tr>
           {% endfor %}
         </tbody>
       </table>
@@ -92,41 +130,70 @@
 {% block scripts %}
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
-const statsData = {{ chart_data | tojson }};
+const D = {{ chart_data | tojson }};
+const COLORS = ['#01696f','#4fd1c5','#0c4e54','#81e6d9','#2bc0b4','#0b4b50'];
+const FAIL_C = '#c0392b';
+const OK_C   = '#27ae60';
 
-function makeChart(id, type, labels, datasets, opts={}) {
+Chart.defaults.font.family = "'Satoshi', sans-serif";
+Chart.defaults.font.size   = 12;
+
+function makeChart(id, type, labels, datasets, extra={}) {
   const ctx = document.getElementById(id);
   if (!ctx) return;
   new Chart(ctx.getContext('2d'), {
     type,
     data: { labels, datasets },
-    options: { responsive: true, plugins: { legend: { position: 'bottom' } }, ...opts }
+    options: {
+      responsive: true,
+      animation: { duration: 700, easing: 'easeOutQuart' },
+      plugins: {
+        legend: { position: 'bottom', labels: { padding: 16, usePointStyle: true, pointStyleWidth: 10 } },
+        tooltip: {
+          backgroundColor: '#1a1814',
+          titleColor: '#fff',
+          bodyColor: 'rgba(255,255,255,.8)',
+          padding: 12,
+          cornerRadius: 8,
+          boxPadding: 4
+        }
+      },
+      ...extra
+    }
   });
 }
 
-makeChart('requestsTypeChart', 'pie',
-  statsData.type_labels,
-  [{ data: statsData.type_values, backgroundColor: ['#01696f','#36A2EB','#FFCE56','#FF6384'], borderWidth: 2, borderColor: '#fff' }]
+makeChart('requestsTypeChart', 'doughnut',
+  D.type_labels,
+  [{ data: D.type_values, backgroundColor: COLORS, borderWidth: 3, borderColor: '#fff', hoverOffset: 8 }]
 );
 
-makeChart('requestsCriteriaChart', 'doughnut',
-  statsData.criteria_labels,
-  [{ data: statsData.criteria_values, backgroundColor: ['#FF6384','#36A2EB','#FFCE56'], borderWidth: 2, borderColor: '#fff' }]
+makeChart('requestsCriteriaChart', 'pie',
+  D.criteria_labels,
+  [{ data: D.criteria_values, backgroundColor: ['#e17055','#0984e3','#fdcb6e','#00b894'], borderWidth: 3, borderColor: '#fff', hoverOffset: 8 }]
 );
 
 makeChart('successFailureChart', 'bar',
-  statsData.type_labels,
+  D.type_labels,
   [
-    { label: 'Completed', data: statsData.type_completed, backgroundColor: '#4CAF50', borderRadius: 4 },
-    { label: 'Failed',    data: statsData.type_failed,    backgroundColor: '#F44336', borderRadius: 4 }
+    { label: 'Completed', data: D.type_completed, backgroundColor: OK_C,   borderRadius: 6, borderSkipped: false },
+    { label: 'Failed',    data: D.type_failed,    backgroundColor: FAIL_C, borderRadius: 6, borderSkipped: false }
   ],
-  { scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } } }
+  { scales: { x: { grid: { display: false } }, y: { beginAtZero: true, ticks: { stepSize: 1 }, grid: { color: 'rgba(0,0,0,.05)' } } } }
 );
 
 makeChart('channelChart', 'bar',
-  statsData.channel_labels,
-  [{ label: 'Requests', data: statsData.channel_values, backgroundColor: '#01696f', borderRadius: 4 }],
-  { indexAxis: 'y', scales: { x: { beginAtZero: true, ticks: { stepSize: 1 } } } }
+  D.channel_labels,
+  [{ label: 'Requests', data: D.channel_values, backgroundColor: COLORS, borderRadius: 6, borderSkipped: false }],
+  { indexAxis: 'y', scales: { x: { beginAtZero: true, ticks: { stepSize: 1 }, grid: { color: 'rgba(0,0,0,.05)' } }, y: { grid: { display: false } } } }
 );
+
+// Animate row count
+const tbody = document.querySelector('#recentTable tbody');
+const rowCountEl = document.getElementById('recentCount');
+if (tbody && rowCountEl) {
+  const n = tbody.querySelectorAll('tr').length;
+  rowCountEl.textContent = `(${n})`;
+}
 </script>
 {% endblock %}
