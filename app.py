@@ -132,6 +132,10 @@ def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
 
+            # ── Migrate existing installs ───────────────────────────────────
+            # Fix channel: ENUM -> VARCHAR so 'GREEN,ORANGE' is stored correctly
+            _modify_column_if_enum(cur, "requests", "channel",
+                                   "VARCHAR(100) NOT NULL DEFAULT 'ALL'")
 
             _add_column_if_missing(cur, "requests", "APPTNESS_STATUS", "VARCHAR(50) NULL")
             _add_column_if_missing(cur, "requests", "GREEN_FTP",        "VARCHAR(500) NULL")
@@ -182,6 +186,35 @@ def _add_column_if_missing(cur, table, column, column_def):
     except Exception as exc:
         if "1060" not in str(exc) and "Duplicate column" not in str(exc):
             raise
+
+
+def _modify_column_if_enum(cur, table, column, new_def):
+    """
+    Check whether `column` in `table` is currently an ENUM type.
+    If so, ALTER it to the new definition (VARCHAR).
+    This is idempotent — safe to call on every startup.
+    """
+    try:
+        cur.execute(
+            """
+            SELECT DATA_TYPE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = %s
+              AND COLUMN_NAME  = %s
+            """,
+            (table, column),
+        )
+        row = cur.fetchone()
+        if row and row[0].lower() == "enum":
+            cur.execute(
+                f"ALTER TABLE `{table}` MODIFY COLUMN `{column}` {new_def}"
+            )
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            f"_modify_column_if_enum({table}.{column}): {exc}"
+        )
 
 
 
@@ -595,6 +628,9 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
     the filedetails table, AND update the per-channel columns on the
     requests table (GREEN_STATUS, GREEN_FILENAME, GREEN_FILECOUNT, etc.)
     so the UI shows real values instead of N/A.
+
+    Only channels that are NOT already 'NOT_SELECTED' are overwritten,
+    preserving the NOT_SELECTED sentinel for channels that were never run.
     """
     out_path   = Path(output_dir)
     json_files = sorted(
@@ -609,38 +645,58 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
         with open(str(latest_json), "r") as jf:
             file_details = json.load(jf)
 
-
-        # ── 1. Upsert into filedetails table (unchanged) ──────────────
+        # ── 1. Upsert into filedetails table ─────────────────────────
         upsert_filedetails(request_uuid, request_name, str(latest_json), file_details)
 
+        # ── 2. Fetch current channel statuses to guard NOT_SELECTED ──
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT GREEN_STATUS, BLUE_STATUS, ARCAMAX_STATUS, ORANGE_STATUS
+                    FROM requests WHERE request_uuid=%s
+                    """,
+                    (request_uuid,),
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
 
-        # ── 2. Update per-channel columns on requests table ───────────
+        existing_statuses = {}
+        if row:
+            for i, ch in enumerate(_ALL_CHANNELS):
+                existing_statuses[ch] = row[i] or ""
+
+        # ── 3. Build per-channel update dict from filedetails.json ───
         channel_updates = {}
         for fd in file_details:
             ch = (fd.get("channel") or "").upper().strip()
+
+            # If channel field is blank, derive it from the filename
             if ch not in {"GREEN", "BLUE", "ARCAMAX", "ORANGE"}:
-                # Try to derive channel from filename (e.g. Client_Supp_GREEN_20260723.csv)
                 fname = fd.get("filename", "")
                 for possible_ch in ("GREEN", "BLUE", "ARCAMAX", "ORANGE"):
                     if possible_ch in fname.upper():
                         ch = possible_ch
                         break
-            if not ch:
+
+            if not ch or ch not in {"GREEN", "BLUE", "ARCAMAX", "ORANGE"}:
                 continue
 
+            # Never overwrite NOT_SELECTED — that channel was intentionally skipped
+            if existing_statuses.get(ch) == "NOT_SELECTED":
+                continue
 
             fname     = fd.get("filename", "")
             row_count = fd.get("file_count") or fd.get("row_count") or ""
-
 
             channel_updates[f"{ch}_STATUS"]    = "completed"
             channel_updates[f"{ch}_FILENAME"]  = fname
             channel_updates[f"{ch}_FILECOUNT"] = str(row_count) if row_count else ""
 
-
         if channel_updates:
             update_request_db(request_uuid, **channel_updates)
-
 
     except Exception as exc:
         import logging as _log

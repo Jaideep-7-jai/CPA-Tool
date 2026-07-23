@@ -20,11 +20,29 @@ CREATE TABLE IF NOT EXISTS requests (
     created_by      INT NOT NULL,
     criteria_type   ENUM('age','state','zips') NOT NULL,
     comp_type       ENUM('greater','less','include','exclude') NOT NULL DEFAULT 'include',
-    channel         ENUM('ALL','GREEN','BLUE','ORANGE','ARCAMAX') NOT NULL DEFAULT 'ALL',
+    -- VARCHAR instead of ENUM so multi-channel strings like 'GREEN,ORANGE' are stored correctly
+    channel         VARCHAR(100) NOT NULL DEFAULT 'ALL',
     criteria_value  VARCHAR(500) NULL COMMENT 'age value or state list; NULL for zips/doordash',
     zip_file_path   VARCHAR(500) NULL,
     output_dir      VARCHAR(255) NOT NULL,
     overall_status  ENUM('inprogress','completed','failed') NOT NULL DEFAULT 'inprogress',
+    GREEN_STATUS    VARCHAR(50)  NULL,
+    BLUE_STATUS     VARCHAR(50)  NULL,
+    ARCAMAX_STATUS  VARCHAR(50)  NULL,
+    ORANGE_STATUS   VARCHAR(50)  NULL,
+    APPTNESS_STATUS VARCHAR(50)  NULL,
+    GREEN_FTP       VARCHAR(500) NULL,
+    BLUE_FTP        VARCHAR(500) NULL,
+    ARCAMAX_FTP     VARCHAR(500) NULL,
+    ORANGE_FTP      VARCHAR(500) NULL,
+    GREEN_FILECOUNT VARCHAR(50)  NULL,
+    BLUE_FILECOUNT  VARCHAR(50)  NULL,
+    ARCAMAX_FILECOUNT VARCHAR(50) NULL,
+    ORANGE_FILECOUNT VARCHAR(50) NULL,
+    GREEN_FILENAME  VARCHAR(500) NULL,
+    BLUE_FILENAME   VARCHAR(500) NULL,
+    ARCAMAX_FILENAME VARCHAR(500) NULL,
+    ORANGE_FILENAME VARCHAR(500) NULL,
     command_text    TEXT NULL,
     log_file        VARCHAR(500) NULL,
     stdout_text     MEDIUMTEXT NULL,
@@ -36,14 +54,34 @@ CREATE TABLE IF NOT EXISTS requests (
     FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Migration helper: add new columns to existing installs
--- Run these only if upgrading from old schema:
--- ALTER TABLE requests ADD COLUMN IF NOT EXISTS request_name VARCHAR(255) UNIQUE AFTER request_uuid;
--- ALTER TABLE requests ADD COLUMN IF NOT EXISTS request_type ENUM('Suppression','Mailing','Doordash') NOT NULL DEFAULT 'Suppression' AFTER request_name;
--- ALTER TABLE requests ADD COLUMN IF NOT EXISTS client_name VARCHAR(255) NOT NULL DEFAULT '' AFTER request_type;
--- ALTER TABLE requests ADD COLUMN IF NOT EXISTS criteria_type ENUM('age','state','zips') NOT NULL AFTER client_name;
--- ALTER TABLE requests MODIFY criteria ENUM('age','state','zips') NOT NULL;
--- ALTER TABLE requests ADD COLUMN IF NOT EXISTS comp_type ENUM('greater','less','include','exclude') NOT NULL DEFAULT 'include' AFTER criteria_type;
--- ALTER TABLE requests ADD COLUMN IF NOT EXISTS channel ENUM('ALL','GREEN','BLUE','ORANGE','ARCAMAX') NOT NULL DEFAULT 'ALL' AFTER comp_type;
--- ALTER TABLE requests ADD COLUMN IF NOT EXISTS criteria_value VARCHAR(500) NULL AFTER channel;
--- ALTER TABLE requests ADD COLUMN IF NOT EXISTS overall_status ENUM('inprogress','completed','failed') NOT NULL DEFAULT 'inprogress';
+-- ─── Migration helpers (run on existing installs) ───────────────────────────
+-- Fix channel column: ENUM -> VARCHAR so multi-channel values like 'GREEN,ORANGE' work
+ALTER TABLE requests MODIFY COLUMN channel VARCHAR(100) NOT NULL DEFAULT 'ALL';
+
+-- Add per-channel status / FTP / filecount / filename columns if missing
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS APPTNESS_STATUS  VARCHAR(50)  NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS GREEN_FTP        VARCHAR(500) NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS BLUE_FTP         VARCHAR(500) NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS ARCAMAX_FTP      VARCHAR(500) NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS ORANGE_FTP       VARCHAR(500) NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS GREEN_FILECOUNT  VARCHAR(50)  NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS BLUE_FILECOUNT   VARCHAR(50)  NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS ARCAMAX_FILECOUNT VARCHAR(50) NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS ORANGE_FILECOUNT VARCHAR(50)  NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS GREEN_FILENAME   VARCHAR(500) NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS BLUE_FILENAME    VARCHAR(500) NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS ARCAMAX_FILENAME VARCHAR(500) NULL;
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS ORANGE_FILENAME  VARCHAR(500) NULL;
+
+-- filedetails table
+CREATE TABLE IF NOT EXISTS filedetails (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    requestid    VARCHAR(64)  NOT NULL,
+    requestname  VARCHAR(255) NOT NULL,
+    filespath    VARCHAR(500) NULL,
+    jsondata     MEDIUMTEXT   NULL,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                             ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_requestid (requestid)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
