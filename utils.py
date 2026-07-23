@@ -167,15 +167,35 @@ def send_email(subject, body_text, is_error=False):
         logging.error(f"Email failed: {e}")
 
 
+def _count_rows_in_file(filepath):
+    """
+    Count data rows (non-empty, non-header lines) in a CSV/TXT file.
+    Returns integer count, or 0 on any error.
+    """
+    try:
+        count = 0
+        with open(str(filepath), 'r', errors='ignore') as fh:
+            for i, line in enumerate(fh):
+                if i == 0:
+                    # Skip header line
+                    continue
+                if line.strip():
+                    count += 1
+        return count
+    except Exception as e:
+        logging.warning(f"_count_rows_in_file failed for {filepath}: {e}")
+        return 0
+
+
 def build_file_details_json(final_files_dir, results=None):
     """
     Scan FINAL_FILES/ directory and build a list of file-detail dicts.
     Each entry contains:
-        filename  - basename of the file
-        size_mb   - size in MB (2 decimal places)
-        row_count - from results dict if available, else 0
-        channel   - channel name derived from results dict or filename
-        path      - full absolute path (useful while disk is still intact)
+        filename   - basename of the file
+        file_count - number of data rows in the file (header excluded)
+        row_count  - same as file_count (kept for backward compat)
+        channel    - channel name derived from results dict or filename
+        path       - full absolute path
 
     Also merges in row_count and channel from the `results` dict returned
     by process_age_state_request() so the JSON is as rich as possible.
@@ -197,14 +217,19 @@ def build_file_details_json(final_files_dir, results=None):
             if not fp.is_file():
                 continue
             fname = fp.name
-            size_mb = round(fp.stat().st_size / 1e6, 2)
             result_entry = result_by_file.get(fname, {})
+
+            # Prefer count from results dict; fallback to counting file rows
+            row_count = result_entry.get('count', None)
+            if row_count is None or row_count == 0:
+                row_count = _count_rows_in_file(fp)
+
             file_details.append({
-                "filename":  fname,
-                "size_mb":   size_mb,
-                "row_count": result_entry.get('count', 0),
-                "channel":   result_entry.get('channel', ''),
-                "path":      str(fp),
+                "filename":   fname,
+                "file_count": row_count,   # NEW: renamed from size_mb -> file_count
+                "row_count":  row_count,   # kept for backward compat
+                "channel":    result_entry.get('channel', ''),
+                "path":       str(fp),
             })
     else:
         logging.warning(f"build_file_details_json: directory not found: {final_dir}")
@@ -230,7 +255,7 @@ def send_success_email(subject, results, run_dir):
     Success email with rich per-file details.
 
     Steps performed:
-    1. Scan <run_dir>/FINAL_FILES/ to collect real file names + sizes.
+    1. Scan <run_dir>/FINAL_FILES/ to collect real file names + row counts.
     2. Merge row_count / channel from the `results` dict.
     3. Write <run_dir>/logs/filedetails.json  (persists for audit and DB
        upsert which is handled by app.py:_persist_filedetails_to_db after
@@ -268,8 +293,6 @@ def send_success_email(subject, results, run_dir):
         logging.error(f"Failed to write filedetails.json: {e}")
 
     # ── 3. Read back from JSON file for email body ─────────────
-    # Using the JSON file as the source of truth so the email is
-    # always consistent with what is stored on disk (and later DB).
     email_file_details = _read_filedetails_json(json_path) if json_path.exists() else file_details
 
     # ── 4. Build email body ────────────────────────────────────
@@ -277,8 +300,9 @@ def send_success_email(subject, results, run_dir):
         lines = []
         for fd in email_file_details:
             ch_tag = f"[{fd['channel']}] " if fd.get('channel') else ""
-            rc     = f"  |  {fd['row_count']:,} rows" if fd.get('row_count') else ""
-            lines.append(f". {ch_tag}{fd['filename']} ({fd['size_mb']:.1f} MB){rc}")
+            fc     = fd.get('file_count', fd.get('row_count', 0))
+            count_str = f"  |  {fc:,} records" if fc else ""
+            lines.append(f". {ch_tag}{fd['filename']} ({fc:,} records){count_str}")
         file_section = "\n".join(lines)
     else:
         file_section = "(no files found in FINAL_FILES directory)"

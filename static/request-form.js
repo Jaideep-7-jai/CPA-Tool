@@ -2,7 +2,7 @@
  * CPA Tool – New Request Form Handler
  * Handles:
  *   - Doordash auto-fill (client, criteria, comp type, channel)
- *   - Multi-channel checkbox selection (Change #1)
+ *   - Multi-channel checkbox selection with single-click toggle
  *   - Request name uniqueness check (debounced)
  *   - Criteria value field show/hide
  *   - File upload field show/hide
@@ -21,7 +21,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const criteriaTypeEl  = document.getElementById('criteria_type');
   const compTypeEl      = document.getElementById('comp_type');
 
-  // Multi-channel checkboxes (Change #1)
+  // Multi-channel checkboxes
   const chAll     = document.getElementById('chAll');
   const chGreen   = document.getElementById('chGreen');
   const chBlue    = document.getElementById('chBlue');
@@ -38,20 +38,46 @@ document.addEventListener('DOMContentLoaded', () => {
   const fileUploadGroup    = document.getElementById('fileUploadGroup');
   const compTypeGroup      = document.getElementById('compTypeGroup');
 
-  // ── Channel checkbox logic ─────────────────────────────────────────────────
-  // "All Channels" toggles off individual ones and vice versa
-  chAll.addEventListener('change', () => {
-    if (chAll.checked) {
-      individualChannels.forEach(cb => { cb.checked = false; cb.disabled = true; });
-    } else {
-      individualChannels.forEach(cb => { cb.disabled = false; });
-    }
-  });
+  // ── Channel single-click toggle ────────────────────────────────────────────
+  // Each channel label listens to 'click' on the label itself (not the hidden
+  // checkbox) and manually toggles checked state. This prevents the browser's
+  // default double-click-to-uncheck behaviour that was confusing users.
+  document.querySelectorAll('.channel-option').forEach(lbl => {
+    lbl.addEventListener('click', (e) => {
+      e.preventDefault(); // Prevent default label-checkbox link behaviour
+      const cb = lbl.querySelector('input[type=checkbox]');
+      if (!cb || cb.disabled) return;
 
-  individualChannels.forEach(cb => {
-    cb.addEventListener('change', () => {
-      if (cb.checked) {
-        chAll.checked = false;
+      const isAll = cb.value === 'ALL';
+
+      if (isAll) {
+        // Toggle ALL
+        const newState = !cb.checked;
+        cb.checked = newState;
+        lbl.classList.toggle('checked', newState);
+        if (newState) {
+          // Deselect all individual channels
+          individualChannels.forEach(ic => {
+            ic.checked  = false;
+            ic.disabled = true;
+            ic.closest('label').classList.remove('checked');
+          });
+        } else {
+          // Re-enable individual channels
+          individualChannels.forEach(ic => {
+            ic.disabled = false;
+          });
+        }
+      } else {
+        // Toggle individual channel
+        const newState = !cb.checked;
+        cb.checked = newState;
+        lbl.classList.toggle('checked', newState);
+        if (newState) {
+          // Deselect ALL if an individual is selected
+          chAll.checked = false;
+          chAll.closest('label').classList.remove('checked');
+        }
       }
     });
   });
@@ -66,9 +92,11 @@ document.addEventListener('DOMContentLoaded', () => {
     [chAll, ...individualChannels].forEach(cb => {
       cb.checked  = false;
       cb.disabled = locked;
+      cb.closest('label').classList.remove('checked');
     });
     if (locked && value === 'ALL') {
       chAll.checked = true;
+      chAll.closest('label').classList.add('checked');
       individualChannels.forEach(cb => { cb.disabled = true; });
     }
     channelWrapper.classList.toggle('disabled', locked);
@@ -226,7 +254,6 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
-      // Change #1: validate at least one channel selected
       const selectedChannels = getSelectedChannels();
       if (selectedChannels.length === 0) {
         formMessage.textContent = '⚠ Please select at least one channel.';
@@ -246,8 +273,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       const body = new FormData(form);
 
-      // Pass channels as a single comma-joined value instead of multiple
-      // (remove any checkbox values, replace with one 'channels' field)
+      // Pass channels as a single comma-joined value
       body.delete('channel');
       body.append('channels', selectedChannels.join(','));
 
@@ -269,6 +295,9 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         form.reset();
+        // Reset channel visual state
+        document.querySelectorAll('.channel-option').forEach(lbl => lbl.classList.remove('checked'));
+        [chAll, ...individualChannels].forEach(cb => { cb.checked = false; cb.disabled = false; });
         applyDoordashDefaults();
         updateCriteriaFields();
         nameIsValid = false;
