@@ -7,6 +7,7 @@ import subprocess
 import threading
 import uuid
 import shlex
+import json
 import os
 
 try:
@@ -109,6 +110,22 @@ def init_db():
                     FOREIGN KEY (created_by) REFERENCES users(id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
+            # ── filedetails table ──────────────────────────────────────────
+            # Stores per-request file metadata as JSON so the UI can still
+            # display file info after the server paths have been cleaned up.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS filedetails (
+                    id           INT AUTO_INCREMENT PRIMARY KEY,
+                    requestid    VARCHAR(64)  NOT NULL,
+                    requestname  VARCHAR(255) NOT NULL,
+                    filespath    VARCHAR(500) NULL,
+                    jsondata     MEDIUMTEXT   NULL,
+                    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                             ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_requestid (requestid)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """)
             admin_user = os.getenv("APP_DEFAULT_ADMIN", "admin")
             admin_pass = os.getenv("APP_DEFAULT_ADMIN_PASSWORD", "admin123")
             cur.execute("SELECT id FROM users WHERE username=%s", (admin_user,))
@@ -172,6 +189,57 @@ def insert_request(record):
                 )
             )
             return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def upsert_filedetails(request_uuid, request_name, filespath, file_details):
+    """
+    Insert or update a row in the filedetails table.
+
+    Parameters
+    ----------
+    request_uuid  : str  – UUID of the parent request (used as PK)
+    request_name  : str  – human-readable request name
+    filespath     : str  – path to the filedetails.json on disk
+    file_details  : list – list of file-detail dicts (will be JSON-serialised)
+    """
+    jsondata = json.dumps(file_details, indent=2)
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO filedetails (requestid, requestname, filespath, jsondata)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    requestname = VALUES(requestname),
+                    filespath   = VALUES(filespath),
+                    jsondata    = VALUES(jsondata)
+                """,
+                (request_uuid, request_name, filespath, jsondata)
+            )
+    finally:
+        conn.close()
+
+
+def fetch_filedetails(request_uuid):
+    """
+    Fetch filedetails row for a given request UUID.
+    Returns parsed list of file-detail dicts, or [] if not found.
+    Reads from DB (table) so it works even after disk cleanup.
+    """
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT jsondata FROM filedetails WHERE requestid=%s",
+                (request_uuid,)
+            )
+            row = cur.fetchone()
+            if not row or not row[0]:
+                return []
+            return json.loads(row[0])
     finally:
         conn.close()
 
@@ -377,7 +445,15 @@ def build_command(payload, db_id, uploaded_zip=None):
     return cmd
 
 
-def run_job(request_uuid, cmd, output_dir):
+def run_job(request_uuid, request_name, cmd, output_dir):
+    """
+    Execute the suppression job in a background thread.
+
+    After the subprocess completes the function:
+      1. Reads <run_dir>/logs/filedetails.json (written by utils.send_success_email)
+      2. Persists the file details to the filedetails DB table via upsert_filedetails()
+         so the UI can still render them after the server paths are cleaned.
+    """
     update_request_db(
         request_uuid,
         overall_status="inprogress",
@@ -393,6 +469,7 @@ def run_job(request_uuid, cmd, output_dir):
         )
         stdout_text = proc.stdout.decode("utf-8", "ignore") if proc.stdout else ""
         stderr_text = proc.stderr.decode("utf-8", "ignore") if proc.stderr else ""
+        log_file    = find_latest_log(output_dir)
         update_request_db(
             request_uuid,
             overall_status="completed" if proc.returncode == 0 else "failed",
@@ -400,8 +477,15 @@ def run_job(request_uuid, cmd, output_dir):
             return_code=proc.returncode,
             stdout_text=stdout_text[-20000:],
             stderr_text=stderr_text[-20000:],
-            log_file=find_latest_log(output_dir),
+            log_file=log_file,
         )
+
+        # ── Persist filedetails to DB after job completes ──────────────
+        # Scan all run sub-directories for a filedetails.json written by
+        # utils.send_success_email and upsert the latest one found.
+        if proc.returncode == 0:
+            _persist_filedetails_to_db(request_uuid, request_name, output_dir)
+
     except Exception as exc:
         update_request_db(
             request_uuid,
@@ -410,6 +494,32 @@ def run_job(request_uuid, cmd, output_dir):
             return_code=-1,
             stderr_text=str(exc),
             log_file=find_latest_log(output_dir),
+        )
+
+
+def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
+    """
+    Walk <output_dir>/**/logs/filedetails.json, pick the most recently
+    modified one, and upsert it into the filedetails table.
+    """
+    out_path  = Path(output_dir)
+    json_files = sorted(
+        out_path.glob("**/logs/filedetails.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+    if not json_files:
+        return
+    latest_json = json_files[0]
+    try:
+        with open(str(latest_json), "r") as jf:
+            file_details = json.load(jf)
+        upsert_filedetails(request_uuid, request_name, str(latest_json), file_details)
+    except Exception as exc:
+        # Non-fatal — log but do not crash the background thread
+        import logging
+        logging.getLogger(__name__).error(
+            f"_persist_filedetails_to_db failed for {request_uuid}: {exc}"
         )
 
 
@@ -505,6 +615,13 @@ def api_analytics():
     return jsonify(stats)
 
 
+@app.route('/api/filedetails/<request_uuid>')
+@login_required
+def api_filedetails(request_uuid):
+    """Return file details for a given request UUID from the DB table."""
+    return jsonify({'items': fetch_filedetails(request_uuid)})
+
+
 @app.route('/api/submit', methods=['POST'])
 @login_required
 def submit_request():
@@ -598,7 +715,12 @@ def submit_request():
     cmd = build_command(payload, db_id, saved_zip)
     update_request_db(request_uuid, command_text=" ".join(shlex.quote(c) for c in cmd))
 
-    threading.Thread(target=run_job, args=(request_uuid, cmd, output_dir), daemon=True).start()
+    # Pass request_name into run_job so it can populate filedetails table
+    threading.Thread(
+        target=run_job,
+        args=(request_uuid, request_name, cmd, output_dir),
+        daemon=True
+    ).start()
     return jsonify({'ok': True, 'request_uuid': request_uuid, 'request_name': request_name})
 
 

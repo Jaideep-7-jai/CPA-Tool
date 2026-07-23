@@ -212,6 +212,19 @@ def build_file_details_json(final_files_dir, results=None):
     return file_details
 
 
+def _read_filedetails_json(json_path):
+    """
+    Safely read and parse a filedetails.json file.
+    Returns parsed list on success, or empty list on any error.
+    """
+    try:
+        with open(str(json_path), "r") as jf:
+            return json.load(jf)
+    except Exception as e:
+        logging.error(f"Failed to read filedetails.json at {json_path}: {e}")
+        return []
+
+
 def send_success_email(subject, results, run_dir):
     """
     Success email with rich per-file details.
@@ -219,16 +232,23 @@ def send_success_email(subject, results, run_dir):
     Steps performed:
     1. Scan <run_dir>/FINAL_FILES/ to collect real file names + sizes.
     2. Merge row_count / channel from the `results` dict.
-    3. Write <run_dir>/logs/filedetails.json  (persists for audit even
-       after disk cleanup — DB insert is done in age_state_updated.py
-       which has access to request_id / request_name).
-    4. Build a human-readable email body and send it.
+    3. Write <run_dir>/logs/filedetails.json  (persists for audit and DB
+       upsert which is handled by app.py:_persist_filedetails_to_db after
+       the subprocess returns).
+    4. Build the email body by reading from filedetails.json (so mail
+       content is always consistent with what was persisted to disk/DB).
+    5. Send the email.
 
     Parameters
     ----------
     subject   : str   – email subject (e.g. "Request 43 completed")
     results   : dict  – channel -> result dict from process_age_state_request()
     run_dir   : str or Path – the run directory (contains FINAL_FILES/ and logs/)
+
+    Returns
+    -------
+    file_details : list  – list of file-detail dicts (also written to JSON + DB)
+    json_path    : Path  – path to the written filedetails.json
     """
     run_dir_path    = Path(run_dir)
     final_files_dir = run_dir_path / "FINAL_FILES"
@@ -247,12 +267,17 @@ def send_success_email(subject, results, run_dir):
     except Exception as e:
         logging.error(f"Failed to write filedetails.json: {e}")
 
-    # ── 3. Build email body ────────────────────────────────────
-    if file_details:
+    # ── 3. Read back from JSON file for email body ─────────────
+    # Using the JSON file as the source of truth so the email is
+    # always consistent with what is stored on disk (and later DB).
+    email_file_details = _read_filedetails_json(json_path) if json_path.exists() else file_details
+
+    # ── 4. Build email body ────────────────────────────────────
+    if email_file_details:
         lines = []
-        for fd in file_details:
-            ch_tag = f"[{fd['channel']}] " if fd['channel'] else ""
-            rc     = f"  |  {fd['row_count']:,} rows" if fd['row_count'] else ""
+        for fd in email_file_details:
+            ch_tag = f"[{fd['channel']}] " if fd.get('channel') else ""
+            rc     = f"  |  {fd['row_count']:,} rows" if fd.get('row_count') else ""
             lines.append(f". {ch_tag}{fd['filename']} ({fd['size_mb']:.1f} MB){rc}")
         file_section = "\n".join(lines)
     else:
@@ -268,7 +293,8 @@ Generated files:
 Processing completed successfully!"""
 
     send_email(subject, body, is_error=False)
-    return file_details  # return so caller can persist to DB
+    # Return both so callers that need the data or path can use them
+    return file_details, json_path
 
 
 def send_error_email(subject, error_msg):
