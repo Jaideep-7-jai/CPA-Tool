@@ -110,6 +110,25 @@ def init_db():
                     FOREIGN KEY (created_by) REFERENCES users(id)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
+
+            # ── Schema migration: add columns that may be absent in older tables ──
+            # ALTER TABLE ... ADD COLUMN IF NOT EXISTS is safe to run repeatedly;
+            # it is a no-op when the column already exists (MySQL 8+).
+            # For MySQL 5.x / MariaDB we catch the duplicate-column error silently.
+            _add_column_if_missing(cur, "requests", "APPTNESS_STATUS", "VARCHAR(50) NULL")
+            _add_column_if_missing(cur, "requests", "GREEN_FTP",        "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "BLUE_FTP",         "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "ARCAMAX_FTP",      "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "ORANGE_FTP",       "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "GREEN_FILECOUNT",  "VARCHAR(50) NULL")
+            _add_column_if_missing(cur, "requests", "BLUE_FILECOUNT",   "VARCHAR(50) NULL")
+            _add_column_if_missing(cur, "requests", "ARCAMAX_FILECOUNT","VARCHAR(50) NULL")
+            _add_column_if_missing(cur, "requests", "ORANGE_FILECOUNT", "VARCHAR(50) NULL")
+            _add_column_if_missing(cur, "requests", "GREEN_FILENAME",   "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "BLUE_FILENAME",    "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "ARCAMAX_FILENAME", "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "ORANGE_FILENAME",  "VARCHAR(500) NULL")
+
             # ── filedetails table ──────────────────────────────────────────
             # Stores per-request file metadata as JSON so the UI can still
             # display file info after the server paths have been cleaned up.
@@ -136,6 +155,24 @@ def init_db():
                 )
     finally:
         conn.close()
+
+
+def _add_column_if_missing(cur, table, column, column_def):
+    """
+    Add *column* to *table* if it does not already exist.
+
+    Works on MySQL 5.x / MariaDB which lack 'ADD COLUMN IF NOT EXISTS'.
+    Silently ignores error 1060 (Duplicate column name).
+    """
+    try:
+        cur.execute(
+            f"ALTER TABLE `{table}` ADD COLUMN `{column}` {column_def}"
+        )
+    except Exception as exc:
+        # pymysql raises InternalError(1060, "Duplicate column name '...'")
+        # when the column is already present – that is fine, skip it.
+        if "1060" not in str(exc) and "Duplicate column" not in str(exc):
+            raise
 
 
 # ─── DB helpers ────────────────────────────────────────────────────
