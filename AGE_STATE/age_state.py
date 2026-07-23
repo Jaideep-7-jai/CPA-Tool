@@ -17,7 +17,7 @@ Run directory layout
         FINAL_FILES/
             <client>_<request_type>_GREEN_<date>.csv   <- final deliverables only
             <client>_<request_type>_BLUE_<date>.csv
-            ...
+            ..
         GREEN_tmp/    <- temp working dir; deleted after final file moved to FINAL_FILES
         BLUE_tmp/
         ARCAMAX_tmp/
@@ -53,6 +53,7 @@ Processing flow per channel
   7. FTP upload from FINAL_FILES/
      ORANGE suppression: email-only CSV
      ORANGE mailing    : ESP-wise split CSVs in a ZIP
+  8. Record FTP path in requests.<CHANNEL>_FTP column
 """
 
 import os
@@ -260,6 +261,55 @@ def update_request_status(request_id, status, status_column, log):
             raise
     log.error(
         f"update_request_status gave up after {_DB_RETRY_ATTEMPTS} attempts: "
+        f"{last_exc}"
+    )
+    raise last_exc
+
+
+def update_ftp_path(request_id, channel_name, ftp_path, log):
+    """
+    Save the FTP file path into the requests table column <CHANNEL>_FTP.
+    Uses the same retry logic as update_request_status.
+
+    Columns expected in requests table:
+        GREEN_FTP   VARCHAR(500)
+        BLUE_FTP    VARCHAR(500)
+        ARCAMAX_FTP VARCHAR(500)
+        ORANGE_FTP  VARCHAR(500)
+    """
+    ftp_column = f"{channel_name.upper()}_FTP"
+    last_exc = None
+    for attempt in range(_DB_RETRY_ATTEMPTS):
+        try:
+            conn = get_db_with_retry(log)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"UPDATE requests SET {ftp_column}=%s WHERE id=%s",
+                        (ftp_path, request_id),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            log.info(
+                f"DB FTP PATH UPDATE: {ftp_column} -> '{ftp_path}'  "
+                f"(request_id={request_id})"
+            )
+            return  # success
+        except pymysql.err.OperationalError as exc:
+            last_exc = exc
+            if attempt < _DB_RETRY_ATTEMPTS - 1:
+                delay = _DB_RETRY_BASE_DELAY * (2 ** attempt)
+                log.warning(
+                    f"update_ftp_path failed (attempt {attempt + 1}/"
+                    f"{_DB_RETRY_ATTEMPTS}): {exc} — retrying in {delay}s"
+                )
+                time.sleep(delay)
+        except Exception:
+            log.exception(f"Failed updating {ftp_column}")
+            raise
+    log.error(
+        f"update_ftp_path gave up after {_DB_RETRY_ATTEMPTS} attempts: "
         f"{last_exc}"
     )
     raise last_exc
@@ -582,6 +632,9 @@ def _post_to_ftp(final_files_dir, path_date, output_file, log):
     log.info(f"  FTP upload completed successfully -> {ftp_dest}")
     log.info(f"  File '{output_file}' has been posted to FTP at /CPA/{path_date}/")
 
+    # Return the full FTP path so callers can persist it to the DB
+    return ftp_dest
+
 
 def _cleanup_channel_tmp(channel_tmp, log):
     """
@@ -615,6 +668,7 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
     """
     GREEN and BLUE channel processor.
     7-step flow with verbose step banners and row-count logging at every stage.
+    After FTP upload the FTP path is saved to requests.<CHANNEL>_FTP.
     """
     TOTAL_STEPS    = 7
     channel_name   = channel_name.upper()
@@ -714,8 +768,9 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
         # ── STEP 7/7 ──────────────────────────────────────────────────────
         _step(log, 7, TOTAL_STEPS, f"FTP upload -> /CPA/{ctx['path_date']}/{ctx['output_file']}", channel_name)
         update_request_status(request_id, "Posting To FTP", channel_status, log)
-        _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
-        log.info(f"  STEP 7 DONE: FTP upload successful")
+        ftp_path = _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
+        update_ftp_path(request_id, channel_name, ftp_path, log)
+        log.info(f"  STEP 7 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path}")
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status, log)
@@ -725,7 +780,7 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
         log.info(f"  Total elapsed   : {elapsed:.2f}s")
         log.info(f"  Final file      : FINAL_FILES/{ctx['output_file']}")
         log.info(f"  Final row count : {record_count:,}")
-        log.info(f"  FTP path        : /CPA/{ctx['path_date']}/{ctx['output_file']}")
+        log.info(f"  FTP path        : {ftp_path}")
         log.info("=" * 70)
 
         result = _success_result(
@@ -749,6 +804,7 @@ def process_arcamax(request_id, run_dir: Path):
     """
     ARCAMAX channel processor.
     7-step flow with verbose step banners and row-count logging at every stage.
+    After FTP upload the FTP path is saved to requests.ARCAMAX_FTP.
     """
     TOTAL_STEPS    = 7
     channel_name   = "ARCAMAX"
@@ -848,8 +904,9 @@ def process_arcamax(request_id, run_dir: Path):
         # ── STEP 7/7 ──────────────────────────────────────────────────────
         _step(log, 7, TOTAL_STEPS, f"FTP upload -> /CPA/{ctx['path_date']}/{ctx['output_file']}", channel_name)
         update_request_status(request_id, "Posting To FTP", channel_status, log)
-        _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
-        log.info(f"  STEP 7 DONE: FTP upload successful")
+        ftp_path = _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
+        update_ftp_path(request_id, channel_name, ftp_path, log)
+        log.info(f"  STEP 7 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path}")
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status, log)
@@ -859,7 +916,7 @@ def process_arcamax(request_id, run_dir: Path):
         log.info(f"  Total elapsed   : {elapsed:.2f}s")
         log.info(f"  Final file      : FINAL_FILES/{ctx['output_file']}")
         log.info(f"  Final row count : {record_count:,}")
-        log.info(f"  FTP path        : /CPA/{ctx['path_date']}/{ctx['output_file']}")
+        log.info(f"  FTP path        : {ftp_path}")
         log.info("=" * 70)
 
         result = _success_result(
@@ -884,6 +941,7 @@ def process_orange(request_id, run_dir: Path):
     ORANGE channel processor.
     8-step flow with verbose step banners and row-count logging at every stage.
     Step 7 branches: suppression -> email-only CSV | mailing -> ESP ZIP.
+    After FTP upload the FTP path is saved to requests.ORANGE_FTP.
     """
     TOTAL_STEPS    = 8
     channel_name   = "ORANGE"
@@ -1051,8 +1109,9 @@ def process_orange(request_id, run_dir: Path):
 
         # ── STEP 8/8 ──────────────────────────────────────────────────────
         _step(log, 8, TOTAL_STEPS, f"FTP upload -> /CPA/{path_date}/{output_file}", channel_name)
-        _post_to_ftp(final_files_dir, path_date, output_file, log)
-        log.info(f"  STEP 8 DONE: FTP upload successful")
+        ftp_path = _post_to_ftp(final_files_dir, path_date, output_file, log)
+        update_ftp_path(request_id, channel_name, ftp_path, log)
+        log.info(f"  STEP 8 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path}")
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status, log)
@@ -1062,7 +1121,7 @@ def process_orange(request_id, run_dir: Path):
         log.info(f"  Total elapsed   : {elapsed:.2f}s")
         log.info(f"  Final file      : FINAL_FILES/{output_file}")
         log.info(f"  Final row count : {record_count:,}")
-        log.info(f"  FTP path        : /CPA/{path_date}/{output_file}")
+        log.info(f"  FTP path        : {ftp_path}")
         log.info("=" * 70)
 
         result = _success_result(
@@ -1234,5 +1293,3 @@ def process_age_state_request(request_id, channel="ALL"):
         )
 
     return results
-
-
