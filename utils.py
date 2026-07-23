@@ -4,6 +4,7 @@ Enhanced Utilities with Directory Safety + Run Isolation
 """
 
 import os
+import json
 import time
 import gzip
 import shutil
@@ -24,7 +25,7 @@ def ensure_output_dir(output_dir, criteria_type):
 
     Layout:
         <output_dir>/run_age_<YYYYMMDD_HHMMSS>/
-            logs/         <- combined + per-channel log files
+            logs/         <- combined + per-channel log files + filedetails.json
             FINAL_DIR/    <- final output CSVs/ZIPs that remain after run
 
     Each execution gets its own isolated folder with full date+time stamp.
@@ -166,24 +167,108 @@ def send_email(subject, body_text, is_error=False):
         logging.error(f"Email failed: {e}")
 
 
-def send_success_email(subject, files, output_dir):
-    """Success email with output dir info (files already uploaded to FTP)"""
-    safe_files = [f for f in files if os.path.exists(f)]
-    if safe_files:
-        file_details = "\n".join(
-            [f"{os.path.basename(f)} ({os.path.getsize(f)/1e6:.1f} MB)" for f in safe_files]
-        )
+def build_file_details_json(final_files_dir, results=None):
+    """
+    Scan FINAL_FILES/ directory and build a list of file-detail dicts.
+    Each entry contains:
+        filename  - basename of the file
+        size_mb   - size in MB (2 decimal places)
+        row_count - from results dict if available, else 0
+        channel   - channel name derived from results dict or filename
+        path      - full absolute path (useful while disk is still intact)
+
+    Also merges in row_count and channel from the `results` dict returned
+    by process_age_state_request() so the JSON is as rich as possible.
+
+    Returns a list of dicts sorted by channel name.
+    """
+    final_dir = Path(final_files_dir)
+    file_details = []
+
+    # Build a quick lookup: filename -> result entry
+    result_by_file = {}
+    if results and isinstance(results, dict):
+        for ch, r in results.items():
+            if r and r.get('file'):
+                result_by_file[r['file']] = r
+
+    if final_dir.exists():
+        for fp in sorted(final_dir.iterdir()):
+            if not fp.is_file():
+                continue
+            fname = fp.name
+            size_mb = round(fp.stat().st_size / 1e6, 2)
+            result_entry = result_by_file.get(fname, {})
+            file_details.append({
+                "filename":  fname,
+                "size_mb":   size_mb,
+                "row_count": result_entry.get('count', 0),
+                "channel":   result_entry.get('channel', ''),
+                "path":      str(fp),
+            })
     else:
-        file_details = "Files uploaded to FTP (local copies in FINAL_DIR)"
+        logging.warning(f"build_file_details_json: directory not found: {final_dir}")
+
+    return file_details
+
+
+def send_success_email(subject, results, run_dir):
+    """
+    Success email with rich per-file details.
+
+    Steps performed:
+    1. Scan <run_dir>/FINAL_FILES/ to collect real file names + sizes.
+    2. Merge row_count / channel from the `results` dict.
+    3. Write <run_dir>/logs/filedetails.json  (persists for audit even
+       after disk cleanup — DB insert is done in age_state_updated.py
+       which has access to request_id / request_name).
+    4. Build a human-readable email body and send it.
+
+    Parameters
+    ----------
+    subject   : str   – email subject (e.g. "Request 43 completed")
+    results   : dict  – channel -> result dict from process_age_state_request()
+    run_dir   : str or Path – the run directory (contains FINAL_FILES/ and logs/)
+    """
+    run_dir_path    = Path(run_dir)
+    final_files_dir = run_dir_path / "FINAL_FILES"
+    logs_dir        = run_dir_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 1. Build file details list ─────────────────────────────
+    file_details = build_file_details_json(final_files_dir, results)
+
+    # ── 2. Write filedetails.json to logs/ ────────────────────
+    json_path = logs_dir / "filedetails.json"
+    try:
+        with open(str(json_path), "w") as jf:
+            json.dump(file_details, jf, indent=2)
+        logging.info(f"filedetails.json written -> {json_path}")
+    except Exception as e:
+        logging.error(f"Failed to write filedetails.json: {e}")
+
+    # ── 3. Build email body ────────────────────────────────────
+    if file_details:
+        lines = []
+        for fd in file_details:
+            ch_tag = f"[{fd['channel']}] " if fd['channel'] else ""
+            rc     = f"  |  {fd['row_count']:,} rows" if fd['row_count'] else ""
+            lines.append(f". {ch_tag}{fd['filename']} ({fd['size_mb']:.1f} MB){rc}")
+        file_section = "\n".join(lines)
+    else:
+        file_section = "(no files found in FINAL_FILES directory)"
+
     body = f"""SUCCESS: {subject}
 
-Output Directory: {output_dir}
+Output Directory: {final_files_dir}
 
 Generated files:
-{file_details}
+{file_section}
 
 Processing completed successfully!"""
+
     send_email(subject, body, is_error=False)
+    return file_details  # return so caller can persist to DB
 
 
 def send_error_email(subject, error_msg):
