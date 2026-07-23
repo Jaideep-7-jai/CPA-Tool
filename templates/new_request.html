@@ -67,16 +67,29 @@
         </select>
       </div>
 
-      <!-- 7. Channel -->
+      <!-- 7. Channel — MULTI-SELECT (Change #1) -->
       <div class="form-group">
-        <label for="channel">Channel</label>
-        <select name="channel" id="channel" required>
-          <option value="ALL">All</option>
-          <option value="GREEN">Green</option>
-          <option value="BLUE">Blue</option>
-          <option value="ORANGE">Orange</option>
-          <option value="ARCAMAX">Arcamax</option>
-        </select>
+        <label>Channel</label>
+        <!-- Hidden input used for Doordash lock (ALL) -->
+        <input type="hidden" name="channel_hidden" id="channel_hidden" value="">
+        <div class="channel-multi-wrapper" id="channelWrapper">
+          <label class="channel-option">
+            <input type="checkbox" name="channel" value="ALL" id="chAll"> All Channels
+          </label>
+          <label class="channel-option">
+            <input type="checkbox" name="channel" value="GREEN" id="chGreen"> Green
+          </label>
+          <label class="channel-option">
+            <input type="checkbox" name="channel" value="BLUE" id="chBlue"> Blue
+          </label>
+          <label class="channel-option">
+            <input type="checkbox" name="channel" value="ORANGE" id="chOrange"> Orange
+          </label>
+          <label class="channel-option">
+            <input type="checkbox" name="channel" value="ARCAMAX" id="chArcamax"> Arcamax
+          </label>
+        </div>
+        <small id="channelHint">Select one or more channels. Selecting "All Channels" overrides others.</small>
       </div>
 
       <!-- 8. File Upload (Zips / Doordash) -->
@@ -86,7 +99,7 @@
           <input type="file" name="zip_file" id="zip_file" accept=".csv,.txt" class="file-input">
           <div class="file-upload-label">
             <span class="file-icon">📁</span>
-            <span id="fileLabel">Click to select or drag & drop a CSV/TXT file</span>
+            <span id="fileLabel">Click to select or drag &amp; drop a CSV/TXT file</span>
           </div>
         </div>
         <small>CSV or TXT with ZIP codes (one per line or comma-separated).</small>
@@ -128,6 +141,33 @@
   </section>
 
 </div>
+
+<style>
+.channel-multi-wrapper {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.2rem;
+  margin-top: 0.35rem;
+}
+.channel-option {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+  font-size: 0.95rem;
+  user-select: none;
+}
+.channel-option input[type="checkbox"] {
+  accent-color: var(--color-primary, #01696f);
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+}
+.channel-multi-wrapper.disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+</style>
 {% endblock %}
 
 {% block scripts %}

@@ -2,6 +2,7 @@
  * CPA Tool – New Request Form Handler
  * Handles:
  *   - Doordash auto-fill (client, criteria, comp type, channel)
+ *   - Multi-channel checkbox selection (Change #1)
  *   - Request name uniqueness check (debounced)
  *   - Criteria value field show/hide
  *   - File upload field show/hide
@@ -19,7 +20,15 @@ document.addEventListener('DOMContentLoaded', () => {
   const clientNameEl    = document.getElementById('client_name');
   const criteriaTypeEl  = document.getElementById('criteria_type');
   const compTypeEl      = document.getElementById('comp_type');
-  const channelEl       = document.getElementById('channel');
+
+  // Multi-channel checkboxes (Change #1)
+  const chAll     = document.getElementById('chAll');
+  const chGreen   = document.getElementById('chGreen');
+  const chBlue    = document.getElementById('chBlue');
+  const chOrange  = document.getElementById('chOrange');
+  const chArcamax = document.getElementById('chArcamax');
+  const channelWrapper = document.getElementById('channelWrapper');
+  const individualChannels = [chGreen, chBlue, chOrange, chArcamax];
 
   // Conditional groups
   const criteriaValueGroup = document.getElementById('criteriaValueGroup');
@@ -28,6 +37,42 @@ document.addEventListener('DOMContentLoaded', () => {
   const criteriaValueHint  = document.getElementById('criteriaValueHint');
   const fileUploadGroup    = document.getElementById('fileUploadGroup');
   const compTypeGroup      = document.getElementById('compTypeGroup');
+
+  // ── Channel checkbox logic ─────────────────────────────────────────────────
+  // "All Channels" toggles off individual ones and vice versa
+  chAll.addEventListener('change', () => {
+    if (chAll.checked) {
+      individualChannels.forEach(cb => { cb.checked = false; cb.disabled = true; });
+    } else {
+      individualChannels.forEach(cb => { cb.disabled = false; });
+    }
+  });
+
+  individualChannels.forEach(cb => {
+    cb.addEventListener('change', () => {
+      if (cb.checked) {
+        chAll.checked = false;
+      }
+    });
+  });
+
+  function getSelectedChannels() {
+    if (chAll.checked) return ['ALL'];
+    return individualChannels.filter(cb => cb.checked).map(cb => cb.value);
+  }
+
+  function setChannelLock(locked, value = 'ALL') {
+    // Called for Doordash: lock to ALL
+    [chAll, ...individualChannels].forEach(cb => {
+      cb.checked  = false;
+      cb.disabled = locked;
+    });
+    if (locked && value === 'ALL') {
+      chAll.checked = true;
+      individualChannels.forEach(cb => { cb.disabled = true; });
+    }
+    channelWrapper.classList.toggle('disabled', locked);
+  }
 
   // ── Doordash auto-fill ─────────────────────────────────────────────────────
   function applyDoordashDefaults() {
@@ -40,14 +85,13 @@ document.addEventListener('DOMContentLoaded', () => {
       criteriaTypeEl.setAttribute('disabled', true);
       compTypeEl.value    = 'include';
       compTypeEl.setAttribute('disabled', true);
-      channelEl.value     = 'ALL';
-      channelEl.setAttribute('disabled', true);
+      setChannelLock(true, 'ALL');
     } else {
       clientNameEl.removeAttribute('readonly');
       if (clientNameEl.value === 'Doordash') clientNameEl.value = '';
       criteriaTypeEl.removeAttribute('disabled');
       compTypeEl.removeAttribute('disabled');
-      channelEl.removeAttribute('disabled');
+      setChannelLock(false);
     }
     updateCriteriaFields();
   }
@@ -57,9 +101,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const criteria     = criteriaTypeEl.value;
     const isZipsOrDD   = criteria === 'zips';
     const isAge        = criteria === 'age';
-    const isState      = criteria === 'state';
 
-    // Criteria value field: show only for age/state
     if (isZipsOrDD) {
       criteriaValueGroup.classList.add('hidden');
       criteriaValueEl.removeAttribute('required');
@@ -80,20 +122,17 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
 
-    // File upload: show for zips/doordash
     if (isZipsOrDD) {
       fileUploadGroup.classList.remove('hidden');
     } else {
       fileUploadGroup.classList.add('hidden');
     }
 
-    // Comp type options: age uses greater/less; others use include/exclude
     updateCompTypeOptions(criteria);
   }
 
   function updateCompTypeOptions(criteria) {
     const isAge = criteria === 'age';
-    // Clear and rebuild
     compTypeEl.innerHTML = '';
     if (isAge) {
       compTypeEl.innerHTML = `
@@ -106,7 +145,6 @@ document.addEventListener('DOMContentLoaded', () => {
         <option value="exclude">Exclude</option>
       `;
     }
-    // Re-apply Doordash lock after rebuild
     if (requestTypeEl.value === 'Doordash') {
       compTypeEl.value = 'include';
       compTypeEl.setAttribute('disabled', true);
@@ -188,6 +226,14 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
+      // Change #1: validate at least one channel selected
+      const selectedChannels = getSelectedChannels();
+      if (selectedChannels.length === 0) {
+        formMessage.textContent = '⚠ Please select at least one channel.';
+        formMessage.className   = 'message error';
+        return;
+      }
+
       formMessage.textContent = 'Submitting…';
       formMessage.className   = 'message loading';
 
@@ -195,13 +241,21 @@ document.addEventListener('DOMContentLoaded', () => {
       const disabledSelects = form.querySelectorAll('select[disabled]');
       disabledSelects.forEach(s => s.removeAttribute('disabled'));
 
+      // Re-enable channel checkboxes to allow FormData to collect them
+      [chAll, ...individualChannels].forEach(cb => cb.removeAttribute('disabled'));
+
       const body = new FormData(form);
+
+      // Pass channels as a single comma-joined value instead of multiple
+      // (remove any checkbox values, replace with one 'channels' field)
+      body.delete('channel');
+      body.append('channels', selectedChannels.join(','));
 
       // Re-disable after collecting
       if (requestTypeEl.value === 'Doordash') {
         criteriaTypeEl.setAttribute('disabled', true);
         compTypeEl.setAttribute('disabled', true);
-        channelEl.setAttribute('disabled', true);
+        setChannelLock(true, 'ALL');
       }
 
       try {
