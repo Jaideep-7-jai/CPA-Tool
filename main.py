@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument("--zip-file",      default=None,
                         help="Path to uploaded ZIP codes file")
     parser.add_argument("--request-id",    type=int, default=None,
-                        help="DB request ID (used by age/state processor)")
+                        help="DB request ID (required for age/state and zips processors)")
     return parser.parse_args()
 
 
@@ -68,10 +68,12 @@ def main():
 
     elif criteria == "zips":
         from ZIPS.zips import process_zip_request
+        if args.request_id is None:
+            print("[ERROR] --request-id is required for zips criteria", file=sys.stderr)
+            sys.exit(1)
         process_zip_request(
-            request_type=req_type,
+            request_id=args.request_id,
             zip_file=args.zip_file,
-            comp_type=args.comp_type,
             channel=channels,
             output_dir=args.output_dir,
         )
