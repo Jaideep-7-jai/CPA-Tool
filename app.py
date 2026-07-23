@@ -587,7 +587,8 @@ def build_command(payload, db_id, uploaded_zip=None):
             cmd.extend(["--age", str(payload["criteria_value"])])
         else:
             cmd.extend(["--states"] + payload["criteria_value"].split(","))
-    else:
+    else:  # zips
+        cmd.extend(["--request-id", str(db_id)])
         cmd.extend(["--zip-file", str(uploaded_zip)])
 
     return cmd
