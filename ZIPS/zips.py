@@ -45,6 +45,7 @@ Processing flow
     5. Download FINAL FILE parts + combine
     6. Move combined file to FINAL_FILES/
     7. FTP upload from FINAL_FILES/
+    8. Record FTP path in requests.<CHANNEL>_FTP column
 
   POST-CHANNEL (orchestrator):
     - DROP the shared ZIP staging table (only after ALL channels finish)
@@ -226,6 +227,55 @@ def update_request_status(request_id, status, status_column, log):
             raise
     log.error(
         f"update_request_status gave up after {_DB_RETRY_ATTEMPTS} attempts: "
+        f"{last_exc}"
+    )
+    raise last_exc
+
+
+def update_ftp_path(request_id, channel_name, ftp_path, log):
+    """
+    Save the FTP file path into the requests table column <CHANNEL>_FTP.
+    Uses the same retry logic as update_request_status.
+
+    Columns expected in requests table:
+        GREEN_FTP   VARCHAR(500)
+        BLUE_FTP    VARCHAR(500)
+        ARCAMAX_FTP VARCHAR(500)
+        ORANGE_FTP  VARCHAR(500)
+    """
+    ftp_column = f"{channel_name.upper()}_FTP"
+    last_exc = None
+    for attempt in range(_DB_RETRY_ATTEMPTS):
+        try:
+            conn = get_db_with_retry(log)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"UPDATE requests SET {ftp_column}=%s WHERE id=%s",
+                        (ftp_path, request_id),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            log.info(
+                f"DB FTP PATH UPDATE: {ftp_column} -> '{ftp_path}'  "
+                f"(request_id={request_id})"
+            )
+            return  # success
+        except pymysql.err.OperationalError as exc:
+            last_exc = exc
+            if attempt < _DB_RETRY_ATTEMPTS - 1:
+                delay = _DB_RETRY_BASE_DELAY * (2 ** attempt)
+                log.warning(
+                    f"update_ftp_path failed (attempt {attempt + 1}/"
+                    f"{_DB_RETRY_ATTEMPTS}): {exc} — retrying in {delay}s"
+                )
+                time.sleep(delay)
+        except Exception:
+            log.exception(f"Failed updating {ftp_column}")
+            raise
+    log.error(
+        f"update_ftp_path gave up after {_DB_RETRY_ATTEMPTS} attempts: "
         f"{last_exc}"
     )
     raise last_exc
@@ -571,6 +621,7 @@ def _download_and_combine(s3_path, download_dir, work_dir,
 # ── FTP / cleanup helpers ─────────────────────────────────────────────────────
 
 def _post_to_ftp(final_files_dir, path_date, output_file, log):
+    """FTP upload from FINAL_FILES/ and return the remote FTP path."""
     ftp_dest = f"/CPA/{path_date}/{output_file}"
     ftp_cmd = (
         f'lftp -u "GreenPub,Zet@Welcome1!" ftp://zxds-ftp-02.bo3.e-dialog.com '
@@ -585,6 +636,9 @@ def _post_to_ftp(final_files_dir, path_date, output_file, log):
 
     run_command(ftp_cmd, cwd=str(final_files_dir))
     log.info(f"  FTP upload completed successfully -> {ftp_dest}")
+
+    # Return the full FTP path so callers can persist it to the DB
+    return ftp_dest
 
 
 def _cleanup_channel_tmp(channel_tmp, log):
@@ -615,6 +669,7 @@ def process_green_blue_zip(request_id, channel_name, zip_staging_table, run_dir:
     GREEN and BLUE channel processor for ZIPS.
     Same 7-step flow as age_state.process_green_blue.
     Receives the shared zip_staging_table name; does NOT create or drop it.
+    After FTP upload the FTP path is saved to requests.<CHANNEL>_FTP.
     """
     TOTAL_STEPS    = 7
     channel_name   = channel_name.upper()
@@ -699,26 +754,35 @@ def process_green_blue_zip(request_id, channel_name, zip_staging_table, run_dir:
         src_file  = channel_tmp / ctx["output_file"]
         dest_file = final_files_dir / ctx["output_file"]
         shutil.move(str(src_file), str(dest_file))
-        log.info(f"  STEP 6 DONE: Moved {src_file.name} -> FINAL_FILES/")
-        _cleanup_channel_tmp(channel_tmp, log)
+        record_count = _count_file_lines(str(dest_file))
+        log.info(f"  STEP 6 DONE: Moved {src_file.name} -> FINAL_FILES/  |  rows: {record_count:,}")
 
         # ── STEP 7/7 ──────────────────────────────────────────────────────
-        _step(log, 7, TOTAL_STEPS, "FTP upload from FINAL_FILES/", channel_name)
-        update_request_status(request_id, "FTP Upload", channel_status, log)
-        _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
-        log.info(f"  STEP 7 DONE: FTP upload complete")
+        _step(log, 7, TOTAL_STEPS, f"FTP upload -> /CPA/{ctx['path_date']}/{ctx['output_file']}", channel_name)
+        update_request_status(request_id, "Posting To FTP", channel_status, log)
+        ftp_path = _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
+        update_ftp_path(request_id, channel_name, ftp_path, log)
+        log.info(f"  STEP 7 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path}")
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status, log)
-        log.info(f"  {channel_name} CHANNEL COMPLETED in {elapsed:.1f}s | {combined_count:,} records")
 
+        log.info("=" * 70)
+        log.info(f"  {channel_name} CHANNEL (ZIPS) PROCESSING COMPLETED SUCCESSFULLY")
+        log.info(f"  Total elapsed   : {elapsed:.2f}s")
+        log.info(f"  Final file      : FINAL_FILES/{ctx['output_file']}")
+        log.info(f"  Final row count : {record_count:,}")
+        log.info(f"  FTP path        : {ftp_path}")
+        log.info("=" * 70)
+
+        _cleanup_channel_tmp(channel_tmp, log)
         return _success_result(
-            channel_name, ctx["output_file"], str(dest_file), elapsed, combined_count
+            channel_name, ctx["output_file"], str(dest_file), elapsed, record_count
         )
 
     except Exception:
         update_request_status(request_id, "Failed", channel_status, log)
-        log.exception(f"  {channel_name} CHANNEL FAILED")
+        log.exception(f"  {channel_name} CHANNEL (ZIPS) FAILED")
         raise
 
 
@@ -727,6 +791,7 @@ def process_arcamax_zip(request_id, zip_staging_table, run_dir: Path):
     ARCAMAX channel processor for ZIPS.
     Same 7-step flow as age_state.process_arcamax.
     Uses the shared zip_staging_table for ZIP matching in Snowflake.
+    After FTP upload the FTP path is saved to requests.ARCAMAX_FTP.
     """
     TOTAL_STEPS    = 7
     channel_name   = "ARCAMAX"
@@ -808,26 +873,35 @@ def process_arcamax_zip(request_id, zip_staging_table, run_dir: Path):
         src_file  = channel_tmp / ctx["output_file"]
         dest_file = final_files_dir / ctx["output_file"]
         shutil.move(str(src_file), str(dest_file))
-        log.info(f"  STEP 6 DONE: Moved {src_file.name} -> FINAL_FILES/")
-        _cleanup_channel_tmp(channel_tmp, log)
+        record_count = _count_file_lines(str(dest_file))
+        log.info(f"  STEP 6 DONE: Moved {src_file.name} -> FINAL_FILES/  |  rows: {record_count:,}")
 
         # ── STEP 7/7 ──────────────────────────────────────────────────────
-        _step(log, 7, TOTAL_STEPS, "FTP upload from FINAL_FILES/", channel_name)
-        update_request_status(request_id, "FTP Upload", channel_status, log)
-        _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
-        log.info(f"  STEP 7 DONE: FTP upload complete")
+        _step(log, 7, TOTAL_STEPS, f"FTP upload -> /CPA/{ctx['path_date']}/{ctx['output_file']}", channel_name)
+        update_request_status(request_id, "Posting To FTP", channel_status, log)
+        ftp_path = _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
+        update_ftp_path(request_id, channel_name, ftp_path, log)
+        log.info(f"  STEP 7 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path}")
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status, log)
-        log.info(f"  ARCAMAX CHANNEL COMPLETED in {elapsed:.1f}s | {combined_count:,} records")
 
+        log.info("=" * 70)
+        log.info(f"  ARCAMAX CHANNEL (ZIPS) PROCESSING COMPLETED SUCCESSFULLY")
+        log.info(f"  Total elapsed   : {elapsed:.2f}s")
+        log.info(f"  Final file      : FINAL_FILES/{ctx['output_file']}")
+        log.info(f"  Final row count : {record_count:,}")
+        log.info(f"  FTP path        : {ftp_path}")
+        log.info("=" * 70)
+
+        _cleanup_channel_tmp(channel_tmp, log)
         return _success_result(
-            channel_name, ctx["output_file"], str(dest_file), elapsed, combined_count
+            channel_name, ctx["output_file"], str(dest_file), elapsed, record_count
         )
 
     except Exception:
         update_request_status(request_id, "Failed", channel_status, log)
-        log.exception("  ARCAMAX CHANNEL FAILED")
+        log.exception("  ARCAMAX CHANNEL (ZIPS) FAILED")
         raise
 
 
@@ -837,6 +911,7 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
     Same 7-step flow as age_state.process_orange.
     Uses the shared zip_staging_table for ZIP matching in Snowflake.
     ORANGE final file is split per-ESP and zipped.
+    After FTP upload the FTP path is saved to requests.ORANGE_FTP.
     """
     TOTAL_STEPS    = 7
     channel_name   = "ORANGE"
@@ -943,20 +1018,31 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
 
         # ── STEP 7/7 ──────────────────────────────────────────────────────
         _step(log, 7, TOTAL_STEPS, "FTP upload (ORANGE suppression email list + mailing ZIP)", channel_name)
-        update_request_status(request_id, "FTP Upload", channel_status, log)
+        update_request_status(request_id, "Posting To FTP", channel_status, log)
 
         # ORANGE suppression: email-only CSV
         supp_file = ctx["output_file"]
         shutil.copy(str(final_files_dir / ctx["output_file"]), str(final_files_dir / supp_file))
-        _post_to_ftp(final_files_dir, ctx["path_date"], supp_file, log)
+        ftp_path_supp = _post_to_ftp(final_files_dir, ctx["path_date"], supp_file, log)
 
         # ORANGE mailing: ESP-split ZIP
-        _post_to_ftp(final_files_dir, ctx["path_date"], zip_out_name, log)
-        log.info(f"  STEP 7 DONE: FTP upload complete")
+        ftp_path_zip = _post_to_ftp(final_files_dir, ctx["path_date"], zip_out_name, log)
+
+        # Persist the mailing ZIP FTP path (primary deliverable for ORANGE)
+        update_ftp_path(request_id, channel_name, ftp_path_zip, log)
+        log.info(f"  STEP 7 DONE: FTP upload successful | FTP path saved to DB -> {ftp_path_zip}")
 
         elapsed = time.time() - start_time
         update_request_status(request_id, "Completed", channel_status, log)
-        log.info(f"  ORANGE CHANNEL COMPLETED in {elapsed:.1f}s | {total_count:,} records")
+
+        log.info("=" * 70)
+        log.info(f"  ORANGE CHANNEL (ZIPS) PROCESSING COMPLETED SUCCESSFULLY")
+        log.info(f"  Total elapsed   : {elapsed:.2f}s")
+        log.info(f"  Final file      : FINAL_FILES/{zip_out_name}")
+        log.info(f"  Total records   : {total_count:,}")
+        log.info(f"  FTP path (ZIP)  : {ftp_path_zip}")
+        log.info(f"  FTP path (supp) : {ftp_path_supp}")
+        log.info("=" * 70)
 
         return _success_result(
             channel_name, zip_out_name, str(zip_out), elapsed, total_count
@@ -964,7 +1050,7 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
 
     except Exception:
         update_request_status(request_id, "Failed", channel_status, log)
-        log.exception("  ORANGE CHANNEL FAILED")
+        log.exception("  ORANGE CHANNEL (ZIPS) FAILED")
         raise
 
 
