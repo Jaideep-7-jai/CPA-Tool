@@ -2,6 +2,7 @@
  * CPA Tool – New Request Form Handler
  * Handles:
  *   - Doordash auto-fill (client, criteria, comp type, channel)
+ *   - Multi-channel checkbox selection with single-click toggle
  *   - Request name uniqueness check (debounced)
  *   - Criteria value field show/hide
  *   - File upload field show/hide
@@ -19,7 +20,15 @@ document.addEventListener('DOMContentLoaded', () => {
   const clientNameEl    = document.getElementById('client_name');
   const criteriaTypeEl  = document.getElementById('criteria_type');
   const compTypeEl      = document.getElementById('comp_type');
-  const channelEl       = document.getElementById('channel');
+
+  // Multi-channel checkboxes
+  const chAll     = document.getElementById('chAll');
+  const chGreen   = document.getElementById('chGreen');
+  const chBlue    = document.getElementById('chBlue');
+  const chOrange  = document.getElementById('chOrange');
+  const chArcamax = document.getElementById('chArcamax');
+  const channelWrapper = document.getElementById('channelWrapper');
+  const individualChannels = [chGreen, chBlue, chOrange, chArcamax];
 
   // Conditional groups
   const criteriaValueGroup = document.getElementById('criteriaValueGroup');
@@ -29,7 +38,60 @@ document.addEventListener('DOMContentLoaded', () => {
   const fileUploadGroup    = document.getElementById('fileUploadGroup');
   const compTypeGroup      = document.getElementById('compTypeGroup');
 
-  // ── Doordash auto-fill ─────────────────────────────────────────────────────
+  // ── Channel single-click toggle ──────────────────────────────────────────────
+  document.querySelectorAll('.channel-option').forEach(lbl => {
+    lbl.addEventListener('click', (e) => {
+      e.preventDefault();
+      const cb = lbl.querySelector('input[type=checkbox]');
+      if (!cb || cb.disabled) return;
+
+      const isAll = cb.value === 'ALL';
+
+      if (isAll) {
+        const newState = !cb.checked;
+        cb.checked = newState;
+        lbl.classList.toggle('checked', newState);
+        if (newState) {
+          individualChannels.forEach(ic => {
+            ic.checked  = false;
+            ic.disabled = true;
+            ic.closest('label').classList.remove('checked');
+          });
+        } else {
+          individualChannels.forEach(ic => { ic.disabled = false; });
+        }
+      } else {
+        const newState = !cb.checked;
+        cb.checked = newState;
+        lbl.classList.toggle('checked', newState);
+        if (newState) {
+          chAll.checked = false;
+          chAll.closest('label').classList.remove('checked');
+        }
+      }
+    });
+  });
+
+  function getSelectedChannels() {
+    if (chAll.checked) return ['ALL'];
+    return individualChannels.filter(cb => cb.checked).map(cb => cb.value);
+  }
+
+  function setChannelLock(locked, value = 'ALL') {
+    [chAll, ...individualChannels].forEach(cb => {
+      cb.checked  = false;
+      cb.disabled = locked;
+      cb.closest('label').classList.remove('checked');
+    });
+    if (locked && value === 'ALL') {
+      chAll.checked = true;
+      chAll.closest('label').classList.add('checked');
+      individualChannels.forEach(cb => { cb.disabled = true; });
+    }
+    channelWrapper.classList.toggle('disabled', locked);
+  }
+
+  // ── Doordash auto-fill ────────────────────────────────────────────────────────
   function applyDoordashDefaults() {
     const isDoordash = requestTypeEl.value === 'Doordash';
 
@@ -40,26 +102,23 @@ document.addEventListener('DOMContentLoaded', () => {
       criteriaTypeEl.setAttribute('disabled', true);
       compTypeEl.value    = 'include';
       compTypeEl.setAttribute('disabled', true);
-      channelEl.value     = 'ALL';
-      channelEl.setAttribute('disabled', true);
+      setChannelLock(true, 'ALL');
     } else {
       clientNameEl.removeAttribute('readonly');
       if (clientNameEl.value === 'Doordash') clientNameEl.value = '';
       criteriaTypeEl.removeAttribute('disabled');
       compTypeEl.removeAttribute('disabled');
-      channelEl.removeAttribute('disabled');
+      setChannelLock(false);
     }
     updateCriteriaFields();
   }
 
-  // ── Show/hide criteria value + file upload ─────────────────────────────────
+  // ── Show/hide criteria value + file upload ──────────────────────────────────
   function updateCriteriaFields() {
-    const criteria     = criteriaTypeEl.value;
-    const isZipsOrDD   = criteria === 'zips';
-    const isAge        = criteria === 'age';
-    const isState      = criteria === 'state';
+    const criteria   = criteriaTypeEl.value;
+    const isZipsOrDD = criteria === 'zips';
+    const isAge      = criteria === 'age';
 
-    // Criteria value field: show only for age/state
     if (isZipsOrDD) {
       criteriaValueGroup.classList.add('hidden');
       criteriaValueEl.removeAttribute('required');
@@ -80,20 +139,17 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
 
-    // File upload: show for zips/doordash
     if (isZipsOrDD) {
       fileUploadGroup.classList.remove('hidden');
     } else {
       fileUploadGroup.classList.add('hidden');
     }
 
-    // Comp type options: age uses greater/less; others use include/exclude
     updateCompTypeOptions(criteria);
   }
 
   function updateCompTypeOptions(criteria) {
     const isAge = criteria === 'age';
-    // Clear and rebuild
     compTypeEl.innerHTML = '';
     if (isAge) {
       compTypeEl.innerHTML = `
@@ -106,7 +162,6 @@ document.addEventListener('DOMContentLoaded', () => {
         <option value="exclude">Exclude</option>
       `;
     }
-    // Re-apply Doordash lock after rebuild
     if (requestTypeEl.value === 'Doordash') {
       compTypeEl.value = 'include';
       compTypeEl.setAttribute('disabled', true);
@@ -153,7 +208,7 @@ document.addEventListener('DOMContentLoaded', () => {
     nameCheckTimer = setTimeout(() => checkRequestName(requestNameEl.value.trim()), 500);
   });
 
-  // ── Event listeners ────────────────────────────────────────────────────────
+  // ── Event listeners ────────────────────────────────────────────────────────────
   requestTypeEl.addEventListener('change', applyDoordashDefaults);
   criteriaTypeEl.addEventListener('change', updateCriteriaFields);
 
@@ -188,6 +243,13 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
+      const selectedChannels = getSelectedChannels();
+      if (selectedChannels.length === 0) {
+        formMessage.textContent = '⚠ Please select at least one channel.';
+        formMessage.className   = 'message error';
+        return;
+      }
+
       formMessage.textContent = 'Submitting…';
       formMessage.className   = 'message loading';
 
@@ -195,13 +257,22 @@ document.addEventListener('DOMContentLoaded', () => {
       const disabledSelects = form.querySelectorAll('select[disabled]');
       disabledSelects.forEach(s => s.removeAttribute('disabled'));
 
+      // Re-enable channel checkboxes to allow FormData to collect them
+      [chAll, ...individualChannels].forEach(cb => cb.removeAttribute('disabled'));
+
       const body = new FormData(form);
+
+      // FIX: Remove all checkbox-submitted channel values, then re-append
+      // each selected channel as a separate 'channel' key so Flask's
+      // request.form.getlist('channel') receives ['GREEN', 'BLUE', ...]
+      body.delete('channel');
+      selectedChannels.forEach(ch => body.append('channel', ch));
 
       // Re-disable after collecting
       if (requestTypeEl.value === 'Doordash') {
         criteriaTypeEl.setAttribute('disabled', true);
         compTypeEl.setAttribute('disabled', true);
-        channelEl.setAttribute('disabled', true);
+        setChannelLock(true, 'ALL');
       }
 
       try {
@@ -215,6 +286,9 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         form.reset();
+        // Reset channel visual state
+        document.querySelectorAll('.channel-option').forEach(lbl => lbl.classList.remove('checked'));
+        [chAll, ...individualChannels].forEach(cb => { cb.checked = false; cb.disabled = false; });
         applyDoordashDefaults();
         updateCriteriaFields();
         nameIsValid = false;

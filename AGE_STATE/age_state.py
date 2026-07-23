@@ -325,63 +325,26 @@ def _count_file_lines(file_path):
     return int(result) if result else 0
 
 
-def _count_s3_rows(s3_path, log):
-    """
-    Count total unloaded rows across all gzipped part files at *s3_path*.
-    Uses 'aws s3 ls' to list parts then zcat | wc -l (minus header per file).
-    Returns an integer count, or -1 if counting fails (non-fatal).
-    """
-    try:
-        ls_out = subprocess.check_output(
-            ["aws", "s3", "ls", s3_path + "/"],
-            universal_newlines=True,
-        )
-        part_keys = [
-            line.split()[-1]
-            for line in ls_out.strip().splitlines()
-            if line.strip()
-        ]
-        if not part_keys:
-            log.warning(f"_count_s3_rows: no objects found at {s3_path}/")
-            return 0
-
-        # Build a one-liner: download each part via aws s3 cp - and zcat | wc -l
-        total = 0
-        bucket_prefix = s3_path.rstrip("/")
-        for key in part_keys:
-            cmd = (
-                f'aws s3 cp "{bucket_prefix}/{key}" - '
-                f'| zcat | tail -n +2 | wc -l'
-            )
-            row_str = subprocess.check_output(
-                cmd, shell=True, universal_newlines=True
-            ).strip()
-            total += int(row_str) if row_str else 0
-        return total
-    except Exception as exc:
-        log.warning(f"_count_s3_rows failed (non-fatal): {exc}")
-        return -1
-
-
-def _query_snowflake_count(table_name, log):
+def _query_snowflake(query_sql, log):
     """
     Run SELECT COUNT(*) FROM <table> via snowsql and return the integer.
     Returns -1 if the query fails (non-fatal).
     """
     try:
         os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-        sql    = f"SELECT COUNT(*) FROM {table_name};"
+        #sql    = f"SELECT COUNT(*) FROM {table_name};"
         output = subprocess.check_output(
-            ["snowsql", "-c", "datateam1", "-q", sql, "-o", "output_format=csv",
-             "-o", "header=false", "-o", "timing=false"],
+            ["snowsql", "-c", "datateam1", "-q", query_sql, "-o", "output_format=csv",
+             "-o", "header=false", "-o", "timing=false", "-o", "friendly=false"],
             universal_newlines=True,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
         )
         # Extract first numeric token from output
         match = re.search(r"(\d+)", output)
         return int(match.group(1)) if match else -1
     except Exception as exc:
-        log.warning(f"_query_snowflake_count failed (non-fatal): {exc}")
+        log.warning(f"_query_snowflake failed (non-fatal): {exc}")
+        #print(f"_query_snowflake failed (non-fatal): {exc}")
         return -1
 
 
@@ -416,17 +379,19 @@ def _download_and_combine(s3_path, download_dir, work_dir,
              f"{[p.name for p in downloaded]}")
 
     out_path = work_dir / output_file
+
     if channel_name != "ORANGE":
         run_command(
+            f"printf 'email\n' > {shlex.quote(str(out_path))} && "
             f"zcat {shlex.quote(str(download_dir) + '/')}data* "
-            f"| tail -n +2 "
-            f"| cut -d'|' -f1 > {shlex.quote(str(out_path))}"
-        )
+            f"| sed 's/\"//g' | tail -n +2 | cut -d'|' -f1 >> {shlex.quote(str(out_path))}"
+            )
     else:
         run_command(
+            f"printf 'email\n' > {shlex.quote(str(out_path))} && "
             f"zcat {shlex.quote(str(download_dir) + '/')}data* "
-            f"| tail -n +2 > {shlex.quote(str(out_path))}"
-        )
+            f"| sed 's/\"//g' | tail -n +2 >> {shlex.quote(str(out_path))}"
+            )
 
     run_command(f"rm -f {str(download_dir / 'data*')}", cwd=str(download_dir))
 
@@ -461,12 +426,8 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
             kw        = "IN" if comp_type == "include" else "NOT IN"
             condition = f"b.STATE {kw} ('{states}')"
 
-        create_sql = (
-            f"CREATE OR REPLACE TABLE {perm_table} "
-            f"(email VARCHAR, condition_field VARCHAR);"
-        )
         insert_sql = (
-            f"INSERT INTO {perm_table} (email, condition_field) "
+            f"CREATE OR REPLACE TABLE {perm_table} AS "
             f"SELECT a.email, {cond_col} "
             f"FROM {profile_table} a "
             f"JOIN APT_CUSTOM_GREEN_REA_DATA_DND b ON a.md5hash = b.EMAIL_MD5 "
@@ -490,12 +451,8 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
             kw        = "IN" if comp_type == "include" else "NOT IN"
             condition = f"STATE {kw} ('{states}')"
 
-        create_sql = (
-            f"CREATE OR REPLACE TABLE {perm_table} "
-            f"(email VARCHAR, condition_field VARCHAR);"
-        )
         insert_sql = (
-            f"INSERT INTO {perm_table} (email, condition_field) "
+            f"CREATE OR REPLACE TABLE {perm_table} AS "
             f"SELECT email, {cond_col} "
             f"FROM APT_CUSTOM_ARCAMAX_CUSTOMER_TABLE "
             f"WHERE {condition};"
@@ -515,12 +472,8 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
             kw        = "IN" if comp_type == "include" else "NOT IN"
             condition = f"STATE {kw} ('{states}')"
 
-        create_sql = (
-            f"CREATE OR REPLACE TABLE {perm_table} "
-            f"(email_address VARCHAR, condition_field VARCHAR, account_name VARCHAR);"
-        )
         insert_sql = (
-            f"INSERT INTO {perm_table} (email_address, condition_field, account_name) "
+            f"CREATE OR REPLACE TABLE {perm_table} AS "
             f"SELECT a.email_address, {cond_col}, b.ACCOUNT_NAME "
             f"FROM ("
             f"  SELECT a.FEED_ID, a.email_address, a.dob, a.STATE "
@@ -539,77 +492,44 @@ def _insert_into_perm_table(perm_table, channel_name, criteria_type,
             f"  ON a.email_address = d.email;"
         )
 
-    combined_sql = f"{create_sql} {insert_sql}"
     log.info(f"  Target table : {perm_table}")
-    log.info(f"  CREATE SQL   : {create_sql}")
     log.info(f"  INSERT SQL   : {insert_sql}")
     log.info("  Executing CREATE + INSERT via snowsql ...")
 
-    run_command(["snowsql", "-c", "datateam1", "-q", combined_sql])
+    run_command(["snowsql", "-c", "datateam1", "-q", insert_sql])
     log.info("  CREATE + INSERT executed successfully")
 
     # Verify row count in perm table
-    inserted_rows = _query_snowflake_count(perm_table, log)
+    count_sql = f'select count(*) from {perm_table}'
+    inserted_rows = _query_snowflake(count_sql, log)
     if inserted_rows >= 0:
         log.info(f"  Rows inserted into {perm_table}: {inserted_rows:,}")
     else:
         log.warning(f"  Could not verify row count for {perm_table} (count query failed)")
 
+    return inserted_rows
 
-def _export_final_file(perm_table, path_FINAL, channel_name, log):
+
+def _export_complete_final_file(export_type, perm_table, export_path, channel_name, log):
     """
-    Export FINAL FILE from permanent table -> path_FINAL (S3).
-    GREEN / BLUE / ARCAMAX : DISTINCT email           (header: email)
-    ORANGE                 : DISTINCT email_address, account_name
-    """
-    os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-
-    select_clause = (
-        "DISTINCT email_address, account_name"
-        if channel_name == "ORANGE"
-        else "DISTINCT email"
-    )
-    sql = (
-        f"COPY INTO '{path_FINAL}/' "
-        f"FROM (SELECT {select_clause} FROM {perm_table}) "
-        f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
-        f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
-        f"FIELD_OPTIONALLY_ENCLOSED_BY='\"' "
-        f"NULL_IF=() EMPTY_FIELD_AS_NULL=FALSE) "
-        f"HEADER=TRUE "
-        f"MAX_FILE_SIZE=490000000;"
-    )
-    log.info(f"  Source table : {perm_table}")
-    log.info(f"  S3 target    : {path_FINAL}/")
-    log.info(f"  SELECT clause: {select_clause}")
-    log.info("  Executing COPY INTO (FINAL FILE) via snowsql ...")
-
-    run_command(["snowsql", "-c", "datateam1", "-q", sql])
-    log.info("  COPY INTO (FINAL FILE) completed successfully")
-
-    # Count rows exported to S3 for FINAL
-    final_s3_rows = _count_s3_rows(path_FINAL, log)
-    if final_s3_rows >= 0:
-        log.info(f"  Rows unloaded to FINAL S3 path: {final_s3_rows:,}")
-    else:
-        log.warning("  Could not verify FINAL FILE S3 row count (non-fatal)")
-
-
-def _export_complete_file(perm_table, path_COMPLETE, channel_name, log):
-    """
-    Export COMPLETE DATA FILE from permanent table -> path_COMPLETE (S3).
+    Export COMPLETE/FINAL DATA FILE from permanent table -> export_path (S3).
     GREEN / BLUE / ARCAMAX : email, condition_field
     ORANGE                 : email_address, condition_field, account_name
     """
     os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-
-    select_clause = (
+    if export_type == 'FINAL':
+        select_clause = (
+        "DISTINCT email_address, account_name"
+        if channel_name == "ORANGE"
+        else "DISTINCT email")
+    else:
+        select_clause = (
         "email_address, condition_field, account_name"
         if channel_name == "ORANGE"
-        else "email, condition_field"
-    )
+        else "email, condition_field")
+
     sql = (
-        f"COPY INTO '{path_COMPLETE}/' "
+        f"COPY INTO '{export_path}/' "
         f"FROM (SELECT {select_clause} FROM {perm_table}) "
         f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
         f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' "
@@ -619,19 +539,19 @@ def _export_complete_file(perm_table, path_COMPLETE, channel_name, log):
         f"MAX_FILE_SIZE=490000000;"
     )
     log.info(f"  Source table : {perm_table}")
-    log.info(f"  S3 target    : {path_COMPLETE}/")
+    log.info(f"  S3 target    : {export_path}/")
     log.info(f"  SELECT clause: {select_clause}")
-    log.info("  Executing COPY INTO (COMPLETE FILE) via snowsql ...")
+    log.info(f"  Executing COPY INTO ({export_type} FILE) via snowsql ...")
 
-    run_command(["snowsql", "-c", "datateam1", "-q", sql])
-    log.info("  COPY INTO (COMPLETE FILE) completed successfully")
+    unloaded_rows = _query_snowflake(sql, log)
+    log.info(f"  COPY INTO ({export_type} FILE) completed successfully")
 
     # Count rows exported to S3 for COMPLETE
-    complete_s3_rows = _count_s3_rows(path_COMPLETE, log)
-    if complete_s3_rows >= 0:
-        log.info(f"  Rows unloaded to COMPLETE S3 path: {complete_s3_rows:,}")
+    #complete_s3_rows = _count_s3_rows(export_path, log)
+    if unloaded_rows >= 0:
+        log.info(f"  Rows unloaded to {export_type} S3 path: {unloaded_rows:,}")
     else:
-        log.warning("  Could not verify COMPLETE FILE S3 row count (non-fatal)")
+        log.warning(f"  Could not verify {export_type} FILE S3 row count (non-fatal)")
 
 
 def _drop_perm_table(perm_table, log):
@@ -730,22 +650,39 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
         # ── STEP 1/7 ──────────────────────────────────────────────────────
         _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
-        _insert_into_perm_table(
+        inserted_count  = _insert_into_perm_table(
             perm_table, channel_name,
             ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
         )
+
+        if inserted_count == 0:
+            update_request_status(request_id, "No Data Retrieved", channel_status, log)
+            log.warning(
+                f"  NO DATA RETRIEVED: 0 rows inserted into {perm_table}. "
+                f"Skipping remaining steps for {channel_name}."
+            )
+            _drop_perm_table(perm_table, log)
+            return {
+                "channel": channel_name,
+                "file": None,
+                "final_file_path": None,
+                "status": "NO_DATA",
+                "elapsed": time.time() - start_time,
+                "count": 0,
+            }   
+
         log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
 
         # ── STEP 2/7 ──────────────────────────────────────────────────────
         _step(log, 2, TOTAL_STEPS, "Exporting FINAL FILE (DISTINCT emails) to S3", channel_name)
         update_request_status(request_id, "Exporting Final File", channel_status, log)
-        _export_final_file(perm_table, path_FINAL, channel_name, log)
+        _export_complete_final_file('FINAL', perm_table, path_FINAL, channel_name, log)
         log.info(f"  STEP 2 DONE: FINAL FILE exported to S3 -> {path_FINAL}")
 
         # ── STEP 3/7 ──────────────────────────────────────────────────────
         _step(log, 3, TOTAL_STEPS, "Exporting COMPLETE DATA FILE (email + condition_field) to S3", channel_name)
         update_request_status(request_id, "Exporting Complete File", channel_status, log)
-        _export_complete_file(perm_table, path_COMPLETE, channel_name, log)
+        _export_complete_final_file('COMPLETE', perm_table, path_COMPLETE, channel_name, log)
         log.info(f"  STEP 3 DONE: COMPLETE FILE exported to S3 -> {path_COMPLETE}")
 
         # ── STEP 4/7 ──────────────────────────────────────────────────────
@@ -847,22 +784,39 @@ def process_arcamax(request_id, run_dir: Path):
         # ── STEP 1/7 ──────────────────────────────────────────────────────
         _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
-        _insert_into_perm_table(
+        inserted_count = _insert_into_perm_table(
             perm_table, channel_name,
             ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
         )
+
+        if inserted_count == 0:
+            update_request_status(request_id, "No Data Retrieved", channel_status, log)
+            log.warning(
+                f"  NO DATA RETRIEVED: 0 rows inserted into {perm_table}. "
+                f"Skipping remaining steps for {channel_name}."
+            )
+            _drop_perm_table(perm_table, log)
+            return {
+                "channel": channel_name,
+                "file": None,
+                "final_file_path": None,
+                "status": "NO_DATA",
+                "elapsed": time.time() - start_time,
+                "count": 0,
+            }
+
         log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
 
         # ── STEP 2/7 ──────────────────────────────────────────────────────
         _step(log, 2, TOTAL_STEPS, "Exporting FINAL FILE (DISTINCT emails) to S3", channel_name)
         update_request_status(request_id, "Exporting Final File", channel_status, log)
-        _export_final_file(perm_table, path_FINAL, channel_name, log)
+        _export_complete_final_file('FINAL', perm_table, path_FINAL, channel_name, log)
         log.info(f"  STEP 2 DONE: FINAL FILE exported to S3 -> {path_FINAL}")
 
         # ── STEP 3/7 ──────────────────────────────────────────────────────
         _step(log, 3, TOTAL_STEPS, "Exporting COMPLETE DATA FILE (email + condition_field) to S3", channel_name)
         update_request_status(request_id, "Exporting Complete File", channel_status, log)
-        _export_complete_file(perm_table, path_COMPLETE, channel_name, log)
+        _export_complete_final_file('COMPLETE', perm_table, path_COMPLETE, channel_name, log)
         log.info(f"  STEP 3 DONE: COMPLETE FILE exported to S3 -> {path_COMPLETE}")
 
         # ── STEP 4/7 ──────────────────────────────────────────────────────
@@ -969,22 +923,39 @@ def process_orange(request_id, run_dir: Path):
         # ── STEP 1/8 ──────────────────────────────────────────────────────
         _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
-        _insert_into_perm_table(
+        inserted_count = _insert_into_perm_table(
             perm_table, channel_name,
             ctx["criteria_type"], ctx["criteria_value"], ctx["comp_type"], log
         )
+
+        if inserted_count == 0:
+            update_request_status(request_id, "No Data Retrieved", channel_status, log)
+            log.warning(
+                f"  NO DATA RETRIEVED: 0 rows inserted into {perm_table}. "
+                f"Skipping remaining steps for {channel_name}."
+            )
+            _drop_perm_table(perm_table, log)
+            return {
+                "channel": channel_name,
+                "file": None,
+                "final_file_path": None,
+                "status": "NO_DATA",
+                "elapsed": time.time() - start_time,
+                "count": 0,
+            }   
+
         log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
 
         # ── STEP 2/8 ──────────────────────────────────────────────────────
         _step(log, 2, TOTAL_STEPS, "Exporting FINAL FILE (DISTINCT email_address, account_name) to S3", channel_name)
         update_request_status(request_id, "Exporting Final File", channel_status, log)
-        _export_final_file(perm_table, path_FINAL, channel_name, log)
+        _export_complete_final_file('FINAL', perm_table, path_FINAL, channel_name, log)
         log.info(f"  STEP 2 DONE: FINAL FILE exported to S3 -> {path_FINAL}")
 
         # ── STEP 3/8 ──────────────────────────────────────────────────────
         _step(log, 3, TOTAL_STEPS, "Exporting COMPLETE DATA FILE (email_address, condition_field, account_name) to S3", channel_name)
         update_request_status(request_id, "Exporting Complete File", channel_status, log)
-        _export_complete_file(perm_table, path_COMPLETE, channel_name, log)
+        _export_complete_final_file('COMPLETE', perm_table, path_COMPLETE, channel_name, log)
         log.info(f"  STEP 3 DONE: COMPLETE FILE exported to S3 -> {path_COMPLETE}")
 
         # ── STEP 4/8 ──────────────────────────────────────────────────────
@@ -1043,7 +1014,8 @@ def process_orange(request_id, run_dir: Path):
         else:  # mailing
             esp_split_dir = channel_tmp / "ORANGE_ESP_SPLIT"
             esp_split_dir.mkdir(exist_ok=True)
-            esp_names  = df_final["account_name"].dropna().unique()
+            esp_names  = df_final["account_name"].dropna().astype(str).str.strip()
+            esp_names = esp_names[esp_names.str.lower() != "account_name"].unique().tolist()
             zip_parts  = []
             total_esp_rows = 0
             for esp in esp_names:
@@ -1055,7 +1027,7 @@ def process_orange(request_id, run_dir: Path):
                     esp_split_dir
                     / f"{client_name}_{request_type}_{esp}_{path_date}.csv"
                 )
-                esp_df.to_csv(str(esp_file), index=False, header=False)
+                esp_df.to_csv(str(esp_file), index=False, header=True)
                 zip_parts.append(esp_file)
                 total_esp_rows += len(esp_df)
                 log.info(
@@ -1133,7 +1105,18 @@ def process_age_state_request(request_id, channel="ALL"):
 
     log_main = setup_main_logging(run_dir, criteria_type)
 
-    channels_to_run = CHANNELS if channel.upper() == "ALL" else [channel.upper()]
+    #channels_to_run = CHANNELS if channel.upper() == "ALL" else [channel.upper()]
+    # ── Normalise channel argument ──────────────────────────────────────
+    # Accepts: str ("ALL" / "GREEN") OR list (["GREEN", "ORANGE"] / ["ALL"])
+    if isinstance(channel, list):
+        normalised = [c.upper() for c in channel]
+    else:
+        normalised = [channel.upper()]
+
+    if "ALL" in normalised:
+        channels_to_run = list(CHANNELS)  # run all four
+    else:
+        channels_to_run = list(dict.fromkeys(normalised))  # deduplicate, preserve order
 
     log_main.info("=" * 70)
     log_main.info("  AGE STATE PROCESSING — ORCHESTRATOR STARTED")
@@ -1167,12 +1150,16 @@ def process_age_state_request(request_id, channel="ALL"):
         log_main.info(f"  [{ch}] single-channel mode — starting now")
         try:
             results[ch] = _run_channel(ch)
-            log_main.info(
-                f"  [{ch}] COMPLETED | "
-                f"file={results[ch]['file']}  "
-                f"count={results[ch]['count']:,}  "
-                f"elapsed={results[ch]['elapsed']:.2f}s"
-            )
+            if results[ch].get("status") == "NO_DATA":
+                log_main.warning(
+                    f"[{ch}] NO DATA | file=None count=0 elapsed={results[ch]['elapsed']:.2f}s"
+                )
+            else:
+                log_main.info(
+                    f"[{ch}] completed | "
+                    f"file={results[ch]['file']} count={results[ch]['count']} "
+                    f"elapsed={results[ch]['elapsed']:.2f}s"
+                )
         except Exception as exc:
             failed.append(ch)
             log_main.error(f"  [{ch}] FAILED: {exc}")
@@ -1191,12 +1178,16 @@ def process_age_state_request(request_id, channel="ALL"):
                 ch = future_map[future]
                 try:
                     results[ch] = future.result()
-                    log_main.info(
-                        f"  [{ch}] COMPLETED | "
-                        f"file={results[ch]['file']}  "
-                        f"count={results[ch]['count']:,}  "
-                        f"elapsed={results[ch]['elapsed']:.2f}s"
-                    )
+                    if results[ch].get("status") == "NO_DATA":
+                        log_main.warning(
+                            f"[{ch}] NO DATA | file=None count=0 elapsed={results[ch]['elapsed']:.2f}s"
+                        )
+                    else:
+                        log_main.info(
+                            f"[{ch}] completed | "
+                            f"file={results[ch]['file']} count={results[ch]['count']} "
+                            f"elapsed={results[ch]['elapsed']:.2f}s"
+                        )
                 except Exception as exc:
                     failed.append(ch)
                     log_main.error(f"  [{ch}] FAILED: {exc}")
@@ -1239,6 +1230,9 @@ def process_age_state_request(request_id, channel="ALL"):
         send_success_email(
             f"Request {request_id} completed",
             f"Channels: {', '.join(channels_to_run)}\nResults: {results}",
+            run_dir
         )
 
     return results
+
+

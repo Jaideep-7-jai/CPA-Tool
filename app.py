@@ -7,20 +7,25 @@ import subprocess
 import threading
 import uuid
 import shlex
+import json
 import os
+
 
 try:
     import pymysql
 except ImportError:
     pymysql = None
 
+
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-this-secret")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+
 
 DB_CONFIG = {
     "host": "zds-prod-jbdb3-vip.bo3.e-dialog.com",
@@ -31,8 +36,22 @@ DB_CONFIG = {
     "autocommit": True,
 }
 
+
 SCRIPT_NAME = os.getenv("SUPPRESSION_SCRIPT_PATH", str(BASE_DIR / "main.py"))
 PYTHON_BIN = os.getenv("APP_PYTHON_BIN", "python3.6")
+
+
+# Per-channel DB columns that can be updated
+_CHANNEL_COLUMNS = {
+    "GREEN_STATUS", "BLUE_STATUS", "ARCAMAX_STATUS", "ORANGE_STATUS", "APPTNESS_STATUS",
+    "GREEN_FTP",    "BLUE_FTP",    "ARCAMAX_FTP",    "ORANGE_FTP",
+    "GREEN_FILECOUNT",  "BLUE_FILECOUNT",  "ARCAMAX_FILECOUNT",  "ORANGE_FILECOUNT",
+    "GREEN_FILENAME",   "BLUE_FILENAME",   "ARCAMAX_FILENAME",   "ORANGE_FILENAME",
+}
+
+# All recognised channel names (excluding ALL)
+_ALL_CHANNELS = ("GREEN", "BLUE", "ARCAMAX", "ORANGE")
+
 
 
 def get_db():
@@ -41,8 +60,10 @@ def get_db():
     return pymysql.connect(**DB_CONFIG)
 
 
+
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 
 def login_required(fn):
@@ -52,6 +73,7 @@ def login_required(fn):
             return redirect(url_for("login"))
         return fn(*args, **kwargs)
     return wrapper
+
 
 
 def init_db():
@@ -76,11 +98,28 @@ def init_db():
                     created_by      INT NOT NULL,
                     criteria_type   ENUM('age','state','zips') NOT NULL,
                     comp_type       ENUM('greater','less','include','exclude') NOT NULL DEFAULT 'include',
-                    channel         ENUM('ALL','GREEN','BLUE','ORANGE','ARCAMAX') NOT NULL DEFAULT 'ALL',
+                    channel         VARCHAR(100) NOT NULL DEFAULT 'ALL',
                     criteria_value  VARCHAR(500) NULL,
                     zip_file_path   VARCHAR(500) NULL,
                     output_dir      VARCHAR(255) NOT NULL,
                     overall_status  ENUM('inprogress','completed','failed') NOT NULL DEFAULT 'inprogress',
+                    GREEN_STATUS    VARCHAR(50)  NULL,
+                    BLUE_STATUS     VARCHAR(50)  NULL,
+                    ARCAMAX_STATUS  VARCHAR(50)  NULL,
+                    ORANGE_STATUS   VARCHAR(50)  NULL,
+                    APPTNESS_STATUS VARCHAR(50)  NULL,
+                    GREEN_FTP       VARCHAR(500) NULL,
+                    BLUE_FTP        VARCHAR(500) NULL,
+                    ARCAMAX_FTP     VARCHAR(500) NULL,
+                    ORANGE_FTP      VARCHAR(500) NULL,
+                    GREEN_FILECOUNT VARCHAR(50)  NULL,
+                    BLUE_FILECOUNT  VARCHAR(50)  NULL,
+                    ARCAMAX_FILECOUNT VARCHAR(50) NULL,
+                    ORANGE_FILECOUNT VARCHAR(50) NULL,
+                    GREEN_FILENAME  VARCHAR(500) NULL,
+                    BLUE_FILENAME   VARCHAR(500) NULL,
+                    ARCAMAX_FILENAME VARCHAR(500) NULL,
+                    ORANGE_FILENAME VARCHAR(500) NULL,
                     command_text    TEXT NULL,
                     log_file        VARCHAR(500) NULL,
                     stdout_text     MEDIUMTEXT NULL,
@@ -90,6 +129,36 @@ def init_db():
                     started_at      DATETIME NULL,
                     finished_at     DATETIME NULL,
                     FOREIGN KEY (created_by) REFERENCES users(id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """)
+
+
+            _add_column_if_missing(cur, "requests", "APPTNESS_STATUS", "VARCHAR(50) NULL")
+            _add_column_if_missing(cur, "requests", "GREEN_FTP",        "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "BLUE_FTP",         "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "ARCAMAX_FTP",      "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "ORANGE_FTP",       "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "GREEN_FILECOUNT",  "VARCHAR(50) NULL")
+            _add_column_if_missing(cur, "requests", "BLUE_FILECOUNT",   "VARCHAR(50) NULL")
+            _add_column_if_missing(cur, "requests", "ARCAMAX_FILECOUNT","VARCHAR(50) NULL")
+            _add_column_if_missing(cur, "requests", "ORANGE_FILECOUNT", "VARCHAR(50) NULL")
+            _add_column_if_missing(cur, "requests", "GREEN_FILENAME",   "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "BLUE_FILENAME",    "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "ARCAMAX_FILENAME", "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "ORANGE_FILENAME",  "VARCHAR(500) NULL")
+
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS filedetails (
+                    id           INT AUTO_INCREMENT PRIMARY KEY,
+                    requestid    VARCHAR(64)  NOT NULL,
+                    requestname  VARCHAR(255) NOT NULL,
+                    filespath    VARCHAR(500) NULL,
+                    jsondata     MEDIUMTEXT   NULL,
+                    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                             ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_requestid (requestid)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
             admin_user = os.getenv("APP_DEFAULT_ADMIN", "admin")
@@ -104,7 +173,20 @@ def init_db():
         conn.close()
 
 
-# ─── DB helpers ───────────────────────────────────────────────
+
+def _add_column_if_missing(cur, table, column, column_def):
+    try:
+        cur.execute(
+            f"ALTER TABLE `{table}` ADD COLUMN `{column}` {column_def}"
+        )
+    except Exception as exc:
+        if "1060" not in str(exc) and "Duplicate column" not in str(exc):
+            raise
+
+
+
+# ─── DB helpers ───────────────────────────────────────────────────────
+
 
 def get_user_by_username(username):
     conn = get_db()
@@ -119,6 +201,7 @@ def get_user_by_username(username):
         conn.close()
 
 
+
 def is_request_name_taken(name):
     conn = get_db()
     try:
@@ -129,11 +212,40 @@ def is_request_name_taken(name):
         conn.close()
 
 
+
+def _resolve_channel_statuses(channel_str):
+    """
+    Given a comma-separated channel string (e.g. "GREEN,ORANGE" or "ALL"),
+    return a dict of initial per-channel STATUS values:
+      - selected channels   -> None           (updated after job finishes)
+      - unselected channels -> 'NOT_SELECTED'
+    When channel_str is 'ALL', every channel is considered selected.
+    """
+    if channel_str.upper() == "ALL":
+        selected = set(_ALL_CHANNELS)
+    else:
+        selected = {ch.strip().upper() for ch in channel_str.split(",") if ch.strip()}
+
+    statuses = {}
+    for ch in _ALL_CHANNELS:
+        statuses[f"{ch}_STATUS"] = None if ch in selected else "NOT_SELECTED"
+    return statuses
+
+
+
 def insert_request(record):
     """Insert a new request row and return the auto-increment DB id."""
     conn = get_db()
     try:
         with conn.cursor() as cur:
+            # Normalise channel: store as comma-separated string (e.g. "GREEN,ORANGE")
+            channel_val = record["channel"]
+            if isinstance(channel_val, list):
+                channel_val = ",".join(channel_val)
+
+            # Pre-compute initial per-channel STATUS values
+            ch_statuses = _resolve_channel_statuses(channel_val)
+
             cur.execute(
                 """
                 INSERT INTO requests (
@@ -141,33 +253,79 @@ def insert_request(record):
                     created_by, criteria_type, comp_type, channel,
                     criteria_value, zip_file_path, output_dir, overall_status,
                     command_text, log_file, stdout_text, stderr_text,
-                    return_code, started_at, finished_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    return_code, started_at, finished_at,
+                    GREEN_STATUS, BLUE_STATUS, ARCAMAX_STATUS, ORANGE_STATUS
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
                     record["request_uuid"], record["request_name"], record["request_type"],
                     record["client_name"], record["created_by"], record["criteria_type"],
-                    record["comp_type"], record["channel"], record.get("criteria_value"),
+                    record["comp_type"], channel_val, record.get("criteria_value"),
                     record.get("zip_file_path"), record["output_dir"], record["overall_status"],
                     record.get("command_text"), record.get("log_file"),
                     record.get("stdout_text", ""), record.get("stderr_text", ""),
-                    record.get("return_code"), record.get("started_at"), record.get("finished_at")
+                    record.get("return_code"), record.get("started_at"), record.get("finished_at"),
+                    ch_statuses["GREEN_STATUS"], ch_statuses["BLUE_STATUS"],
+                    ch_statuses["ARCAMAX_STATUS"], ch_statuses["ORANGE_STATUS"],
                 )
             )
-            return cur.lastrowid   # ← return the new DB id
+            return cur.lastrowid
     finally:
         conn.close()
 
 
+
+def upsert_filedetails(request_uuid, request_name, filespath, file_details):
+    jsondata = json.dumps(file_details, indent=2)
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO filedetails (requestid, requestname, filespath, jsondata)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    requestname = VALUES(requestname),
+                    filespath   = VALUES(filespath),
+                    jsondata    = VALUES(jsondata)
+                """,
+                (request_uuid, request_name, filespath, jsondata)
+            )
+    finally:
+        conn.close()
+
+
+
+def fetch_filedetails(request_uuid):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT jsondata FROM filedetails WHERE requestid=%s",
+                (request_uuid,)
+            )
+            row = cur.fetchone()
+            if not row or not row[0]:
+                return []
+            return json.loads(row[0])
+    finally:
+        conn.close()
+
+
+
 def update_request_db(request_uuid, **kwargs):
+    """Update request row. Accepts both core columns and per-channel columns."""
     if not kwargs:
         return
-    allowed = {"overall_status", "command_text", "log_file", "stdout_text",
-               "stderr_text", "return_code", "started_at", "finished_at"}
+    _core_allowed = {
+        "overall_status", "command_text", "log_file", "stdout_text",
+        "stderr_text", "return_code", "started_at", "finished_at",
+    }
+    allowed = _core_allowed | _CHANNEL_COLUMNS
     fields, values = [], []
     for key, value in kwargs.items():
         if key in allowed:
-            fields.append(f"{key}=%s")
+            fields.append(f"`{key}`=%s")
             values.append(value)
     if not fields:
         return
@@ -180,41 +338,71 @@ def update_request_db(request_uuid, **kwargs):
         conn.close()
 
 
+
 def fetch_all_requests(limit=200):
+    """Fetch all requests including per-channel statuses and file details."""
     conn = get_db()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT r.request_uuid, r.request_name, r.request_type, r.client_name,
-                       r.criteria_type, r.comp_type, r.channel, r.criteria_value,
-                       r.zip_file_path, r.output_dir, r.overall_status,
-                       r.created_at, r.started_at, r.finished_at, r.return_code, u.username
+                SELECT
+                    r.request_uuid, r.request_name, r.request_type, r.client_name,
+                    r.criteria_type, r.comp_type, r.channel, r.criteria_value,
+                    r.zip_file_path, r.output_dir, r.overall_status,
+                    r.created_at, r.started_at, r.finished_at, r.return_code,
+                    u.username,
+                    r.GREEN_STATUS, r.BLUE_STATUS, r.ARCAMAX_STATUS, r.ORANGE_STATUS,
+                    r.APPTNESS_STATUS,
+                    r.GREEN_FTP,    r.BLUE_FTP,    r.ARCAMAX_FTP,    r.ORANGE_FTP,
+                    r.GREEN_FILECOUNT, r.BLUE_FILECOUNT, r.ARCAMAX_FILECOUNT, r.ORANGE_FILECOUNT,
+                    r.GREEN_FILENAME,  r.BLUE_FILENAME,  r.ARCAMAX_FILENAME,  r.ORANGE_FILENAME
                 FROM requests r
                 JOIN users u ON u.id = r.created_by
                 ORDER BY r.id DESC
                 LIMIT %s
             """, (limit,))
             rows = cur.fetchall()
-            return [{
-                "request_uuid":   row[0],
-                "request_name":   row[1],
-                "request_type":   row[2],
-                "client_name":    row[3],
-                "criteria_type":  row[4],
-                "comp_type":      row[5],
-                "channel":        row[6],
-                "criteria_value": row[7],
-                "zip_file_path":  row[8],
-                "output_dir":     row[9],
-                "overall_status": row[10],
-                "created_at":     str(row[11]),
-                "started_at":     str(row[12]) if row[12] else None,
-                "finished_at":    str(row[13]) if row[13] else None,
-                "return_code":    row[14],
-                "username":       row[15],
-            } for row in rows]
+            results = []
+            for row in rows:
+                results.append({
+                    "request_uuid":     row[0],
+                    "request_name":     row[1],
+                    "request_type":     row[2],
+                    "client_name":      row[3],
+                    "criteria_type":    row[4],
+                    "comp_type":        row[5],
+                    "channel":          row[6],
+                    "criteria_value":   row[7],
+                    "zip_file_path":    row[8],
+                    "output_dir":       row[9],
+                    "overall_status":   row[10],
+                    "created_at":       str(row[11]),
+                    "started_at":       str(row[12]) if row[12] else None,
+                    "finished_at":      str(row[13]) if row[13] else None,
+                    "return_code":      row[14],
+                    "username":         row[15],
+                    "GREEN_STATUS":     row[16] or "",
+                    "BLUE_STATUS":      row[17] or "",
+                    "ARCAMAX_STATUS":   row[18] or "",
+                    "ORANGE_STATUS":    row[19] or "",
+                    "APPTNESS_STATUS":  row[20] or "",
+                    "GREEN_FTP":        row[21] or "",
+                    "BLUE_FTP":         row[22] or "",
+                    "ARCAMAX_FTP":      row[23] or "",
+                    "ORANGE_FTP":       row[24] or "",
+                    "GREEN_FILECOUNT":  row[25] or "",
+                    "BLUE_FILECOUNT":   row[26] or "",
+                    "ARCAMAX_FILECOUNT":row[27] or "",
+                    "ORANGE_FILECOUNT": row[28] or "",
+                    "GREEN_FILENAME":   row[29] or "",
+                    "BLUE_FILENAME":    row[30] or "",
+                    "ARCAMAX_FILENAME": row[31] or "",
+                    "ORANGE_FILENAME":  row[32] or "",
+                })
+            return results
     finally:
         conn.close()
+
 
 
 def fetch_dashboard_stats():
@@ -236,6 +424,7 @@ def fetch_dashboard_stats():
             failed = int(row[2] or 0)
             inprogress = int(row[3] or 0)
 
+
             cur.execute("""
                 SELECT request_type,
                        SUM(overall_status='completed') AS completed,
@@ -247,17 +436,20 @@ def fetch_dashboard_stats():
             for r in cur.fetchall():
                 by_type[r[0]] = {"completed": int(r[1] or 0), "failed": int(r[2] or 0), "total": int(r[3] or 0)}
 
+
             cur.execute("""
                 SELECT criteria_type, COUNT(*) AS total
                 FROM requests GROUP BY criteria_type
             """)
             by_criteria = {r[0]: int(r[1] or 0) for r in cur.fetchall()}
 
+
             cur.execute("""
                 SELECT channel, COUNT(*) AS total
                 FROM requests GROUP BY channel
             """)
             by_channel = {r[0]: int(r[1] or 0) for r in cur.fetchall()}
+
 
             return {
                 "total": total,
@@ -274,15 +466,18 @@ def fetch_dashboard_stats():
         conn.close()
 
 
+
 def build_chart_data(stats):
     by_type     = stats.get("by_type", {})
     by_criteria = stats.get("by_criteria", {})
     by_channel  = stats.get("by_channel", {})
 
+
     type_labels    = list(by_type.keys())
     type_values    = [v["total"]     for v in by_type.values()]
     type_completed = [v["completed"] for v in by_type.values()]
     type_failed    = [v["failed"]    for v in by_type.values()]
+
 
     return {
         "type_labels":      type_labels    if type_labels    else ["No data"],
@@ -296,6 +491,7 @@ def build_chart_data(stats):
     }
 
 
+
 def find_latest_log(output_dir):
     log_dir = Path(output_dir) / "logs"
     if not log_dir.exists():
@@ -304,24 +500,39 @@ def find_latest_log(output_dir):
     return str(files[0]) if files else None
 
 
+
 def build_command(payload, db_id, uploaded_zip=None):
-    """Build the CLI command for main.py.
-    For age/state criteria, passes --request-id so age_state_new.py can
-    look up all parameters from the DB directly.
+    """
+    Build the subprocess command list for main.py.
+
+    The --channel flag is repeated once per channel so argparse (action='append')
+    receives individual valid choices instead of a comma-joined string.
+
+    Example:
+        channels_raw = "GREEN,ORANGE"
+        -> [..., '--channel', 'GREEN', '--channel', 'ORANGE', ...]
     """
     criteria = payload["criteria_type"]
+
+    # Split comma-separated channels, strip whitespace, deduplicate
+    raw_channels = payload["channel"].upper()
+    channels = list(dict.fromkeys(
+        ch.strip() for ch in raw_channels.split(",") if ch.strip()
+    ))
 
     cmd = [
         PYTHON_BIN, SCRIPT_NAME,
         "--request-type",  payload["request_type"],
         "--criteria-type", criteria,
         "--comp-type",     payload["comp_type"],
-        "--channel",       payload["channel"],
         "--output-dir",    payload["output_dir"],
     ]
 
+    # Append one --channel flag per channel value
+    for ch in channels:
+        cmd.extend(["--channel", ch])
+
     if criteria in ("age", "state"):
-        # age_state_new.py reads everything from DB via request_id
         cmd.extend(["--request-id", str(db_id)])
         if criteria == "age":
             cmd.extend(["--age", str(payload["criteria_value"])])
@@ -333,7 +544,8 @@ def build_command(payload, db_id, uploaded_zip=None):
     return cmd
 
 
-def run_job(request_uuid, cmd, output_dir):
+
+def run_job(request_uuid, request_name, cmd, output_dir):
     update_request_db(
         request_uuid,
         overall_status="inprogress",
@@ -349,6 +561,7 @@ def run_job(request_uuid, cmd, output_dir):
         )
         stdout_text = proc.stdout.decode("utf-8", "ignore") if proc.stdout else ""
         stderr_text = proc.stderr.decode("utf-8", "ignore") if proc.stderr else ""
+        log_file    = find_latest_log(output_dir)
         update_request_db(
             request_uuid,
             overall_status="completed" if proc.returncode == 0 else "failed",
@@ -356,8 +569,14 @@ def run_job(request_uuid, cmd, output_dir):
             return_code=proc.returncode,
             stdout_text=stdout_text[-20000:],
             stderr_text=stderr_text[-20000:],
-            log_file=find_latest_log(output_dir),
+            log_file=log_file,
         )
+
+
+        if proc.returncode == 0:
+            _persist_filedetails_to_db(request_uuid, request_name, output_dir)
+
+
     except Exception as exc:
         update_request_db(
             request_uuid,
@@ -369,7 +588,70 @@ def run_job(request_uuid, cmd, output_dir):
         )
 
 
-# ─── Auth routes ──────────────────────────────────────────────
+
+def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
+    """
+    Read filedetails.json produced by send_success_email, upsert it into
+    the filedetails table, AND update the per-channel columns on the
+    requests table (GREEN_STATUS, GREEN_FILENAME, GREEN_FILECOUNT, etc.)
+    so the UI shows real values instead of N/A.
+    """
+    out_path   = Path(output_dir)
+    json_files = sorted(
+        out_path.glob("**/logs/filedetails.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+    if not json_files:
+        return
+    latest_json = json_files[0]
+    try:
+        with open(str(latest_json), "r") as jf:
+            file_details = json.load(jf)
+
+
+        # ── 1. Upsert into filedetails table (unchanged) ──────────────
+        upsert_filedetails(request_uuid, request_name, str(latest_json), file_details)
+
+
+        # ── 2. Update per-channel columns on requests table ───────────
+        channel_updates = {}
+        for fd in file_details:
+            ch = (fd.get("channel") or "").upper().strip()
+            if ch not in {"GREEN", "BLUE", "ARCAMAX", "ORANGE"}:
+                # Try to derive channel from filename (e.g. Client_Supp_GREEN_20260723.csv)
+                fname = fd.get("filename", "")
+                for possible_ch in ("GREEN", "BLUE", "ARCAMAX", "ORANGE"):
+                    if possible_ch in fname.upper():
+                        ch = possible_ch
+                        break
+            if not ch:
+                continue
+
+
+            fname     = fd.get("filename", "")
+            row_count = fd.get("file_count") or fd.get("row_count") or ""
+
+
+            channel_updates[f"{ch}_STATUS"]    = "completed"
+            channel_updates[f"{ch}_FILENAME"]  = fname
+            channel_updates[f"{ch}_FILECOUNT"] = str(row_count) if row_count else ""
+
+
+        if channel_updates:
+            update_request_db(request_uuid, **channel_updates)
+
+
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).error(
+            f"_persist_filedetails_to_db failed for {request_uuid}: {exc}"
+        )
+
+
+
+# ─── Auth routes ───────────────────────────────────────────────────────
+
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -385,6 +667,7 @@ def login():
     return render_template('login.html')
 
 
+
 @app.route('/logout')
 @login_required
 def logout():
@@ -392,7 +675,9 @@ def logout():
     return redirect(url_for('login'))
 
 
-# ─── Page routes ──────────────────────────────────────────────
+
+# ─── Page routes ──────────────────────────────────────────────────────
+
 
 @app.route('/')
 @login_required
@@ -408,6 +693,7 @@ def dashboard():
                            active_page='dashboard')
 
 
+
 @app.route('/new-request')
 @login_required
 def new_request():
@@ -416,6 +702,7 @@ def new_request():
                            recent=recent,
                            username=session.get('username'),
                            active_page='new_request')
+
 
 
 @app.route('/requests')
@@ -428,13 +715,16 @@ def requests_list():
                            active_page='requests')
 
 
+
 @app.route('/home')
 @login_required
 def home():
     return redirect(url_for('dashboard'))
 
 
-# ─── API routes ───────────────────────────────────────────────
+
+# ─── API routes ───────────────────────────────────────────────────────
+
 
 @app.route('/api/check-name')
 @login_required
@@ -446,10 +736,12 @@ def api_check_name():
     return jsonify({'available': not taken})
 
 
+
 @app.route('/api/requests')
 @login_required
 def api_requests():
     return jsonify({'items': fetch_all_requests()})
+
 
 
 @app.route('/api/analytics')
@@ -459,6 +751,15 @@ def api_analytics():
     recent = fetch_all_requests(limit=10)
     stats['recent_requests'] = recent
     return jsonify(stats)
+
+
+
+@app.route('/api/filedetails/<request_uuid>')
+@login_required
+def api_filedetails(request_uuid):
+    """Return file details for a given request UUID from the DB table."""
+    return jsonify({'items': fetch_filedetails(request_uuid)})
+
 
 
 @app.route('/api/submit', methods=['POST'])
@@ -472,8 +773,20 @@ def submit_request():
     client_name    = form.get('client_name', '').strip()
     criteria_type  = form.get('criteria_type', '').strip().lower()
     comp_type      = form.get('comp_type', '').strip().lower()
-    channel        = form.get('channel', 'ALL').strip().upper()
     criteria_value = form.get('criteria_value', '').strip()
+
+    # ── Read channel(s) ────────────────────────────────────────────────
+    # The JS sends each selected channel as a separate field:
+    #   channel=GREEN&channel=BLUE&channel=ARCAMAX
+    # form.getlist('channel') collects them all into a list.
+    # Fallback: accept a legacy comma-string via 'channels' field.
+    channel_list = form.getlist('channel')   # e.g. ['GREEN', 'BLUE', 'ARCAMAX']
+    if not channel_list:
+        # Backward-compat: single comma-joined string from older clients
+        channels_fallback = form.get('channels', '').strip().upper()
+        channel_list = [ch.strip() for ch in channels_fallback.split(',') if ch.strip()]
+    else:
+        channel_list = [ch.strip().upper() for ch in channel_list if ch.strip()]
 
     if not request_name:
         return jsonify({'ok': False, 'error': 'Request Name is required.'}), 400
@@ -488,12 +801,21 @@ def submit_request():
         client_name   = 'Doordash'
         criteria_type = 'zips'
         comp_type     = 'include'
-        channel       = 'ALL'
+        channel_list  = ['ALL']
 
     if criteria_type == 'age' and comp_type not in {'greater', 'less'}:
         return jsonify({'ok': False, 'error': 'Age criteria requires comp type greater or less.'}), 400
     if criteria_type in {'state', 'zips'} and comp_type not in {'include', 'exclude'}:
         return jsonify({'ok': False, 'error': 'State/Zips criteria requires include or exclude comp type.'}), 400
+
+    # Validate each channel
+    valid_channels = {'ALL', 'GREEN', 'BLUE', 'ORANGE', 'ARCAMAX'}
+    submitted_channels = list(dict.fromkeys(channel_list))   # deduplicate, preserve order
+    if not submitted_channels:
+        return jsonify({'ok': False, 'error': 'At least one channel must be selected.'}), 400
+    invalid = [ch for ch in submitted_channels if ch not in valid_channels]
+    if invalid:
+        return jsonify({'ok': False, 'error': f'Invalid channel(s): {", ".join(invalid)}. Choose from {sorted(valid_channels)}.'}), 400
 
     if criteria_type == 'age':
         if not criteria_value.isdigit():
@@ -517,18 +839,20 @@ def submit_request():
     safe_name  = "".join(c if c.isalnum() or c in '-_' else '_' for c in request_name)
     output_dir = str(BASE_DIR / "output" / safe_name)
 
+    # Build the final comma-separated channel string stored in DB
+    channel_str = ",".join(submitted_channels)   # e.g. "GREEN,BLUE,ARCAMAX"
+
     payload = {
         "request_type":   request_type,
         "criteria_type":  criteria_type,
         "comp_type":      comp_type,
-        "channel":        channel,
+        "channel":        channel_str,
         "criteria_value": criteria_value,
         "output_dir":     output_dir,
     }
 
     request_uuid = uuid.uuid4().hex
 
-    # Insert first to get the DB id, then build command with that id
     db_id = insert_request({
         "request_uuid":   request_uuid,
         "request_name":   request_name,
@@ -537,7 +861,7 @@ def submit_request():
         "created_by":     session['user_id'],
         "criteria_type":  criteria_type,
         "comp_type":      comp_type,
-        "channel":        channel,
+        "channel":        channel_str,
         "criteria_value": criteria_value,
         "zip_file_path":  str(saved_zip) if saved_zip else None,
         "output_dir":     output_dir,
@@ -552,17 +876,21 @@ def submit_request():
     })
 
     cmd = build_command(payload, db_id, saved_zip)
-
-    # Update command_text now that we have the real command
     update_request_db(request_uuid, command_text=" ".join(shlex.quote(c) for c in cmd))
 
-    threading.Thread(target=run_job, args=(request_uuid, cmd, output_dir), daemon=True).start()
+    threading.Thread(
+        target=run_job,
+        args=(request_uuid, request_name, cmd, output_dir),
+        daemon=True
+    ).start()
     return jsonify({'ok': True, 'request_uuid': request_uuid, 'request_name': request_name})
+
 
 
 @app.route('/health')
 def health():
     return jsonify({'ok': True, 'time': now_str()})
+
 
 
 if __name__ == '__main__':

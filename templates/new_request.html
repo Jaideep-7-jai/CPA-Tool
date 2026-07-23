@@ -1,21 +1,22 @@
 {% extends "dashboard.html" %}
 {% block title %}New Request{% endblock %}
 {% block page_title %}New Request{% endblock %}
-{% block breadcrumb %}<span class="breadcrumb">New Request</span>{% endblock %}
+{% block breadcrumb %}<span class="breadcrumb">Requests &rsaquo; New</span>{% endblock %}
 
 {% block content %}
 <div class="request-page-container">
 
-  <!-- Form -->
+  <!-- ── Form ─────────────────────────────────── -->
   <section class="form-section">
     <h2>Create Request</h2>
     <form id="requestForm" class="request-form" enctype="multipart/form-data">
 
       <!-- 1. Request Name -->
       <div class="form-group">
-        <label for="request_name">Request Name</label>
+        <label for="request_name"><i class="bi bi-tag-fill" style="color:var(--primary);margin-right:5px;"></i>Request Name</label>
         <div class="input-with-status">
-          <input type="text" name="request_name" id="request_name" required placeholder="e.g. CPA_AGE_55_JUN2026" autocomplete="off">
+          <input type="text" name="request_name" id="request_name" required
+                 placeholder="e.g. CPA_AGE_55_JUN2026" autocomplete="off">
           <span id="nameStatus" class="name-status"></span>
         </div>
         <small>Must be unique across all requests.</small>
@@ -23,42 +24,43 @@
 
       <!-- 2. Request Type -->
       <div class="form-group">
-        <label for="request_type">Request Type</label>
+        <label for="request_type"><i class="bi bi-layers-fill" style="color:var(--primary);margin-right:5px;"></i>Request Type</label>
         <select name="request_type" id="request_type" required>
-          <option value="">-- Select --</option>
-          <option value="Suppression">Suppression</option>
-          <option value="Mailing">Mailing</option>
-          <option value="Doordash">Doordash</option>
+          <option value="">-- Select Type --</option>
+          <option value="Suppression">🛡️ Suppression</option>
+          <option value="Mailing">📧 Mailing</option>
+          <option value="Doordash">🚪 Doordash</option>
         </select>
       </div>
 
       <!-- 3. Client Name -->
       <div class="form-group">
-        <label for="client_name">Client Name</label>
+        <label for="client_name"><i class="bi bi-building" style="color:var(--primary);margin-right:5px;"></i>Client Name</label>
         <input type="text" name="client_name" id="client_name" required placeholder="Enter client name">
       </div>
 
       <!-- 4. Criteria Type -->
       <div class="form-group">
-        <label for="criteria_type">Criteria Type</label>
+        <label for="criteria_type"><i class="bi bi-funnel-fill" style="color:var(--primary);margin-right:5px;"></i>Criteria Type</label>
         <select name="criteria_type" id="criteria_type" required>
-          <option value="">-- Select --</option>
-          <option value="age">Age</option>
-          <option value="state">State</option>
-          <option value="zips">Zips</option>
+          <option value="">-- Select Criteria --</option>
+          <option value="age">🎂 Age</option>
+          <option value="state">🗺️ State</option>
+          <option value="zips">📮 Zips</option>
         </select>
       </div>
 
-      <!-- 5. Criteria Value (hidden for Doordash/Zips) -->
+      <!-- 5. Criteria Value -->
       <div class="form-group" id="criteriaValueGroup">
-        <label for="criteria_value" id="criteriaValueLabel">Criteria Value</label>
-        <input type="text" name="criteria_value" id="criteria_value" placeholder="e.g. 55 for Age, CA,TX for State">
+        <label for="criteria_value" id="criteriaValueLabel"><i class="bi bi-input-cursor-text" style="color:var(--primary);margin-right:5px;"></i>Criteria Value</label>
+        <input type="text" name="criteria_value" id="criteria_value"
+               placeholder="e.g. 55 for Age, CA,TX for State">
         <small id="criteriaValueHint">Enter the value for the selected criteria type.</small>
       </div>
 
       <!-- 6. Comp Type -->
       <div class="form-group" id="compTypeGroup">
-        <label for="comp_type">Comp Type</label>
+        <label for="comp_type"><i class="bi bi-sliders" style="color:var(--primary);margin-right:5px;"></i>Comp Type</label>
         <select name="comp_type" id="comp_type" required>
           <option value="include">Include</option>
           <option value="exclude">Exclude</option>
@@ -69,62 +71,73 @@
 
       <!-- 7. Channel -->
       <div class="form-group">
-        <label for="channel">Channel</label>
-        <select name="channel" id="channel" required>
-          <option value="ALL">All</option>
-          <option value="GREEN">Green</option>
-          <option value="BLUE">Blue</option>
-          <option value="ORANGE">Orange</option>
-          <option value="ARCAMAX">Arcamax</option>
-        </select>
+        <label><i class="bi bi-broadcast-pin" style="color:var(--primary);margin-right:5px;"></i>Channel</label>
+        <input type="hidden" name="channel_hidden" id="channel_hidden" value="">
+        <div class="channel-multi-wrapper" id="channelWrapper">
+          <label class="channel-option" id="lbl_ALL">
+            <input type="checkbox" name="channel" value="ALL" id="chAll"> All Channels
+          </label>
+          <label class="channel-option" id="lbl_GREEN">
+            <input type="checkbox" name="channel" value="GREEN" id="chGreen"> 🟢 Green
+          </label>
+          <label class="channel-option" id="lbl_BLUE">
+            <input type="checkbox" name="channel" value="BLUE" id="chBlue"> 🔵 Blue
+          </label>
+          <label class="channel-option" id="lbl_ORANGE">
+            <input type="checkbox" name="channel" value="ORANGE" id="chOrange"> 🟠 Orange
+          </label>
+          <label class="channel-option" id="lbl_ARCAMAX">
+            <input type="checkbox" name="channel" value="ARCAMAX" id="chArcamax"> ⚡ Arcamax
+          </label>
+        </div>
+        <small id="channelHint">Select one or more channels. "All Channels" overrides others.</small>
       </div>
 
-      <!-- 8. File Upload (Zips / Doordash) -->
+      <!-- 8. File Upload -->
       <div class="form-group hidden" id="fileUploadGroup">
-        <label for="zip_file">ZIP Codes File</label>
+        <label for="zip_file"><i class="bi bi-file-earmark-zip-fill" style="color:var(--primary);margin-right:5px;"></i>ZIP Codes File</label>
         <div class="file-upload-area" id="fileDropArea">
           <input type="file" name="zip_file" id="zip_file" accept=".csv,.txt" class="file-input">
           <div class="file-upload-label">
             <span class="file-icon">📁</span>
-            <span id="fileLabel">Click to select or drag & drop a CSV/TXT file</span>
+            <span id="fileLabel">Click to select or drag &amp; drop a CSV/TXT file</span>
           </div>
         </div>
         <small>CSV or TXT with ZIP codes (one per line or comma-separated).</small>
       </div>
 
-      <button type="submit" class="submit-button" id="submitBtn">Submit Request</button>
+      <button type="submit" class="submit-button" id="submitBtn" style="width:100%;justify-content:center;">
+        <i class="bi bi-send-fill"></i> Submit Request
+      </button>
       <p id="formMessage" class="message"></p>
     </form>
   </section>
 
-  <!-- Recent Requests -->
+  <!-- ── History Sidebar ───────────────────────── -->
   <section class="history-section">
     <h2>Recent Requests</h2>
-    <div class="requests-history">
-      {% if recent %}
-        <div class="history-list">
-          {% for r in recent %}
-          <div class="history-item">
-            <div class="item-header">
-              <strong>{{ r.request_name }}</strong>
-              <span class="badge {{ r.overall_status|lower }}">{{ r.overall_status }}</span>
-            </div>
-            <div class="item-meta">
-              <span class="tag">{{ r.request_type }}</span>
-              <span class="tag">{{ r.criteria_type|upper }}</span>
-              <span class="tag">{{ r.channel }}</span>
-            </div>
-            <div class="item-meta">
-              <span>By: {{ r.username }}</span>
-              <span>{{ r.created_at }}</span>
-            </div>
+    {% if recent %}
+      <div class="history-list">
+        {% for r in recent %}
+        <div class="history-item">
+          <div class="item-header">
+            <strong title="{{ r.request_name }}">{{ r.request_name[:28] }}{% if r.request_name|length > 28 %}…{% endif %}</strong>
+            <span class="badge {{ r.overall_status|lower }}">{{ r.overall_status }}</span>
           </div>
-          {% endfor %}
+          <div class="item-meta">
+            <span class="badge-type {{ r.request_type|lower }}">{{ r.request_type }}</span>
+            <span class="badge-criteria">{{ r.criteria_type|upper }}</span>
+            <span class="tag">{{ r.channel }}</span>
+          </div>
+          <div class="item-meta" style="margin-top:4px;">
+            <span style="font-size:.72rem;color:var(--faint);">By {{ r.username }} &bull; {{ r.created_at[:16] }}</span>
+          </div>
         </div>
-      {% else %}
-        <p class="no-data">No requests yet. Submit one!</p>
-      {% endif %}
-    </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="no-data">No requests yet. Submit one!</p>
+    {% endif %}
   </section>
 
 </div>
@@ -132,4 +145,14 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', filename='request-form.js') }}" defer></script>
+<script>
+// Sync checkbox → visual "checked" class
+document.querySelectorAll('.channel-option').forEach(lbl => {
+  const cb = lbl.querySelector('input[type=checkbox]');
+  if (!cb) return;
+  cb.addEventListener('change', () => {
+    lbl.classList.toggle('checked', cb.checked);
+  });
+});
+</script>
 {% endblock %}

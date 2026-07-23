@@ -26,9 +26,13 @@ def parse_args():
     parser.add_argument("--comp-type",     required=True,
                         choices=["greater", "less", "include", "exclude"],
                         help="Comparison / inclusion type")
+    # Accept one or more channel values: --channel GREEN --channel ORANGE
+    # or a single value like --channel ALL
     parser.add_argument("--channel",       required=True,
                         choices=["ALL", "GREEN", "BLUE", "ORANGE", "ARCAMAX"],
-                        help="Channel to process")
+                        action="append",
+                        dest="channels",
+                        help="Channel(s) to process. Repeat flag for multiple: --channel GREEN --channel ORANGE")
     parser.add_argument("--output-dir",    required=True,
                         help="Output directory")
     # Criteria-specific args
@@ -47,14 +51,19 @@ def main():
     criteria = args.criteria_type.lower()
     req_type = args.request_type
 
+    # Normalise: if ALL is present, treat as ["ALL"]; otherwise deduplicate
+    channels = list(dict.fromkeys(args.channels))  # preserve order, deduplicate
+    if "ALL" in channels:
+        channels = ["ALL"]
+
     if criteria in ("age", "state"):
-        from AGE_STATE.age_state_new import process_age_state_request
+        from AGE_STATE.age_state import process_age_state_request
         if args.request_id is None:
             print("[ERROR] --request-id is required for age/state criteria", file=sys.stderr)
             sys.exit(1)
         process_age_state_request(
             request_id=args.request_id,
-            channel=args.channel,
+            channel=channels,
         )
 
     elif criteria == "zips":
@@ -63,7 +72,7 @@ def main():
             request_type=req_type,
             zip_file=args.zip_file,
             comp_type=args.comp_type,
-            channel=args.channel,
+            channel=channels,
             output_dir=args.output_dir,
         )
 
