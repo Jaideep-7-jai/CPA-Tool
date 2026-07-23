@@ -68,6 +68,7 @@
           {% for r in requests %}
           {% set sel = r.channel.split(',') if r.channel else [] %}
           {% set is_all = (r.channel == 'ALL') %}
+          {% set cv = r.criteria_value or '-' %}
 
           <tr class="req-row"
               data-channels="{{ r.channel }}"
@@ -96,12 +97,25 @@
             <td><strong>{{ r.request_name }}</strong></td>
             <td><span class="badge-type {{ r.request_type|lower }}">{{ r.request_type }}</span></td>
             <td><span class="badge-criteria">{{ r.criteria_type|upper }}</span></td>
-            <td class="muted small">{{ r.criteria_value or '-' }}</td>
+
+            {# Value cell — truncate to 10 chars with tooltip if longer #}
+            <td class="muted small">
+              {% if cv|length > 10 %}
+                <span class="value-truncated" title="{{ cv }}">{{ cv[:10] }}&hellip;</span>
+              {% else %}
+                {{ cv }}
+              {% endif %}
+            </td>
+
             <td class="muted small">{{ r.comp_type }}</td>
+
+            {# Channel tags — inline (side by side) #}
             <td>
-              {% for ch in sel %}
-                <span class="tag">{{ ch.strip() }}</span>
-              {% endfor %}
+              <div class="channel-tags-inline">
+                {% for ch in sel %}
+                  <span class="tag">{{ ch.strip() }}</span>
+                {% endfor %}
+              </div>
             </td>
 
             {# Green #}
@@ -185,7 +199,7 @@
 
 {% block scripts %}
 <script>
-// ── Filtering ──────────────────────────────────────────────────
+// ── Filtering ──────���───────────────────────────────────────────
 const search  = document.getElementById('searchInput');
 const typeF   = document.getElementById('typeFilter');
 const critF   = document.getElementById('criteriaFilter');
@@ -233,19 +247,10 @@ const COLORS = {
 
 let hideTimer;
 
-// ── Channel name -> row data-attribute key mapping ────────────
-function getRowDatasetKey(channel, attr) {
-  // e.g. channel="ARCAMAX", attr="filepath" -> "filepathArcamax"
-  const ch = channel.charAt(0).toUpperCase() + channel.slice(1).toLowerCase();
-  return attr + ch;
-}
-
-// ── Fetch filedetails from DB and show popup ──────────────────
 function showPopup(badge) {
   clearTimeout(hideTimer);
   const channel   = badge.dataset.channel  || '';
   const status    = (badge.dataset.status  || '').trim();
-  // Get file details from data attributes
   const ftp       = (badge.dataset.ftp      || '').trim();
   const filecount = (badge.dataset.filecount || '').trim();
   const filename  = (badge.dataset.filename  || '').trim();
@@ -261,7 +266,6 @@ function showPopup(badge) {
   popStatus.style.background = colors.bg;
   popStatus.style.color      = colors.color;
 
-  // Position popup
   const rect = badge.getBoundingClientRect();
   const left = Math.min(rect.left + window.scrollX, window.innerWidth - 360);
   popup.style.left = left + 'px';
@@ -274,13 +278,11 @@ function showPopup(badge) {
     return;
   }
 
-  // If we already have data attributes populated, render immediately
   if (ftp || filecount || filename || filepath) {
     renderPopupBody(ftp, filecount, filename, filepath);
     return;
   }
 
-  // Otherwise fetch from /api/filedetails/<uuid> for this row's channel
   const tr   = badge.closest('tr');
   const uuid = tr ? tr.dataset.uuid : null;
   if (!uuid) {
@@ -302,11 +304,7 @@ function showPopup(badge) {
         return;
       }
       const fd = items[0];
-      const ftpVal      = fd.ftp_path  || '';
-      const fcVal       = String(fd.file_count !== undefined ? fd.file_count : (fd.row_count || 0));
-      const fnVal       = fd.filename  || '';
-      const fpVal       = fd.path      || '';
-      renderPopupBody(ftpVal, fcVal, fnVal, fpVal);
+      renderPopupBody(fd.ftp_path||'', String(fd.file_count!==undefined?fd.file_count:(fd.row_count||0)), fd.filename||'', fd.path||'');
     })
     .catch(() => {
       popBody.innerHTML = '<div class="popup-no-data">Completed — no file details recorded</div>';
