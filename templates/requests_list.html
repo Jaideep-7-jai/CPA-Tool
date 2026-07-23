@@ -1,20 +1,19 @@
 {% extends "dashboard.html" %}
 {% block title %}All Requests{% endblock %}
 {% block page_title %}All Requests{% endblock %}
-{% block breadcrumb %}<span>All Requests</span>{% endblock %}
+{% block breadcrumb %}<span class="breadcrumb">Requests &rsaquo; All</span>{% endblock %}
 
 {% block content %}
+<div class="analytics-container">
 
-<!-- ═══ FILTERS ═══════════════════════════════════════════ -->
-<div class="table-card mb-4">
-  <div class="filters-bar">
-    <input type="text" id="searchInput" class="filter-input"
-           placeholder="🔍  Search name, type, criteria...">
+  <!-- ── Filters ────────────────────────────────── -->
+  <section class="filters-bar">
+    <input type="text" id="searchInput" placeholder="🔍 Search name, type, criteria..." class="filter-input">
     <select id="typeFilter" class="filter-select">
       <option value="">All Types</option>
-      <option>Suppression</option>
-      <option>Mailing</option>
-      <option>Doordash</option>
+      <option value="Suppression">Suppression</option>
+      <option value="Mailing">Mailing</option>
+      <option value="Doordash">Doordash</option>
     </select>
     <select id="criteriaFilter" class="filter-select">
       <option value="">All Criteria</option>
@@ -34,300 +33,265 @@
       <option value="BLUE">Blue</option>
       <option value="ORANGE">Orange</option>
       <option value="ARCAMAX">Arcamax</option>
-      <option value="ALL">ALL</option>
+      <option value="ALL">All (combined)</option>
     </select>
-  </div>
+  </section>
+
+  <!-- ── Table ─────────────────────────────────── -->
+  <section class="table-section">
+    <div class="table-header">
+      <h3>All Requests <span id="rowCount" class="row-count"></span></h3>
+      <a href="{{ url_for('new_request') }}" class="submit-button small">
+        <i class="bi bi-plus-lg"></i> New Request
+      </a>
+    </div>
+    <div class="table-scroll">
+      <table class="requests-table" id="requestsTable">
+        <thead>
+          <tr>
+            <th>Request Name</th>
+            <th>Type</th>
+            <th>Criteria</th>
+            <th>Value</th>
+            <th>Comp</th>
+            <th>Channel</th>
+            <th>Green</th>
+            <th>Blue</th>
+            <th>Arcamax</th>
+            <th>Orange</th>
+            <th>Overall</th>
+            <th>Created By</th>
+            <th>Created At</th>
+          </tr>
+        </thead>
+        <tbody id="requestsBody">
+          {% for r in requests %}
+          {% set sel = r.channel.split(',') if r.channel else [] %}
+          {% set is_all = (r.channel == 'ALL') %}
+
+          <tr class="req-row"
+              data-channels="{{ r.channel }}"
+              data-status-green="{{ r.GREEN_STATUS }}"
+              data-status-blue="{{ r.BLUE_STATUS }}"
+              data-status-arcamax="{{ r.ARCAMAX_STATUS }}"
+              data-status-orange="{{ r.ORANGE_STATUS }}"
+              data-ftp-green="{{ r.GREEN_FTP }}"
+              data-ftp-blue="{{ r.BLUE_FTP }}"
+              data-ftp-arcamax="{{ r.ARCAMAX_FTP }}"
+              data-ftp-orange="{{ r.ORANGE_FTP }}"
+              data-filecount-green="{{ r.GREEN_FILECOUNT }}"
+              data-filecount-blue="{{ r.BLUE_FILECOUNT }}"
+              data-filecount-arcamax="{{ r.ARCAMAX_FILECOUNT }}"
+              data-filecount-orange="{{ r.ORANGE_FILECOUNT }}"
+              data-filename-green="{{ r.GREEN_FILENAME }}"
+              data-filename-blue="{{ r.BLUE_FILENAME }}"
+              data-filename-arcamax="{{ r.ARCAMAX_FILENAME }}"
+              data-filename-orange="{{ r.ORANGE_FILENAME }}">
+
+            <td><strong>{{ r.request_name }}</strong></td>
+            <td><span class="badge-type {{ r.request_type|lower }}">{{ r.request_type }}</span></td>
+            <td><span class="badge-criteria">{{ r.criteria_type|upper }}</span></td>
+            <td class="muted small">{{ r.criteria_value or '-' }}</td>
+            <td class="muted small">{{ r.comp_type }}</td>
+            <td>
+              {% for ch in sel %}
+                <span class="tag">{{ ch.strip() }}</span>
+              {% endfor %}
+            </td>
+
+            {# Green #}
+            <td>
+              {% if is_all or 'GREEN' in sel %}
+                {% set st = (r.GREEN_STATUS or 'pending')|lower|replace(' ','_') %}
+                <span class="badge-status {{ st }} has-popup"
+                      data-channel="GREEN"
+                      data-status="{{ r.GREEN_STATUS or 'Pending' }}"
+                      data-ftp="{{ r.GREEN_FTP }}"
+                      data-filecount="{{ r.GREEN_FILECOUNT }}"
+                      data-filename="{{ r.GREEN_FILENAME }}">{{ r.GREEN_STATUS or 'Pending' }}</span>
+              {% else %}<span class="muted small">N/A</span>{% endif %}
+            </td>
+
+            {# Blue #}
+            <td>
+              {% if is_all or 'BLUE' in sel %}
+                {% set st = (r.BLUE_STATUS or 'pending')|lower|replace(' ','_') %}
+                <span class="badge-status {{ st }} has-popup"
+                      data-channel="BLUE"
+                      data-status="{{ r.BLUE_STATUS or 'Pending' }}"
+                      data-ftp="{{ r.BLUE_FTP }}"
+                      data-filecount="{{ r.BLUE_FILECOUNT }}"
+                      data-filename="{{ r.BLUE_FILENAME }}">{{ r.BLUE_STATUS or 'Pending' }}</span>
+              {% else %}<span class="muted small">N/A</span>{% endif %}
+            </td>
+
+            {# Arcamax #}
+            <td>
+              {% if is_all or 'ARCAMAX' in sel %}
+                {% set st = (r.ARCAMAX_STATUS or 'pending')|lower|replace(' ','_') %}
+                <span class="badge-status {{ st }} has-popup"
+                      data-channel="ARCAMAX"
+                      data-status="{{ r.ARCAMAX_STATUS or 'Pending' }}"
+                      data-ftp="{{ r.ARCAMAX_FTP }}"
+                      data-filecount="{{ r.ARCAMAX_FILECOUNT }}"
+                      data-filename="{{ r.ARCAMAX_FILENAME }}">{{ r.ARCAMAX_STATUS or 'Pending' }}</span>
+              {% else %}<span class="muted small">N/A</span>{% endif %}
+            </td>
+
+            {# Orange #}
+            <td>
+              {% if is_all or 'ORANGE' in sel %}
+                {% set st = (r.ORANGE_STATUS or 'pending')|lower|replace(' ','_') %}
+                <span class="badge-status {{ st }} has-popup"
+                      data-channel="ORANGE"
+                      data-status="{{ r.ORANGE_STATUS or 'Pending' }}"
+                      data-ftp="{{ r.ORANGE_FTP }}"
+                      data-filecount="{{ r.ORANGE_FILECOUNT }}"
+                      data-filename="{{ r.ORANGE_FILENAME }}">{{ r.ORANGE_STATUS or 'Pending' }}</span>
+              {% else %}<span class="muted small">N/A</span>{% endif %}
+            </td>
+
+            <td><span class="badge {{ r.overall_status|lower }}">{{ r.overall_status }}</span></td>
+            <td>{{ r.username }}</td>
+            <td class="muted small">{{ r.created_at }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="13" class="text-center muted" style="padding:30px;">No requests found.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
 </div>
 
-<!-- ═══ TABLE ════════════════════════════════════════════ -->
-<div class="table-card">
-  <div class="table-card-header">
-    <span class="section-title">
-      <i class="bi bi-table" style="color:var(--primary)"></i>
-      All Requests
-      <span class="count-pill" id="rowCount"></span>
-    </span>
-    <a href="{{ url_for('new_request') }}" class="btn-primary-cpa">
-      <i class="bi bi-plus-lg"></i> New Request
-    </a>
-  </div>
-
-  <div class="table-scroll">
-    <table class="adv-table" id="requestsTable">
-      <thead>
-        <tr>
-          <th>Request Name</th>
-          <th>Type</th>
-          <th>Criteria</th>
-          <th>Value</th>
-          <th>Comp</th>
-          <th>Channel</th>
-          <th>
-            <span class="ch-dot ch-green"></span>Green
-          </th>
-          <th>
-            <span class="ch-dot ch-blue"></span>Blue
-          </th>
-          <th>
-            <span class="ch-dot ch-arcamax"></span>Arcamax
-          </th>
-          <th>
-            <span class="ch-dot ch-orange"></span>Orange
-          </th>
-          <th>Overall</th>
-          <th>Created By</th>
-          <th>Created At</th>
-        </tr>
-      </thead>
-      <tbody id="requestsBody">
-        {% for r in requests %}
-        {% set sel  = r.channel.split(',') if r.channel else [] %}
-        {% set isAll = (r.channel|upper == 'ALL') %}
-
-        <tr class="req-row"
-            data-channels="{{ r.channel }}"
-            data-status-green="{{ r.GREEN_STATUS }}"
-            data-status-blue="{{ r.BLUE_STATUS }}"
-            data-status-arcamax="{{ r.ARCAMAX_STATUS }}"
-            data-status-orange="{{ r.ORANGE_STATUS }}"
-            data-ftp-green="{{ r.GREEN_FTP }}"
-            data-ftp-blue="{{ r.BLUE_FTP }}"
-            data-ftp-arcamax="{{ r.ARCAMAX_FTP }}"
-            data-ftp-orange="{{ r.ORANGE_FTP }}"
-            data-fc-green="{{ r.GREEN_FILECOUNT }}"
-            data-fc-blue="{{ r.BLUE_FILECOUNT }}"
-            data-fc-arcamax="{{ r.ARCAMAX_FILECOUNT }}"
-            data-fc-orange="{{ r.ORANGE_FILECOUNT }}"
-            data-fn-green="{{ r.GREEN_FILENAME }}"
-            data-fn-blue="{{ r.BLUE_FILENAME }}"
-            data-fn-arcamax="{{ r.ARCAMAX_FILENAME }}"
-            data-fn-orange="{{ r.ORANGE_FILENAME }}">
-
-          <td class="td-name">{{ r.request_name }}</td>
-          <td><span class="badge-pill bt-{{ r.request_type|lower }}">{{ r.request_type }}</span></td>
-          <td><span class="tag">{{ r.criteria_type|upper }}</span></td>
-          <td class="td-muted">{{ r.criteria_value or '—' }}</td>
-          <td class="td-muted">{{ r.comp_type }}</td>
-          <td>
-            {% for ch in sel %}
-              <span class="ch-tag">{{ ch.strip() }}</span>
-            {% endfor %}
-          </td>
-
-          {# ── GREEN ── #}
-          <td>
-            {% if isAll or 'GREEN' in sel %}
-              {% set st = (r.GREEN_STATUS or '')|lower|replace(' ','_') %}
-              <span class="badge-pill bp-{{ st if st else 'pending' }} has-popup"
-                    data-channel="GREEN"
-                    data-status="{{ r.GREEN_STATUS or '' }}"
-                    data-ftp="{{ r.GREEN_FTP or '' }}"
-                    data-filecount="{{ r.GREEN_FILECOUNT or '' }}"
-                    data-filename="{{ r.GREEN_FILENAME or '' }}"
-                    tabindex="0" role="button">
-                {% if (r.GREEN_STATUS or '')|lower == 'completed' %}<i class="bi bi-check-circle-fill me-1"></i>{% endif %}
-                {{ r.GREEN_STATUS or '—' }}
-              </span>
-            {% else %}
-              <span class="badge-pill bp-na">N/A</span>
-            {% endif %}
-          </td>
-
-          {# ── BLUE ── #}
-          <td>
-            {% if isAll or 'BLUE' in sel %}
-              {% set st = (r.BLUE_STATUS or '')|lower|replace(' ','_') %}
-              <span class="badge-pill bp-{{ st if st else 'pending' }} has-popup"
-                    data-channel="BLUE"
-                    data-status="{{ r.BLUE_STATUS or '' }}"
-                    data-ftp="{{ r.BLUE_FTP or '' }}"
-                    data-filecount="{{ r.BLUE_FILECOUNT or '' }}"
-                    data-filename="{{ r.BLUE_FILENAME or '' }}"
-                    tabindex="0" role="button">
-                {% if (r.BLUE_STATUS or '')|lower == 'completed' %}<i class="bi bi-check-circle-fill me-1"></i>{% endif %}
-                {{ r.BLUE_STATUS or '—' }}
-              </span>
-            {% else %}
-              <span class="badge-pill bp-na">N/A</span>
-            {% endif %}
-          </td>
-
-          {# ── ARCAMAX ── #}
-          <td>
-            {% if isAll or 'ARCAMAX' in sel %}
-              {% set st = (r.ARCAMAX_STATUS or '')|lower|replace(' ','_') %}
-              <span class="badge-pill bp-{{ st if st else 'pending' }} has-popup"
-                    data-channel="ARCAMAX"
-                    data-status="{{ r.ARCAMAX_STATUS or '' }}"
-                    data-ftp="{{ r.ARCAMAX_FTP or '' }}"
-                    data-filecount="{{ r.ARCAMAX_FILECOUNT or '' }}"
-                    data-filename="{{ r.ARCAMAX_FILENAME or '' }}"
-                    tabindex="0" role="button">
-                {% if (r.ARCAMAX_STATUS or '')|lower == 'completed' %}<i class="bi bi-check-circle-fill me-1"></i>{% endif %}
-                {{ r.ARCAMAX_STATUS or '—' }}
-              </span>
-            {% else %}
-              <span class="badge-pill bp-na">N/A</span>
-            {% endif %}
-          </td>
-
-          {# ── ORANGE ── #}
-          <td>
-            {% if isAll or 'ORANGE' in sel %}
-              {% set st = (r.ORANGE_STATUS or '')|lower|replace(' ','_') %}
-              <span class="badge-pill bp-{{ st if st else 'pending' }} has-popup"
-                    data-channel="ORANGE"
-                    data-status="{{ r.ORANGE_STATUS or '' }}"
-                    data-ftp="{{ r.ORANGE_FTP or '' }}"
-                    data-filecount="{{ r.ORANGE_FILECOUNT or '' }}"
-                    data-filename="{{ r.ORANGE_FILENAME or '' }}"
-                    tabindex="0" role="button">
-                {% if (r.ORANGE_STATUS or '')|lower == 'completed' %}<i class="bi bi-check-circle-fill me-1"></i>{% endif %}
-                {{ r.ORANGE_STATUS or '—' }}
-              </span>
-            {% else %}
-              <span class="badge-pill bp-na">N/A</span>
-            {% endif %}
-          </td>
-
-          <td>
-            {% set ost = r.overall_status|lower %}
-            <span class="badge-pill bp-{{ ost }}">
-              {% if ost == 'completed' %}<i class="bi bi-check-circle-fill me-1"></i>
-              {% elif ost == 'failed' %}<i class="bi bi-x-circle-fill me-1"></i>
-              {% elif ost == 'inprogress' %}<i class="bi bi-arrow-repeat me-1"></i>
-              {% endif %}{{ r.overall_status }}
-            </span>
-          </td>
-          <td class="td-muted">{{ r.username }}</td>
-          <td class="td-muted text-sm">{{ r.created_at }}</td>
-        </tr>
-        {% else %}
-        <tr><td colspan="13" class="text-center py-5 text-muted">No requests found.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
-
-<!-- Popup element -->
+<!-- Shared hover popup -->
 <div id="statusPopup" class="status-popup" role="tooltip" aria-hidden="true">
   <div class="popup-header">
-    <span class="popup-ch-name"></span>
-    <span class="popup-status-badge badge-pill"></span>
+    <span class="popup-channel-name"></span>
+    <span class="popup-status-badge"></span>
   </div>
   <div class="popup-body"></div>
 </div>
-
 {% endblock %}
 
 {% block scripts %}
 <script>
-// ── Filtering ────────────────────────────────────────────
-const si = document.getElementById('searchInput');
-const tf = document.getElementById('typeFilter');
-const cf = document.getElementById('criteriaFilter');
-const sf = document.getElementById('statusFilter');
-const chf= document.getElementById('channelFilter');
-const rc = document.getElementById('rowCount');
+// ── Filtering ──────────────────────────────────────────────────
+const search  = document.getElementById('searchInput');
+const typeF   = document.getElementById('typeFilter');
+const critF   = document.getElementById('criteriaFilter');
+const statF   = document.getElementById('statusFilter');
+const chanF   = document.getElementById('channelFilter');
+const countEl = document.getElementById('rowCount');
 
-function filterTable() {
-  const q  = si.value.toLowerCase();
-  const t  = tf.value.toLowerCase();
-  const c  = cf.value.toLowerCase();
-  const s  = sf.value.toLowerCase();
-  const ch = chf.value.toUpperCase();
-  let vis = 0;
+function filterRows() {
+  const q    = search.value.toLowerCase();
+  const type = typeF.value.toLowerCase();
+  const crit = critF.value.toLowerCase();
+  const stat = statF.value.toLowerCase();
+  const chan  = chanF.value.toUpperCase();
+  let visible = 0;
   document.querySelectorAll('.req-row').forEach(tr => {
-    const txt = tr.textContent.toLowerCase();
-    const channels = (tr.dataset.channels || '').toUpperCase();
-    const show = (!q || txt.includes(q))
-              && (!t || txt.includes(t))
-              && (!c || txt.includes(c))
-              && (!s || txt.includes(s))
-              && (!ch || channels.includes(ch));
+    const txt   = tr.textContent.toLowerCase();
+    const chans = (tr.dataset.channels || '').toUpperCase();
+    const allSt = [tr.dataset.statusGreen,tr.dataset.statusBlue,tr.dataset.statusArcamax,tr.dataset.statusOrange].join(' ').toLowerCase();
+    const show  = (!q    || txt.includes(q))
+               && (!type || txt.includes(type))
+               && (!crit || txt.includes(crit))
+               && (!stat || txt.includes(stat) || allSt.includes(stat))
+               && (!chan  || chans.includes(chan));
     tr.style.display = show ? '' : 'none';
-    if (show) vis++;
+    if (show) visible++;
   });
-  rc.textContent = vis;
+  countEl.textContent = `(${visible})`;
 }
-[si,tf,cf,sf,chf].forEach(el => el.addEventListener('input', filterTable));
-filterTable();
+[search, typeF, critF, statF, chanF].forEach(el => el.addEventListener('input', filterRows));
+filterRows();
 
-// ── Status popup ─────────────────────────────────────────
-const popup    = document.getElementById('statusPopup');
-const popChName= popup.querySelector('.popup-ch-name');
-const popBadge = popup.querySelector('.popup-status-badge');
-const popBody  = popup.querySelector('.popup-body');
+// ── Status Popup ──────────────────────────────────────────────
+const popup       = document.getElementById('statusPopup');
+const popChanName = popup.querySelector('.popup-channel-name');
+const popStatus   = popup.querySelector('.popup-status-badge');
+const popBody     = popup.querySelector('.popup-body');
 
-const BADGE_CLS = { completed:'bp-completed', failed:'bp-failed', inprogress:'bp-inprogress', not_selected:'bp-not_selected', '':'bp-pending' };
-let hideT = null;
+const COLORS = {
+  completed:    { bg:'#dcfce7', color:'#16a34a' },
+  failed:       { bg:'#fee2e2', color:'#dc2626' },
+  inprogress:   { bg:'#fef3c7', color:'#d97706' },
+  not_selected: { bg:'#f3f4f6', color:'#9ca3af' },
+  pending:      { bg:'#f3f4f6', color:'#6b7280' },
+};
+
+let hideTimer;
 
 function showPopup(badge) {
-  clearTimeout(hideT);
-  const ch     = badge.dataset.channel  || '';
-  const status = (badge.dataset.status  || '').trim();
-  const ftp    = (badge.dataset.ftp     || '').trim();
-  const fc     = (badge.dataset.filecount|| '').trim();
-  const fn     = (badge.dataset.filename|| '').trim();
-  if (!status) return;
+  clearTimeout(hideTimer);
+  const channel   = badge.dataset.channel  || '';
+  const status    = (badge.dataset.status  || '').trim();
+  const ftp       = (badge.dataset.ftp     || '').trim();
+  const filecount = (badge.dataset.filecount || '').trim();
+  const filename  = (badge.dataset.filename || '').trim();
+  if (!status || status === '-') return;
 
-  const sk = status.toLowerCase().replace(/ /g,'_');
-  const isComplete = sk === 'completed';
+  const key      = status.toLowerCase().replace(/ /g,'_');
+  const isComp   = key === 'completed';
+  const hasData  = ftp || filecount || filename;
+  const colors   = COLORS[key] || COLORS.pending;
 
-  popChName.textContent = ch;
-  popBadge.className = 'popup-status-badge badge-pill ' + (BADGE_CLS[sk] || 'bp-pending');
-  popBadge.textContent = status;
+  popChanName.textContent    = channel;
+  popStatus.textContent      = status;
+  popStatus.style.background = colors.bg;
+  popStatus.style.color      = colors.color;
 
   let html = '';
-  if (isComplete) {
-    if (ftp) {
-      html += `<div class="popup-row">
-        <span class="popup-label">FTP Path</span>
-        <span><span class="popup-value">${esc(ftp)}</span><br>
-        <button class="popup-copy" data-copy="${escA(ftp)}">📋 Copy</button></span>
-      </div>`;
-    }
-    if (fc)  html += `<div class="popup-row"><span class="popup-label">Files</span><span class="popup-value">${esc(fc)}</span></div>`;
-    if (fn) {
-      html += `<div class="popup-row">
-        <span class="popup-label">Filename</span>
-        <span><span class="popup-value">${esc(fn)}</span><br>
-        <button class="popup-copy" data-copy="${escA(fn)}">📋 Copy</button></span>
-      </div>`;
-    }
-    if (!html) html = `<div class="popup-nodata">Completed — no file details recorded</div>`;
+  if (isComp && hasData) {
+    if (ftp) html += row('FTP Path',   ftp,      true);
+    if (filecount) html += row('File Count', filecount, false);
+    if (filename)  html += row('File Name',  filename,  true);
+  } else if (isComp) {
+    html = '<div class="popup-no-data">Completed — no file details recorded</div>';
   } else {
-    html = `<div class="popup-nodata">No file details for this status</div>`;
+    html = '<div class="popup-no-data">No file details for this status</div>';
   }
   popBody.innerHTML = html;
 
-  popBody.querySelectorAll('.popup-copy').forEach(btn => {
+  popBody.querySelectorAll('.popup-copy-btn').forEach(btn => {
     btn.addEventListener('click', e => {
       e.stopPropagation();
       navigator.clipboard.writeText(btn.dataset.copy).then(() => {
-        btn.textContent = '✔ Copied!'; btn.classList.add('copied');
-        setTimeout(() => { btn.textContent = '📋 Copy'; btn.classList.remove('copied'); }, 1800);
-      }).catch(() => {
-        const ta = Object.assign(document.createElement('textarea'),{value:btn.dataset.copy,style:'position:fixed;opacity:0'});
-        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
-        btn.textContent = '✔ Copied!'; btn.classList.add('copied');
-        setTimeout(() => { btn.textContent = '📋 Copy'; btn.classList.remove('copied'); }, 1800);
-      });
+        btn.innerHTML = '✔ Copied'; btn.classList.add('copied');
+        setTimeout(() => { btn.innerHTML = '⎘ Copy'; btn.classList.remove('copied'); }, 1800);
+      }).catch(() => fallbackCopy(btn));
     });
   });
 
   const rect = badge.getBoundingClientRect();
-  const left = Math.min(rect.left + window.scrollX, window.innerWidth - 380);
+  const left = Math.min(rect.left + window.scrollX, window.innerWidth - 360);
   popup.style.left = left + 'px';
-  popup.style.top  = (rect.bottom + window.scrollY + 7) + 'px';
+  popup.style.top  = (rect.bottom + window.scrollY + 6) + 'px';
   popup.setAttribute('aria-hidden','false');
   popup.classList.add('visible');
 }
 
-function hidePopup() {
-  hideT = setTimeout(() => { popup.classList.remove('visible'); popup.setAttribute('aria-hidden','true'); }, 160);
+function row(label, val, copyable) {
+  return `<div class="popup-row">
+    <span class="popup-label">${label}</span>
+    <span>
+      <span class="popup-value">${esc(val)}</span>
+      ${copyable ? `<br><button class="popup-copy-btn" data-copy="${escAttr(val)}">⎘ Copy</button>` : ''}
+    </span>
+  </div>`;
 }
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function escAttr(s) { return s.replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+function fallbackCopy(btn) {
+  const ta = document.createElement('textarea');
+  ta.value = btn.dataset.copy; ta.style.cssText='position:fixed;opacity:0';
+  document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+  btn.innerHTML='✔ Copied'; btn.classList.add('copied');
+  setTimeout(()=>{ btn.innerHTML='⎘ Copy'; btn.classList.remove('copied'); },1800);
+}
+function hidePopup() { hideTimer = setTimeout(() => { popup.classList.remove('visible'); popup.setAttribute('aria-hidden','true'); }, 160); }
 
 document.querySelectorAll('.has-popup').forEach(b => {
   b.addEventListener('mouseenter', () => showPopup(b));
@@ -335,10 +299,7 @@ document.querySelectorAll('.has-popup').forEach(b => {
   b.addEventListener('focus',      () => showPopup(b));
   b.addEventListener('blur',       hidePopup);
 });
-popup.addEventListener('mouseenter', () => clearTimeout(hideT));
+popup.addEventListener('mouseenter', () => clearTimeout(hideTimer));
 popup.addEventListener('mouseleave', hidePopup);
-
-function esc(s)  { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-function escA(s) { return s.replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 </script>
 {% endblock %}
