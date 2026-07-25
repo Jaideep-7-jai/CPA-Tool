@@ -24,17 +24,19 @@ def ensure_output_dir(output_dir, criteria_type):
     Create output directory if not exists + add timestamped run subdir.
 
     Layout:
-        <output_dir>/run_age_<YYYYMMDD_HHMMSS>/
+        <output_dir>/run_<criteria_type>_<YYYYMMDD_HHMMSS>/
             logs/         <- combined + per-channel log files + filedetails.json
             FINAL_DIR/    <- final output CSVs/ZIPs that remain after run
 
     Each execution gets its own isolated folder with full date+time stamp.
+    The prefix reflects the actual criteria type (age / state / zips).
     """
     path = Path(output_dir)
     path.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    safe_dir = path / f"run_age_{timestamp}"
+    safe_criteria = (criteria_type or "run").lower().strip()
+    safe_dir = path / f"run_{safe_criteria}_{timestamp}"
     safe_dir.mkdir(exist_ok=True)
 
     # Pre-create logs/ and FINAL_DIR/ so they always exist
@@ -187,6 +189,17 @@ def _count_rows_in_file(filepath):
         return 0
 
 
+def _get_file_size_bytes(filepath):
+    """
+    Return the file size in bytes, or 0 on any error.
+    """
+    try:
+        return Path(str(filepath)).stat().st_size
+    except Exception as e:
+        logging.warning(f"_get_file_size_bytes failed for {filepath}: {e}")
+        return 0
+
+
 def build_file_details_json(final_files_dir, results=None):
     """
     Scan FINAL_FILES/ directory and build a list of file-detail dicts.
@@ -194,6 +207,7 @@ def build_file_details_json(final_files_dir, results=None):
         filename   - basename of the file
         file_count - number of data rows in the file (header excluded)
         row_count  - same as file_count (kept for backward compat)
+        file_size_bytes - raw file size in bytes
         channel    - channel name derived from results dict or filename
         path       - full absolute path
 
@@ -224,12 +238,15 @@ def build_file_details_json(final_files_dir, results=None):
             if row_count is None or row_count == 0:
                 row_count = _count_rows_in_file(fp)
 
+            file_size_bytes = _get_file_size_bytes(fp)
+
             file_details.append({
-                "filename":   fname,
-                "file_count": row_count,   # NEW: renamed from size_mb -> file_count
-                "row_count":  row_count,   # kept for backward compat
-                "channel":    result_entry.get('channel', ''),
-                "path":       str(fp),
+                "filename":        fname,
+                "file_count":      row_count,        # number of data rows
+                "row_count":       row_count,         # kept for backward compat
+                "file_size_bytes": file_size_bytes,   # raw file size in bytes
+                "channel":         result_entry.get('channel', ''),
+                "path":            str(fp),
             })
     else:
         logging.warning(f"build_file_details_json: directory not found: {final_dir}")
@@ -250,12 +267,38 @@ def _read_filedetails_json(json_path):
         return []
 
 
+def _format_size_bytes(size_bytes):
+    """
+    Format a byte count into a human-readable string.
+    Examples:
+        512        -> "512 B"
+        1536       -> "1.5 KB"
+        2097152    -> "2.0 MB"
+        1073741824 -> "1.0 GB"
+    """
+    if size_bytes is None or size_bytes == 0:
+        return "0 B"
+    try:
+        size_bytes = int(size_bytes)
+    except (TypeError, ValueError):
+        return "0 B"
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 ** 2:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 ** 3:
+        return f"{size_bytes / 1024 ** 2:.1f} MB"
+    else:
+        return f"{size_bytes / 1024 ** 3:.1f} GB"
+
+
 def send_success_email(subject, results, run_dir):
     """
     Success email with rich per-file details.
 
     Steps performed:
-    1. Scan <run_dir>/FINAL_FILES/ to collect real file names + row counts.
+    1. Scan <run_dir>/FINAL_FILES/ to collect real file names, row counts
+       and file sizes in bytes.
     2. Merge row_count / channel from the `results` dict.
     3. Write <run_dir>/logs/filedetails.json  (persists for audit and DB
        upsert which is handled by app.py:_persist_filedetails_to_db after
@@ -299,10 +342,16 @@ def send_success_email(subject, results, run_dir):
     if email_file_details:
         lines = []
         for fd in email_file_details:
-            ch_tag = f"[{fd['channel']}] " if fd.get('channel') else ""
-            fc     = fd.get('file_count', fd.get('row_count', 0))
-            count_str = f"  |  {fc:,} records" if fc else ""
-            lines.append(f". {ch_tag}{fd['filename']} ({fc:,} records){count_str}")
+            ch_tag     = f"[{fd['channel']}] " if fd.get('channel') else ""
+            row_count  = fd.get('file_count', fd.get('row_count', 0)) or 0
+            size_bytes = fd.get('file_size_bytes', 0) or 0
+            size_str   = _format_size_bytes(size_bytes)
+            lines.append(
+                f"  . {ch_tag}{fd['filename']}"
+                f"  |  Rows: {row_count:,}"
+                f"  |  Size: {size_str}"
+                f"  |  Raw bytes: {size_bytes:,}"
+            )
         file_section = "\n".join(lines)
     else:
         file_section = "(no files found in FINAL_FILES directory)"
@@ -325,40 +374,3 @@ def send_error_email(subject, error_msg):
     """Error email"""
     body = f"ERROR: {subject}\n\n{error_msg}"
     send_email(subject, body, is_error=True)
-
-
-def load_zip_to_pg(zip_file, table_name, pg_config, truncate=True):
-    """Load ZIP directly to PostgreSQL staging table"""
-    import psycopg2
-    from zipfile import ZipFile
-
-    zip_path = Path(zip_file)
-    logger = logging.getLogger("zip_pg_loader")
-
-    conn = psycopg2.connect(
-        host=pg_config['host'],
-        database=pg_config['db'],
-        user=pg_config['user'],
-    )
-
-    cur = conn.cursor()
-    try:
-        cur.execute(f"DROP TABLE IF EXISTS {table_name};")
-        cur.execute(f"CREATE TABLE {table_name} (zip_code VARCHAR);")
-        cur.execute(f"TRUNCATE TABLE {table_name}")
-        with open(zip_file, "r") as f:
-            cur.copy_expert(f"COPY {table_name} FROM STDIN WITH CSV HEADER", f)
-
-        conn.commit()
-
-        cur.execute(f"SELECT COUNT(*) FROM {table_name};")
-        count = cur.fetchone()[0]
-        logging.info(f"PG Load complete: {count:,} records in {table_name}")
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"Error: {e}")
-        raise
-    finally:
-        cur.close()
-        conn.close()
-    return count
