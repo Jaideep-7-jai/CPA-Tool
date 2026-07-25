@@ -40,6 +40,8 @@ DB_CONFIG = {
 SCRIPT_NAME = os.getenv("SUPPRESSION_SCRIPT_PATH", str(BASE_DIR / "main.py"))
 PYTHON_BIN = os.getenv("APP_PYTHON_BIN", "python3.6")
 
+# Subprocess timeout in seconds for background jobs (default 2 hours)
+JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT_SECONDS", "7200"))
 
 # Per-channel DB columns that can be updated
 _CHANNEL_COLUMNS = {
@@ -47,8 +49,10 @@ _CHANNEL_COLUMNS = {
     "GREEN_FTP",    "BLUE_FTP",    "ARCAMAX_FTP",    "ORANGE_FTP",
     "GREEN_FILECOUNT",  "BLUE_FILECOUNT",  "ARCAMAX_FILECOUNT",  "ORANGE_FILECOUNT",
     "GREEN_FILENAME",   "BLUE_FILENAME",   "ARCAMAX_FILENAME",   "ORANGE_FILENAME",
-    # ── NEW: absolute local file path for each channel output file ──
+    # absolute local file path for each channel output file
     "GREEN_FILEPATH",   "BLUE_FILEPATH",   "ARCAMAX_FILEPATH",   "ORANGE_FILEPATH",
+    # file size in bytes for each channel output file
+    "GREEN_FILESIZE",   "BLUE_FILESIZE",   "ARCAMAX_FILESIZE",   "ORANGE_FILESIZE",
 }
 
 # All recognised channel names (excluding ALL)
@@ -126,6 +130,10 @@ def init_db():
                     BLUE_FILEPATH   VARCHAR(500) NULL,
                     ARCAMAX_FILEPATH VARCHAR(500) NULL,
                     ORANGE_FILEPATH VARCHAR(500) NULL,
+                    GREEN_FILESIZE  BIGINT       NULL,
+                    BLUE_FILESIZE   BIGINT       NULL,
+                    ARCAMAX_FILESIZE BIGINT      NULL,
+                    ORANGE_FILESIZE BIGINT       NULL,
                     command_text    TEXT NULL,
                     log_file        VARCHAR(500) NULL,
                     stdout_text     MEDIUMTEXT NULL,
@@ -138,7 +146,7 @@ def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
 
-            # ── Migrate existing installs ───────────────────────────────────
+            # ── Migrate existing installs ──────────────────────────────────
             # Fix channel: ENUM -> VARCHAR so 'GREEN,ORANGE' is stored correctly
             _modify_column_if_enum(cur, "requests", "channel",
                                    "VARCHAR(100) NOT NULL DEFAULT 'ALL'")
@@ -156,12 +164,15 @@ def init_db():
             _add_column_if_missing(cur, "requests", "BLUE_FILENAME",    "VARCHAR(500) NULL")
             _add_column_if_missing(cur, "requests", "ARCAMAX_FILENAME", "VARCHAR(500) NULL")
             _add_column_if_missing(cur, "requests", "ORANGE_FILENAME",  "VARCHAR(500) NULL")
-            # ── NEW filepath columns ────────────────────────────────────────
             _add_column_if_missing(cur, "requests", "GREEN_FILEPATH",   "VARCHAR(500) NULL")
             _add_column_if_missing(cur, "requests", "BLUE_FILEPATH",    "VARCHAR(500) NULL")
             _add_column_if_missing(cur, "requests", "ARCAMAX_FILEPATH", "VARCHAR(500) NULL")
             _add_column_if_missing(cur, "requests", "ORANGE_FILEPATH",  "VARCHAR(500) NULL")
-
+            # ── NEW: file size columns (bytes) ─────────────────────────────
+            _add_column_if_missing(cur, "requests", "GREEN_FILESIZE",   "BIGINT NULL")
+            _add_column_if_missing(cur, "requests", "BLUE_FILESIZE",    "BIGINT NULL")
+            _add_column_if_missing(cur, "requests", "ARCAMAX_FILESIZE", "BIGINT NULL")
+            _add_column_if_missing(cur, "requests", "ORANGE_FILESIZE",  "BIGINT NULL")
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS filedetails (
@@ -229,7 +240,7 @@ def _modify_column_if_enum(cur, table, column, new_def):
 
 
 
-# ─── DB helpers ───────────────────────────────────────────────────────
+# ─── DB helpers ─────────────────────────────────────────────────────
 
 
 def get_user_by_username(username):
@@ -400,7 +411,8 @@ def fetch_all_requests(limit=200):
                     r.GREEN_FTP,    r.BLUE_FTP,    r.ARCAMAX_FTP,    r.ORANGE_FTP,
                     r.GREEN_FILECOUNT, r.BLUE_FILECOUNT, r.ARCAMAX_FILECOUNT, r.ORANGE_FILECOUNT,
                     r.GREEN_FILENAME,  r.BLUE_FILENAME,  r.ARCAMAX_FILENAME,  r.ORANGE_FILENAME,
-                    r.GREEN_FILEPATH,  r.BLUE_FILEPATH,  r.ARCAMAX_FILEPATH,  r.ORANGE_FILEPATH
+                    r.GREEN_FILEPATH,  r.BLUE_FILEPATH,  r.ARCAMAX_FILEPATH,  r.ORANGE_FILEPATH,
+                    r.GREEN_FILESIZE,  r.BLUE_FILESIZE,  r.ARCAMAX_FILESIZE,  r.ORANGE_FILESIZE
                 FROM requests r
                 JOIN users u ON u.id = r.created_by
                 ORDER BY r.id DESC
@@ -447,6 +459,10 @@ def fetch_all_requests(limit=200):
                     "BLUE_FILEPATH":    row[34] or "",
                     "ARCAMAX_FILEPATH": row[35] or "",
                     "ORANGE_FILEPATH":  row[36] or "",
+                    "GREEN_FILESIZE":   row[37],
+                    "BLUE_FILESIZE":    row[38],
+                    "ARCAMAX_FILESIZE": row[39],
+                    "ORANGE_FILESIZE":  row[40],
                 })
             return results
     finally:
@@ -596,6 +612,7 @@ def build_command(payload, db_id, uploaded_zip=None):
 
 
 def run_job(request_uuid, request_name, cmd, output_dir):
+    import logging as _log
     update_request_db(
         request_uuid,
         overall_status="inprogress",
@@ -607,7 +624,8 @@ def run_job(request_uuid, request_name, cmd, output_dir):
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            cwd=str(BASE_DIR)
+            cwd=str(BASE_DIR),
+            timeout=JOB_TIMEOUT,
         )
         stdout_text = proc.stdout.decode("utf-8", "ignore") if proc.stdout else ""
         stderr_text = proc.stderr.decode("utf-8", "ignore") if proc.stderr else ""
@@ -622,11 +640,21 @@ def run_job(request_uuid, request_name, cmd, output_dir):
             log_file=log_file,
         )
 
-
         if proc.returncode == 0:
             _persist_filedetails_to_db(request_uuid, request_name, output_dir)
 
-
+    except subprocess.TimeoutExpired:
+        _log.getLogger(__name__).error(
+            f"run_job timeout ({JOB_TIMEOUT}s) for {request_uuid}"
+        )
+        update_request_db(
+            request_uuid,
+            overall_status="failed",
+            finished_at=now_str(),
+            return_code=-2,
+            stderr_text=f"Job timed out after {JOB_TIMEOUT} seconds.",
+            log_file=find_latest_log(output_dir),
+        )
     except Exception as exc:
         update_request_db(
             request_uuid,
@@ -644,11 +672,12 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
     Read filedetails.json produced by send_success_email, upsert it into
     the filedetails table, AND update the per-channel columns on the
     requests table (GREEN_STATUS, GREEN_FILENAME, GREEN_FILECOUNT,
-    GREEN_FILEPATH, etc.) so the UI shows real values instead of N/A.
+    GREEN_FILEPATH, GREEN_FILESIZE, etc.) so the UI shows real values.
 
     Only channels that are NOT already 'NOT_SELECTED' are overwritten,
     preserving the NOT_SELECTED sentinel for channels that were never run.
     """
+    import logging as _log
     out_path   = Path(output_dir)
     json_files = sorted(
         out_path.glob("**/logs/filedetails.json"),
@@ -662,7 +691,7 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
         with open(str(latest_json), "r") as jf:
             file_details = json.load(jf)
 
-        # ── 1. Upsert into filedetails table ─────────────────────────
+        # ── 1. Upsert into filedetails table ─────────────────────────────
         upsert_filedetails(request_uuid, request_name, str(latest_json), file_details)
 
         # ── 2. Fetch current channel statuses to guard NOT_SELECTED ──
@@ -705,28 +734,29 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
             if existing_statuses.get(ch) == "NOT_SELECTED":
                 continue
 
-            fname     = fd.get("filename", "")
-            row_count = fd.get("file_count") or fd.get("row_count") or ""
-            # 'path' is the absolute local file path written by build_file_details_json
-            filepath  = fd.get("path", "")
+            fname      = fd.get("filename", "")
+            row_count  = fd.get("file_count") or fd.get("row_count") or ""
+            filepath   = fd.get("path", "")
+            # file_size_bytes added by build_file_details_json in utils.py
+            file_size  = fd.get("file_size_bytes") or None
 
             channel_updates[f"{ch}_STATUS"]    = "completed"
             channel_updates[f"{ch}_FILENAME"]  = fname
             channel_updates[f"{ch}_FILECOUNT"] = str(row_count) if row_count else ""
             channel_updates[f"{ch}_FILEPATH"]  = filepath
+            channel_updates[f"{ch}_FILESIZE"]  = int(file_size) if file_size else None
 
         if channel_updates:
             update_request_db(request_uuid, **channel_updates)
 
     except Exception as exc:
-        import logging as _log
         _log.getLogger(__name__).error(
             f"_persist_filedetails_to_db failed for {request_uuid}: {exc}"
         )
 
 
 
-# ─── Auth routes ───────────────────────────────────────────────────────
+# ─── Auth routes ─────────────────────────────────────────────────────
 
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -752,7 +782,7 @@ def logout():
 
 
 
-# ─── Page routes ──────────────────────────────────────────────────────
+# ─── Page routes ──────────────────────────────────────────────────
 
 
 @app.route('/')
@@ -799,7 +829,7 @@ def home():
 
 
 
-# ─── API routes ───────────────────────────────────────────────────────
+# ─── API routes ──────────────────────────────────────────────────
 
 
 @app.route('/api/check-name')
@@ -851,7 +881,7 @@ def submit_request():
     comp_type      = form.get('comp_type', '').strip().lower()
     criteria_value = form.get('criteria_value', '').strip()
 
-    # ── Read channel(s) ────────────────────────────────────────────────
+    # ── Read channel(s) ─────────────────────────────────────────────
     # The JS sends each selected channel as a separate field:
     #   channel=GREEN&channel=BLUE&channel=ARCAMAX
     # form.getlist('channel') collects them all into a list.
