@@ -571,25 +571,45 @@ def _download_and_combine(s3_path, download_dir, work_dir,
     Download gzipped S3 parts and concatenate into one pipe-delimited file.
     ORANGE: keep all columns.  Others: keep col-1 (email) only.
     Header row (written by Snowflake COPY INTO HEADER=TRUE) is stripped.
+
+    FIX: Snowflake COPY INTO COMPRESSION=GZIP produces part files named
+         data_0_0_0.csv.gz  (or similar).  The previous glob('data*') only
+         matched files starting with 'data' which works BUT aws s3 cp
+         --recursive downloads the files preserving the prefix structure.
+         The real bug was that s3_path had NO trailing slash, causing
+         aws s3 cp to treat it as a single object copy (not a prefix copy)
+         and writing a single file named 'ORANGE_FINAL' with no extension
+         instead of the .gz parts inside the prefix — so glob('*.gz')
+         found nothing.  Fix: always append trailing slash to s3_path and
+         glob for '*.gz' to match Snowflake GZIP part files regardless of
+         naming scheme.
     """
     download_dir = Path(download_dir)
     work_dir     = Path(work_dir)
     download_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info(f"  S3 source   : {s3_path}")
+    # Always ensure trailing slash so aws s3 cp treats it as a prefix (folder)
+    s3_prefix = s3_path.rstrip("/") + "/"
+
+    log.info(f"  S3 source   : {s3_prefix}")
     log.info(f"  Download dir: {download_dir}")
     log.info(f"  Output file : {work_dir / output_file}")
     log.info("  Starting aws s3 cp (recursive) ...")
 
     run_command(
-        ["aws", "s3", "cp", s3_path, str(download_dir), "--recursive", "--quiet"]
+        ["aws", "s3", "cp", s3_prefix, str(download_dir), "--recursive", "--quiet"]
     )
 
-    downloaded = sorted(download_dir.glob("data*"))
+    # Snowflake COPY INTO COMPRESSION=GZIP produces *.csv.gz part files
+    downloaded = sorted(download_dir.glob("*.gz"))
+    if not downloaded:
+        # Fallback: check for any file (uncompressed edge case)
+        downloaded = sorted(f for f in download_dir.iterdir() if f.is_file())
+
     if not downloaded:
         raise RuntimeError(
-            f"aws s3 cp from {s3_path} downloaded 0 files into {download_dir}."
+            f"aws s3 cp from {s3_prefix} downloaded 0 files into {download_dir}."
         )
     log.info(
         f"  Downloaded {len(downloaded)} part file(s): "
@@ -601,17 +621,22 @@ def _download_and_combine(s3_path, download_dir, work_dir,
     if channel_name != "ORANGE":
         run_command(
             f"printf 'email\\n' > {shlex.quote(str(out_path))} && "
-            f"zcat {shlex.quote(str(download_dir) + '/')}data* "
+            f"zcat {shlex.quote(str(download_dir) + '/')}*.gz "
             f"| sed 's/\\\"//g' | tail -n +2 | cut -d'|' -f1 >> {shlex.quote(str(out_path))}"
         )
     else:
         run_command(
-            f"printf 'email\\n' > {shlex.quote(str(out_path))} && "
-            f"zcat {shlex.quote(str(download_dir) + '/')}data* "
+            f"printf 'email|account_name\\n' > {shlex.quote(str(out_path))} && "
+            f"zcat {shlex.quote(str(download_dir) + '/')}*.gz "
             f"| sed 's/\\\"//g' | tail -n +2 >> {shlex.quote(str(out_path))}"
         )
 
-    run_command(f"rm -f {str(download_dir / 'data*')}", cwd=str(download_dir))
+    # Clean up downloaded gz parts
+    for f in downloaded:
+        try:
+            f.unlink()
+        except Exception:
+            pass
 
     combined_count = _count_file_lines(str(out_path))
     log.info(f"  Combined file written: {out_path}  |  rows: {combined_count:,}")
@@ -990,6 +1015,7 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
 
         # ── STEP 6/7 ── Split per-ESP + ZIP archive ────────────────────────
         _step(log, 6, TOTAL_STEPS, "Splitting ORANGE file per-ESP + creating ZIP archive", channel_name)
+        # combined CSV was written by _download_and_combine into channel_tmp/output_file
         combined_path = channel_tmp / ctx["output_file"]
         df_final = pd.read_csv(
             str(combined_path),
@@ -1014,6 +1040,12 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
             cwd=str(channel_tmp)
         )
         log.info(f"  STEP 6 DONE: ESP ZIP archive created -> {zip_out}")
+
+        # Also copy the combined CSV (email-only suppression file) to FINAL_FILES/
+        supp_dest = final_files_dir / ctx["output_file"]
+        shutil.copy(str(combined_path), str(supp_dest))
+        log.info(f"  Suppression CSV copied -> FINAL_FILES/{ctx['output_file']}")
+
         _cleanup_channel_tmp(channel_tmp, log)
 
         # ── STEP 7/7 ──────────────────────────────────────────────────────
@@ -1021,9 +1053,7 @@ def process_orange_zip(request_id, zip_staging_table, run_dir: Path):
         update_request_status(request_id, "Posting To FTP", channel_status, log)
 
         # ORANGE suppression: email-only CSV
-        supp_file = ctx["output_file"]
-        shutil.copy(str(final_files_dir / ctx["output_file"]), str(final_files_dir / supp_file))
-        ftp_path_supp = _post_to_ftp(final_files_dir, ctx["path_date"], supp_file, log)
+        ftp_path_supp = _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
 
         # ORANGE mailing: ESP-split ZIP
         ftp_path_zip = _post_to_ftp(final_files_dir, ctx["path_date"], zip_out_name, log)
@@ -1067,7 +1097,7 @@ def process_zip_request(
     """
     Main entry point called by main.py.
 
-    request_id : DB request ID (used to fetch client_name, request_type, comp_type …)
+    request_id : DB request ID (used to fetch client_name, request_type, comp_type ...)
     zip_file   : absolute path to the ZIP codes file uploaded via UI
     channel    : list like ['ALL'] or ['GREEN', 'BLUE'] or single string 'ALL'
     output_dir : base output directory
