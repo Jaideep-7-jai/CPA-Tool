@@ -27,8 +27,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const chBlue    = document.getElementById('chBlue');
   const chOrange  = document.getElementById('chOrange');
   const chArcamax = document.getElementById('chArcamax');
+  const chApptness = document.getElementById('chApptness');
   const channelWrapper = document.getElementById('channelWrapper');
-  const individualChannels = [chGreen, chBlue, chOrange, chArcamax];
+  const individualChannels = [chGreen, chBlue, chOrange, chApptness, chArcamax];
 
   // Conditional groups
   const criteriaValueGroup = document.getElementById('criteriaValueGroup');

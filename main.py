@@ -4,7 +4,7 @@ CPA Tool – Entry point
 Routes incoming requests to the correct processing module:
   age / state  → AGE_STATE/age_state_new.py  (process_age_state_request)
   zips         → ZIPS/zips.py  (Suppression / Mailing)
-  doordash     → ZIPS/zips.py  (Doordash mode)
+  doordash     → Doordash/doordash_zips.py
 """
 
 import argparse
@@ -29,7 +29,7 @@ def parse_args():
     # Accept one or more channel values: --channel GREEN --channel ORANGE
     # or a single value like --channel ALL
     parser.add_argument("--channel",       required=True,
-                        choices=["ALL", "GREEN", "BLUE", "ORANGE", "ARCAMAX"],
+                        choices=["ALL", "GREEN", "BLUE", "ORANGE", "ARCAMAX", "APPTNESS"],
                         action="append",
                         dest="channels",
                         help="Channel(s) to process. Repeat flag for multiple: --channel GREEN --channel ORANGE")
@@ -67,11 +67,16 @@ def main():
         )
 
     elif criteria == "zips":
-        from ZIPS.zips import process_zip_request
+        if req_type == "Doordash":
+            from Doordash.doordash_zips import process_doordash_zip_request
+            processor = process_doordash_zip_request
+        else:
+            from ZIPS.zips import process_zip_request
+            processor = process_zip_request
         if args.request_id is None:
             print("[ERROR] --request-id is required for zips criteria", file=sys.stderr)
             sys.exit(1)
-        process_zip_request(
+        processor(
             request_id=args.request_id,
             zip_file=args.zip_file,
             channel=channels,
