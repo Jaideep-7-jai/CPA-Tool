@@ -46,17 +46,17 @@ JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT_SECONDS", "7200"))
 # Per-channel DB columns that can be updated
 _CHANNEL_COLUMNS = {
     "GREEN_STATUS", "BLUE_STATUS", "ARCAMAX_STATUS", "ORANGE_STATUS", "APPTNESS_STATUS",
-    "GREEN_FTP",    "BLUE_FTP",    "ARCAMAX_FTP",    "ORANGE_FTP",
-    "GREEN_FILECOUNT",  "BLUE_FILECOUNT",  "ARCAMAX_FILECOUNT",  "ORANGE_FILECOUNT",
-    "GREEN_FILENAME",   "BLUE_FILENAME",   "ARCAMAX_FILENAME",   "ORANGE_FILENAME",
+    "GREEN_FTP",    "BLUE_FTP",    "ARCAMAX_FTP",    "ORANGE_FTP",    "APPTNESS_FTP",
+    "GREEN_FILECOUNT",  "BLUE_FILECOUNT",  "ARCAMAX_FILECOUNT",  "ORANGE_FILECOUNT",  "APPTNESS_FILECOUNT",
+    "GREEN_FILENAME",   "BLUE_FILENAME",   "ARCAMAX_FILENAME",   "ORANGE_FILENAME",   "APPTNESS_FILENAME",
     # absolute local file path for each channel output file
-    "GREEN_FILEPATH",   "BLUE_FILEPATH",   "ARCAMAX_FILEPATH",   "ORANGE_FILEPATH",
+    "GREEN_FILEPATH",   "BLUE_FILEPATH",   "ARCAMAX_FILEPATH",   "ORANGE_FILEPATH",   "APPTNESS_FILEPATH",
     # file size in bytes for each channel output file
-    "GREEN_FILESIZE",   "BLUE_FILESIZE",   "ARCAMAX_FILESIZE",   "ORANGE_FILESIZE",
+    "GREEN_FILESIZE",   "BLUE_FILESIZE",   "ARCAMAX_FILESIZE",   "ORANGE_FILESIZE",   "APPTNESS_FILESIZE",
 }
 
 # All recognised channel names (excluding ALL)
-_ALL_CHANNELS = ("GREEN", "BLUE", "ARCAMAX", "ORANGE")
+_ALL_CHANNELS = ("GREEN", "BLUE", "ARCAMAX", "ORANGE", "APPTNESS")
 
 
 
@@ -118,22 +118,27 @@ def init_db():
                     BLUE_FTP        VARCHAR(500) NULL,
                     ARCAMAX_FTP     VARCHAR(500) NULL,
                     ORANGE_FTP      VARCHAR(500) NULL,
+                    APPTNESS_FTP    VARCHAR(500) NULL,
                     GREEN_FILECOUNT VARCHAR(50)  NULL,
                     BLUE_FILECOUNT  VARCHAR(50)  NULL,
                     ARCAMAX_FILECOUNT VARCHAR(50) NULL,
                     ORANGE_FILECOUNT VARCHAR(50) NULL,
+                    APPTNESS_FILECOUNT VARCHAR(50) NULL,
                     GREEN_FILENAME  VARCHAR(500) NULL,
                     BLUE_FILENAME   VARCHAR(500) NULL,
                     ARCAMAX_FILENAME VARCHAR(500) NULL,
                     ORANGE_FILENAME VARCHAR(500) NULL,
+                    APPTNESS_FILENAME VARCHAR(500) NULL,
                     GREEN_FILEPATH  VARCHAR(500) NULL,
                     BLUE_FILEPATH   VARCHAR(500) NULL,
                     ARCAMAX_FILEPATH VARCHAR(500) NULL,
                     ORANGE_FILEPATH VARCHAR(500) NULL,
+                    APPTNESS_FILEPATH VARCHAR(500) NULL,
                     GREEN_FILESIZE  BIGINT       NULL,
                     BLUE_FILESIZE   BIGINT       NULL,
                     ARCAMAX_FILESIZE BIGINT      NULL,
                     ORANGE_FILESIZE BIGINT       NULL,
+                    APPTNESS_FILESIZE BIGINT      NULL,
                     command_text    TEXT NULL,
                     log_file        VARCHAR(500) NULL,
                     stdout_text     MEDIUMTEXT NULL,
@@ -152,6 +157,11 @@ def init_db():
                                    "VARCHAR(100) NOT NULL DEFAULT 'ALL'")
 
             _add_column_if_missing(cur, "requests", "APPTNESS_STATUS", "VARCHAR(50) NULL")
+            _add_column_if_missing(cur, "requests", "APPTNESS_FTP", "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "APPTNESS_FILECOUNT", "VARCHAR(50) NULL")
+            _add_column_if_missing(cur, "requests", "APPTNESS_FILENAME", "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "APPTNESS_FILEPATH", "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "APPTNESS_FILESIZE", "BIGINT NULL")
             _add_column_if_missing(cur, "requests", "GREEN_FTP",        "VARCHAR(500) NULL")
             _add_column_if_missing(cur, "requests", "BLUE_FTP",         "VARCHAR(500) NULL")
             _add_column_if_missing(cur, "requests", "ARCAMAX_FTP",      "VARCHAR(500) NULL")
@@ -408,11 +418,11 @@ def fetch_all_requests(limit=200):
                     u.username,
                     r.GREEN_STATUS, r.BLUE_STATUS, r.ARCAMAX_STATUS, r.ORANGE_STATUS,
                     r.APPTNESS_STATUS,
-                    r.GREEN_FTP,    r.BLUE_FTP,    r.ARCAMAX_FTP,    r.ORANGE_FTP,
-                    r.GREEN_FILECOUNT, r.BLUE_FILECOUNT, r.ARCAMAX_FILECOUNT, r.ORANGE_FILECOUNT,
-                    r.GREEN_FILENAME,  r.BLUE_FILENAME,  r.ARCAMAX_FILENAME,  r.ORANGE_FILENAME,
-                    r.GREEN_FILEPATH,  r.BLUE_FILEPATH,  r.ARCAMAX_FILEPATH,  r.ORANGE_FILEPATH,
-                    r.GREEN_FILESIZE,  r.BLUE_FILESIZE,  r.ARCAMAX_FILESIZE,  r.ORANGE_FILESIZE
+                    r.GREEN_FTP,    r.BLUE_FTP,    r.ARCAMAX_FTP,    r.ORANGE_FTP,    r.APPTNESS_FTP,
+                    r.GREEN_FILECOUNT, r.BLUE_FILECOUNT, r.ARCAMAX_FILECOUNT, r.ORANGE_FILECOUNT, r.APPTNESS_FILECOUNT,
+                    r.GREEN_FILENAME,  r.BLUE_FILENAME,  r.ARCAMAX_FILENAME,  r.ORANGE_FILENAME, r.APPTNESS_FILENAME,
+                    r.GREEN_FILEPATH,  r.BLUE_FILEPATH,  r.ARCAMAX_FILEPATH,  r.ORANGE_FILEPATH, r.APPTNESS_FILEPATH,
+                    r.GREEN_FILESIZE,  r.BLUE_FILESIZE,  r.ARCAMAX_FILESIZE,  r.ORANGE_FILESIZE, r.APPTNESS_FILESIZE
                 FROM requests r
                 JOIN users u ON u.id = r.created_by
                 ORDER BY r.id DESC
@@ -447,22 +457,27 @@ def fetch_all_requests(limit=200):
                     "BLUE_FTP":         row[22] or "",
                     "ARCAMAX_FTP":      row[23] or "",
                     "ORANGE_FTP":       row[24] or "",
-                    "GREEN_FILECOUNT":  row[25] or "",
-                    "BLUE_FILECOUNT":   row[26] or "",
-                    "ARCAMAX_FILECOUNT":row[27] or "",
-                    "ORANGE_FILECOUNT": row[28] or "",
-                    "GREEN_FILENAME":   row[29] or "",
-                    "BLUE_FILENAME":    row[30] or "",
-                    "ARCAMAX_FILENAME": row[31] or "",
-                    "ORANGE_FILENAME":  row[32] or "",
-                    "GREEN_FILEPATH":   row[33] or "",
-                    "BLUE_FILEPATH":    row[34] or "",
-                    "ARCAMAX_FILEPATH": row[35] or "",
-                    "ORANGE_FILEPATH":  row[36] or "",
-                    "GREEN_FILESIZE":   row[37],
-                    "BLUE_FILESIZE":    row[38],
-                    "ARCAMAX_FILESIZE": row[39],
-                    "ORANGE_FILESIZE":  row[40],
+                    "APPTNESS_FTP":     row[25] or "",
+                    "GREEN_FILECOUNT":  row[26] or "",
+                    "BLUE_FILECOUNT":   row[27] or "",
+                    "ARCAMAX_FILECOUNT":row[28] or "",
+                    "ORANGE_FILECOUNT": row[29] or "",
+                    "APPTNESS_FILECOUNT": row[30] or "",
+                    "GREEN_FILENAME":   row[31] or "",
+                    "BLUE_FILENAME":    row[32] or "",
+                    "ARCAMAX_FILENAME": row[33] or "",
+                    "ORANGE_FILENAME":  row[34] or "",
+                    "APPTNESS_FILENAME": row[35] or "",
+                    "GREEN_FILEPATH":   row[36] or "",
+                    "BLUE_FILEPATH":    row[37] or "",
+                    "ARCAMAX_FILEPATH": row[38] or "",
+                    "ORANGE_FILEPATH":  row[39] or "",
+                    "APPTNESS_FILEPATH": row[40] or "",
+                    "GREEN_FILESIZE":   row[41],
+                    "BLUE_FILESIZE":    row[42],
+                    "ARCAMAX_FILESIZE": row[43],
+                    "ORANGE_FILESIZE":  row[44],
+                    "APPTNESS_FILESIZE": row[45],
                 })
             return results
     finally:
@@ -700,7 +715,7 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT GREEN_STATUS, BLUE_STATUS, ARCAMAX_STATUS, ORANGE_STATUS
+                    SELECT GREEN_STATUS, BLUE_STATUS, ARCAMAX_STATUS, ORANGE_STATUS, APPTNESS_STATUS
                     FROM requests WHERE request_uuid=%s
                     """,
                     (request_uuid,),
@@ -720,14 +735,14 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
             ch = (fd.get("channel") or "").upper().strip()
 
             # If channel field is blank, derive it from the filename
-            if ch not in {"GREEN", "BLUE", "ARCAMAX", "ORANGE"}:
+            if ch not in {"GREEN", "BLUE", "ARCAMAX", "ORANGE", "APPTNESS"}:
                 fname = fd.get("filename", "")
-                for possible_ch in ("GREEN", "BLUE", "ARCAMAX", "ORANGE"):
+                for possible_ch in ("GREEN", "BLUE", "ARCAMAX", "ORANGE", "APPTNESS"):
                     if possible_ch in fname.upper():
                         ch = possible_ch
                         break
 
-            if not ch or ch not in {"GREEN", "BLUE", "ARCAMAX", "ORANGE"}:
+            if not ch or ch not in {"GREEN", "BLUE", "ARCAMAX", "ORANGE", "APPTNESS"}:
                 continue
 
             # Never overwrite NOT_SELECTED — that channel was intentionally skipped
@@ -915,7 +930,7 @@ def submit_request():
         return jsonify({'ok': False, 'error': 'State/Zips criteria requires include or exclude comp type.'}), 400
 
     # Validate each channel
-    valid_channels = {'ALL', 'GREEN', 'BLUE', 'ORANGE', 'ARCAMAX'}
+    valid_channels = {'ALL', 'GREEN', 'BLUE', 'ORANGE', 'ARCAMAX', 'APPTNESS'}
     submitted_channels = list(dict.fromkeys(channel_list))   # deduplicate, preserve order
     if not submitted_channels:
         return jsonify({'ok': False, 'error': 'At least one channel must be selected.'}), 400
