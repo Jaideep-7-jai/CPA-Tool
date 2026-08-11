@@ -12,8 +12,6 @@ from config import SNOWSQL_PASSPHRASE, AWS_KEY_ID, AWS_SECRET_KEY, S3_BASE
 from utils import run_command, send_success_email, send_error_email
 from ZIPS.zips import (
     _build_common_context,
-    _cleanup_channel_tmp,
-    _count_file_lines,
     _create_zip_staging_table,
     _download_and_combine,
     _drop_perm_table,
@@ -24,12 +22,10 @@ from ZIPS.zips import (
     _post_to_ftp,
     _query_snowflake,
     _step,
-    _success_result,
     fetch_request_details,
     process_orange_zip,
     setup_channel_logging,
     setup_main_logging,
-    update_ftp_path,
     update_request_status,
 )
 
@@ -62,8 +58,15 @@ def _insert_apptness_into_perm_table(perm_table, zip_staging_table, comp_type, l
     return inserted_rows
 
 
-def _process_email_zip_channel(request_id, channel_name, zip_staging_table, run_dir: Path, insert_func):
-    TOTAL_STEPS = 7
+def insert_complete_extract(request_id, channel_name, zip_staging_table, run_dir: Path):
+    """Create a non-Orange perm table and export its COMPLETE data to S3.
+
+    The Doordash aggregate files are built from these perm tables only after
+    every selected non-Orange channel has completed this phase.  Keeping the
+    tables alive until then avoids reloading the COMPLETE S3 extracts merely
+    to build the aggregate outputs.
+    """
+    TOTAL_STEPS = 2
     channel_name = channel_name.upper()
     channel_status = f"{channel_name}_STATUS"
     log = setup_channel_logging(run_dir, channel_name)
@@ -79,156 +82,108 @@ def _process_email_zip_channel(request_id, channel_name, zip_staging_table, run_
     log.info(
         f"  comp_type      = {ctx['comp_type']}\n"
         f"  perm_table     = {ctx['perm_table']}\n"
-        f"  path_FINAL     = {ctx['path_FINAL']}\n"
-        f"  path_COMPLETE  = {ctx['path_COMPLETE']}\n"
-        f"  output_file    = {ctx['output_file']}"
+        f"  path_COMPLETE  = {ctx['path_COMPLETE']}"
     )
 
+    perm_table = ctx["perm_table"]
     try:
-        channel_tmp = ctx["channel_tmp"]
-        final_files_dir = ctx["final_files_dir"]
-        perm_table = ctx["perm_table"]
         start_time = time.time()
 
         _step(log, 1, TOTAL_STEPS, "Creating Snowflake table + inserting ZIP-matched data", channel_name)
         update_request_status(request_id, "Loading to Snowflake", channel_status, log)
-        inserted_count = insert_func(perm_table, zip_staging_table, ctx["comp_type"], log)
+        if channel_name in ("GREEN", "BLUE", "ARCAMAX"):
+            inserted_count = _insert_into_perm_table(
+                perm_table, channel_name, zip_staging_table, ctx["comp_type"], log
+            )
+        elif channel_name == "APPTNESS":
+            inserted_count = _insert_apptness_into_perm_table(
+                perm_table, zip_staging_table, ctx["comp_type"], log
+            )
+        else:
+            raise ValueError(f"Unsupported Doordash extract channel: {channel_name}")
         if inserted_count == 0:
             update_request_status(request_id, "No Data Retrieved", channel_status, log)
             _drop_perm_table(perm_table, log)
-            return {"channel": channel_name, "file": None, "final_file_path": None, "status": "NO_DATA", "elapsed": time.time() - start_time, "count": 0}
+            return {
+                "channel": channel_name, "status": "NO_DATA", "count": 0,
+                "elapsed": time.time() - start_time, "perm_table": None,
+            }
 
-        _step(log, 2, TOTAL_STEPS, "Exporting FINAL FILE (DISTINCT emails) to S3", channel_name)
-        update_request_status(request_id, "Exporting Final File", channel_status, log)
-        _export_complete_final_file("FINAL", perm_table, ctx["path_FINAL"], channel_name, log)
-
-        _step(log, 3, TOTAL_STEPS, "Exporting COMPLETE DATA FILE (email + ZIP) to S3", channel_name)
+        _step(log, 2, TOTAL_STEPS, "Exporting COMPLETE DATA FILE (email + ZIP) to S3", channel_name)
         update_request_status(request_id, "Exporting Complete File", channel_status, log)
         _export_complete_final_file("COMPLETE", perm_table, ctx["path_COMPLETE"], channel_name, log)
-
-        _step(log, 4, TOTAL_STEPS, f"Dropping permanent Snowflake table {perm_table}", channel_name)
-        _drop_perm_table(perm_table, log)
-
-        _step(log, 5, TOTAL_STEPS, "Downloading FINAL FILE parts from S3 + combining", channel_name)
-        update_request_status(request_id, "Combining Data", channel_status, log)
-        combined_count = _download_and_combine(ctx["path_FINAL"], channel_tmp / f"{channel_name}_FINAL_DL", channel_tmp, ctx["output_file"], channel_name, log)
-
-        _step(log, 6, TOTAL_STEPS, "Moving combined file to FINAL_FILES/", channel_name)
-        src_file = channel_tmp / ctx["output_file"]
-        dest_file = final_files_dir / ctx["output_file"]
-        shutil.move(str(src_file), str(dest_file))
-        record_count = _count_file_lines(str(dest_file))
-        log.info(f"  STEP 6 DONE: Moved {src_file.name} -> FINAL_FILES/ | rows: {record_count:,}")
-
-        _step(log, 7, TOTAL_STEPS, f"FTP upload -> /CPA/{ctx['path_date']}/{ctx['output_file']}", channel_name)
-        update_request_status(request_id, "Posting To FTP", channel_status, log)
-        ftp_path = _post_to_ftp(final_files_dir, ctx["path_date"], ctx["output_file"], log)
-        update_ftp_path(request_id, channel_name, ftp_path, log)
         elapsed = time.time() - start_time
-        update_request_status(request_id, "Completed", channel_status, log)
-        _cleanup_channel_tmp(channel_tmp, log)
-        return _success_result(channel_name, ctx["output_file"], str(dest_file), elapsed, record_count)
+        update_request_status(request_id, "Complete Data Exported", channel_status, log)
+        return {
+            "channel": channel_name, "status": "COMPLETE_EXPORTED",
+            "count": inserted_count if inserted_count >= 0 else 0,
+            "elapsed": elapsed, "perm_table": perm_table,
+        }
     except Exception:
+        # An unsuccessful extract cannot contribute to the aggregate files.
+        # Drop a partially-created table rather than leaving it behind.
+        try:
+            _drop_perm_table(perm_table, log)
+        except Exception:
+            log.exception(f"  Failed to clean up {perm_table} after extract failure")
         update_request_status(request_id, "Failed", channel_status, log)
         log.exception(f"  {channel_name} CHANNEL (DOORDASH ZIPS) FAILED")
         raise
 
 
-def process_green_blue_doordash(request_id, channel_name, zip_staging_table, run_dir: Path):
-    return _process_email_zip_channel(
-        request_id,
-        channel_name,
-        zip_staging_table,
-        run_dir,
-        lambda perm_table, staging, comp_type, log: _insert_into_perm_table(perm_table, channel_name.upper(), staging, comp_type, log),
-    )
-
-
-def process_apptness(request_id, zip_staging_table, run_dir: Path):
-    """APPTNESS Doordash processor with the Green/Blue workflow and placeholder SQL."""
-    return _process_email_zip_channel(
-        request_id, "APPTNESS", zip_staging_table, run_dir, _insert_apptness_into_perm_table
-    )
-
-
-def process_arcamax_doordash(request_id, zip_staging_table, run_dir: Path):
-    return _process_email_zip_channel(
-        request_id,
-        "ARCAMAX",
-        zip_staging_table,
-        run_dir,
-        lambda perm_table, staging, comp_type, log: _insert_into_perm_table(perm_table, "ARCAMAX", staging, comp_type, log),
-    )
-
-
-def _load_complete_output_to_table(table_name, channel_name, complete_path, log):
-    os.environ["SNOWSQL_PRIVATE_KEY_PASSPHRASE"] = SNOWSQL_PASSPHRASE
-    sql = (
-        f"CREATE OR REPLACE TABLE {table_name} (email VARCHAR, zip VARCHAR); "
-        f"COPY INTO {table_name} FROM '{complete_path}/' "
-        f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') "
-        f"FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' SKIP_HEADER=1 "
-        f"FIELD_OPTIONALLY_ENCLOSED_BY='\"') ON_ERROR='CONTINUE' PURGE=FALSE;"
-    )
-    log.info(f"  Loading {channel_name} COMPLETE output into {table_name} from {complete_path}/")
-    run_command(["snowsql", "-c", "datateam1", "-q", sql])
-
-
 def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log):
-    completed = [ch for ch in COMBINED_CHANNELS if results.get(ch, {}).get("status") == "SUCCESS"]
-    if completed != COMBINED_CHANNELS:
-        log.info("  Combined Doordash outputs skipped; all four email channels did not complete successfully")
+    """Write aggregate email and Arcamax MD5 files, then clean up source tables."""
+    completed = [
+        ch for ch in COMBINED_CHANNELS
+        if results.get(ch, {}).get("status") == "COMPLETE_EXPORTED"
+    ]
+    if not completed:
+        log.info("  Combined Doordash outputs skipped; no non-Orange channels exported data")
         return []
 
     final_files_dir = run_dir / "FINAL_FILES"
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stage_tables = []
-    for ch in COMBINED_CHANNELS:
-        ctx = _build_common_context(request_id, ch, run_dir)
-        table_name = f"APT_CPA_DOORDASH_{ch}_COMPLETE_{ts}"
-        _load_complete_output_to_table(table_name, ch, ctx["path_COMPLETE"], log)
-        stage_tables.append((ch, table_name))
-
-    combined_table = f"APT_CPA_DOORDASH_COMBINED_{ts}"
-    union_sql = " UNION ALL ".join(
-        f"SELECT '{ch}' AS channel, email, zip FROM {tbl}" for ch, tbl in stage_tables
-    )
-    run_command(["snowsql", "-c", "datateam1", "-q", f"CREATE OR REPLACE TABLE {combined_table} AS {union_sql};"])
-
     email_name = f"Doordash_Green_Blue_Apptness_Arcamax_email_zips_{path_date}.csv"
     md5_name = f"Doordash_Arcamax_md5hash_zips_{path_date}.csv"
     email_s3 = f"{S3_BASE}/Doordash/{path_date}/FINAL_EMAIL"
     md5_s3 = f"{S3_BASE}/Doordash/{path_date}/FINAL_ARCAMAX_MD5"
+    union_sql = " UNION ALL ".join(
+        f"SELECT email FROM {results[ch]['perm_table']}" for ch in completed
+    )
     copy_email = (
-        f"COPY INTO '{email_s3}/' FROM (SELECT DISTINCT email FROM {combined_table} WHERE email IS NOT NULL) "
+        f"COPY INTO '{email_s3}/' FROM (SELECT DISTINCT email FROM ({union_sql}) WHERE email IS NOT NULL) "
         f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' FIELD_OPTIONALLY_ENCLOSED_BY='\"') HEADER=TRUE MAX_FILE_SIZE=490000000;"
     )
-    copy_md5 = (
-        f"COPY INTO '{md5_s3}/' FROM (SELECT DISTINCT MD5(LOWER(TRIM(email))) AS md5hash FROM {combined_table} WHERE channel='ARCAMAX' AND email IS NOT NULL) "
-        f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' FIELD_OPTIONALLY_ENCLOSED_BY='\"') HEADER=TRUE MAX_FILE_SIZE=490000000;"
-    )
-    run_command(["snowsql", "-c", "datateam1", "-q", copy_email])
-    run_command(["snowsql", "-c", "datateam1", "-q", copy_md5])
+    arcamax_table = results.get("ARCAMAX", {}).get("perm_table")
+    try:
+        run_command(["snowsql", "-c", "datateam1", "-q", copy_email])
+        if arcamax_table:
+            copy_md5 = (
+                f"COPY INTO '{md5_s3}/' FROM (SELECT DISTINCT MD5(LOWER(TRIM(email))) AS md5hash FROM {arcamax_table} WHERE email IS NOT NULL) "
+                f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' FIELD_OPTIONALLY_ENCLOSED_BY='\"') HEADER=TRUE MAX_FILE_SIZE=490000000;"
+            )
+            run_command(["snowsql", "-c", "datateam1", "-q", copy_md5])
+    finally:
+        # The aggregate data is now in S3; cleanup must precede FTP posting.
+        for ch in completed:
+            _drop_perm_table(results[ch]["perm_table"], log)
+
     email_count = _download_and_combine(email_s3, run_dir / "EMAIL_FINAL_DL", run_dir / "EMAIL_FINAL_TMP", email_name, "GREEN", log)
-    md5_count = _download_and_combine(md5_s3, run_dir / "MD5_FINAL_DL", run_dir / "MD5_FINAL_TMP", md5_name, "GREEN", log)
     email_dest = final_files_dir / email_name
-    md5_dest = final_files_dir / md5_name
     shutil.move(str(run_dir / "EMAIL_FINAL_TMP" / email_name), str(email_dest))
-    shutil.move(str(run_dir / "MD5_FINAL_TMP" / md5_name), str(md5_dest))
-    md5_lines = md5_dest.read_text().splitlines()
-    if md5_lines:
-        md5_dest.write_text("md5hash\n" + "\n".join(md5_lines[1:]) + ("\n" if len(md5_lines) > 1 else ""))
     _post_to_ftp(final_files_dir, path_date, email_name, log)
-    _post_to_ftp(final_files_dir, path_date, md5_name, log)
-    for _, tbl in stage_tables:
-        _drop_perm_table(tbl, log)
-    _drop_perm_table(combined_table, log)
     shutil.rmtree(str(run_dir / "EMAIL_FINAL_TMP"), ignore_errors=True)
-    shutil.rmtree(str(run_dir / "MD5_FINAL_TMP"), ignore_errors=True)
-    return [
-        {"channel": "DOORDASH_EMAIL", "file": email_name, "final_file_path": str(email_dest), "status": "SUCCESS", "count": email_count},
-        {"channel": "DOORDASH_ARCAMAX_MD5", "file": md5_name, "final_file_path": str(md5_dest), "status": "SUCCESS", "count": md5_count},
-    ]
+    outputs = [{"channel": "DOORDASH_EMAIL", "file": email_name, "final_file_path": str(email_dest), "status": "SUCCESS", "count": email_count}]
+    if arcamax_table:
+        md5_count = _download_and_combine(md5_s3, run_dir / "MD5_FINAL_DL", run_dir / "MD5_FINAL_TMP", md5_name, "GREEN", log)
+        md5_dest = final_files_dir / md5_name
+        shutil.move(str(run_dir / "MD5_FINAL_TMP" / md5_name), str(md5_dest))
+        md5_lines = md5_dest.read_text().splitlines()
+        if md5_lines:
+            md5_dest.write_text("md5hash\n" + "\n".join(md5_lines[1:]) + ("\n" if len(md5_lines) > 1 else ""))
+        _post_to_ftp(final_files_dir, path_date, md5_name, log)
+        shutil.rmtree(str(run_dir / "MD5_FINAL_TMP"), ignore_errors=True)
+        outputs.append({"channel": "DOORDASH_ARCAMAX_MD5", "file": md5_name, "final_file_path": str(md5_dest), "status": "SUCCESS", "count": md5_count})
+    return outputs
 
 
 def process_doordash_zip_request(request_id: int, zip_file: str, channel, output_dir: str):
@@ -251,7 +206,6 @@ def process_doordash_zip_request(request_id: int, zip_file: str, channel, output
     request_data = fetch_request_details(request_id)
     if not request_data:
         raise Exception(f"Request ID {request_id} not found in DB")
-    comp_type = request_data["comp_type"]
     path_date = datetime.now().strftime("%Y%m%d")
     s3_zip_dir = f"{S3_BASE}/Doordash/ZIPS/{path_date}/staging"
     s3_zip_path = f"{s3_zip_dir}/{os.path.basename(zip_file)}"
@@ -264,15 +218,11 @@ def process_doordash_zip_request(request_id: int, zip_file: str, channel, output
         raise RuntimeError("ZIP staging table is empty — no ZIP codes were loaded from the file.")
 
     def _run_channel(ch):
-        if ch in ("GREEN", "BLUE"):
-            return process_green_blue_doordash(request_id, ch, zip_staging_table, run_dir)
-        if ch == "APPTNESS":
-            return process_apptness(request_id, zip_staging_table, run_dir)
-        if ch == "ARCAMAX":
-            return process_arcamax_doordash(request_id, zip_staging_table, run_dir)
         if ch == "ORANGE":
+            # Orange retains the established ZIPS flow, including FINAL data
+            # generation, table cleanup, and its own FTP upload.
             return process_orange_zip(request_id, zip_staging_table, run_dir)
-        raise ValueError(f"Unknown channel: {ch}")
+        return insert_complete_extract(request_id, ch, zip_staging_table, run_dir)
 
     results = {}
     errors = []
@@ -288,6 +238,9 @@ def process_doordash_zip_request(request_id: int, zip_file: str, channel, output
 
     try:
         combined_outputs = _create_combined_outputs(request_id, run_dir, path_date, results, log)
+        for ch in COMBINED_CHANNELS:
+            if results.get(ch, {}).get("status") == "COMPLETE_EXPORTED":
+                update_request_status(request_id, "Completed", f"{ch}_STATUS", log)
     except Exception as exc:
         errors.append(("COMBINED", str(exc)))
         log.exception("  Combined Doordash output generation failed")
@@ -302,7 +255,10 @@ def process_doordash_zip_request(request_id: int, zip_file: str, channel, output
     if errors:
         send_error_email("DOORDASH ZIP PARTIAL FAILURE", "\n".join(f"{c}: {e}" for c, e in errors))
     else:
-        files = [v.get("file") for v in results.values() if isinstance(v, dict)] + [v["file"] for v in combined_outputs]
+        files = [
+            v["file"] for v in results.values()
+            if isinstance(v, dict) and v.get("file")
+        ] + [v["file"] for v in combined_outputs]
         send_success_email(f"DOORDASH ZIP REQUEST COMPLETE — {total_records:,} matched", files, str(run_dir))
     if errors and not results:
         raise RuntimeError(f"All channels failed: {errors}")
