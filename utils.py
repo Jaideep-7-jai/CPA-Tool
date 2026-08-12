@@ -247,6 +247,7 @@ def build_file_details_json(final_files_dir, results=None):
                 "file_size_bytes": file_size_bytes,   # raw file size in bytes
                 "channel":         result_entry.get('channel', ''),
                 "path":            str(fp),
+                "s3_path":         result_entry.get("s3_path", ""),
             })
     else:
         logging.warning(f"build_file_details_json: directory not found: {final_dir}")
