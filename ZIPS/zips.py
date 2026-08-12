@@ -281,6 +281,23 @@ def update_ftp_path(request_id, channel_name, ftp_path, log):
     raise last_exc
 
 
+def update_channel_storage(request_id, channel_name, s3_path, row_count, log):
+    """Persist the S3 location and exported-row count for one channel."""
+    channel = channel_name.upper()
+    if channel not in {"GREEN", "BLUE", "ARCAMAX", "ORANGE", "APPTNESS"}:
+        raise ValueError(f"Unsupported channel storage update: {channel}")
+    conn = get_db_with_retry(log)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE requests SET {channel}_FILEPATH=%s, {channel}_FILESIZE=%s WHERE id=%s",
+                (s3_path.rstrip("/") + "/", row_count if row_count >= 0 else None, request_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Common context builder  (same pattern as age_state._build_common_context)
 # ---------------------------------------------------------------------------
@@ -481,7 +498,7 @@ def _insert_into_perm_table(
 
     else:  # ORANGE
         condition = (
-            f"ZIP {kw} (SELECT zip_code FROM {zip_staging_table})"
+            f"a.ZIP {kw} (SELECT zip_code FROM {zip_staging_table})"
         )
         insert_sql = (
             f"CREATE OR REPLACE TABLE {perm_table} AS "
