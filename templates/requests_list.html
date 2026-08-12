@@ -1,16 +1,92 @@
 {% extends "dashboard.html" %}
 {% block title %}All Requests{% endblock %}
 {% block page_title %}All Requests{% endblock %}
+{% block breadcrumb %}<span class="breadcrumb">Requests &rsaquo; All</span>{% endblock %}
+
 {% block content %}
 <div class="analytics-container">
-  <section class="filters-bar"><input id="searchInput" class="filter-input" placeholder="Search name, type, criteria..."><select id="typeFilter" class="filter-select"><option value="">All Types</option><option>Suppression</option><option>Mailing</option><option>Doordash</option></select><select id="criteriaFilter" class="filter-select"><option value="">All Criteria</option><option value="age">Age</option><option value="state">State</option><option value="zips">Zips</option></select><select id="statusFilter" class="filter-select"><option value="">All Statuses</option><option value="completed">Completed</option><option value="failed">Failed</option><option value="inprogress">In Progress</option></select></section>
-  <section class="table-section"><div class="table-header"><h3>All Requests <span id="rowCount"></span></h3><a href="{{ url_for('new_request') }}" class="submit-button small">+ New Request</a></div><div class="table-scroll"><table class="requests-table"><thead><tr><th>Request Name</th><th>Client Name</th><th>Type</th><th>Criteria</th><th>Value</th><th>Comp</th><th>Channel</th><th>Overall</th><th>Created By</th><th>Created At</th><th>Finished At</th></tr></thead><tbody>
-{% for r in requests %}<tr class="req-row" data-search="{{ r.request_name }} {{ r.client_name }} {{ r.request_type }} {{ r.criteria_type }} {{ r.overall_status }}"><td><button class="request-detail-toggle" data-request='{{ r|tojson }}'>{{ r.request_name }}</button></td><td>{{ r.client_name }}</td><td>{{ r.request_type }}</td><td>{{ r.criteria_type|upper }}</td><td>{{ r.criteria_value or '-' }}</td><td>{{ r.comp_type }}</td><td>{{ r.channel }}</td><td><span class="badge {{ r.overall_status|lower }}">{{ r.overall_status }}</span></td><td>{{ r.username }}</td><td>{{ r.created_at }}</td><td>{{ r.finished_at or '-' }}</td></tr>{% else %}<tr><td colspan="11" class="muted">No requests found.</td></tr>{% endfor %}
-</tbody></table></div></section></div>
-<div id="requestDetails" class="status-popup" aria-hidden="true"><div class="popup-header"><span class="popup-channel-name">Request details</span><button id="closeDetails">×</button></div><div class="popup-body"></div></div>
+  <section class="filters-bar">
+    <input type="text" id="searchInput" placeholder="🔍 Search name, type, criteria..." class="filter-input">
+    <select id="typeFilter" class="filter-select"><option value="">All Types</option><option value="Suppression">Suppression</option><option value="Mailing">Mailing</option><option value="Doordash">Doordash</option></select>
+    <select id="criteriaFilter" class="filter-select"><option value="">All Criteria</option><option value="age">Age</option><option value="state">State</option><option value="zips">Zips</option></select>
+    <select id="statusFilter" class="filter-select"><option value="">All Statuses</option><option value="completed">Completed</option><option value="failed">Failed</option><option value="inprogress">In Progress</option></select>
+    <select id="channelFilter" class="filter-select"><option value="">All Channels</option><option value="GREEN">Green</option><option value="BLUE">Blue</option><option value="ORANGE">Orange</option><option value="ARCAMAX">Arcamax</option><option value="APPTNESS">Apptness</option><option value="ALL">All</option></select>
+  </section>
+
+  <section class="table-section">
+    <div class="table-header"><h3>All Requests <span id="rowCount" class="row-count"></span></h3><a href="{{ url_for('new_request') }}" class="submit-button small"><i class="bi bi-plus-lg"></i> New Request</a></div>
+    <div class="table-scroll">
+      <table class="requests-table" id="requestsTable">
+        <thead><tr><th>Request Name</th><th>Client Name</th><th>Type</th><th>Criteria</th><th>Value</th><th>Comp</th><th>Channel</th><th>Overall</th><th>Created By</th><th>Created At</th><th>Finished At</th></tr></thead>
+        <tbody id="requestsBody">
+        {% for r in requests %}
+          {% set selected = r.channel.split(',') if r.channel else [] %}
+          {% set is_all = r.channel == 'ALL' %}
+          {% set row_id = 'details-' ~ loop.index %}
+          <tr class="req-row request-summary-row" tabindex="0" role="button" aria-expanded="false" aria-controls="{{ row_id }}"
+              data-channels="{{ r.channel }}" data-search="{{ r.request_name }} {{ r.client_name }} {{ r.request_type }} {{ r.criteria_type }} {{ r.overall_status }}">
+            <td><strong>{{ r.request_name }}</strong><span class="expand-indicator" aria-hidden="true">⌄</span></td>
+            <td>{{ r.client_name }}</td><td><span class="badge-type {{ r.request_type|lower }}">{{ r.request_type }}</span></td><td><span class="badge-criteria">{{ r.criteria_type|upper }}</span></td>
+            <td class="muted small">{{ r.criteria_value or '-' }}</td><td class="muted small">{{ r.comp_type }}</td><td><span class="tag">{{ r.channel }}</span></td>
+            <td><span class="badge {{ r.overall_status|lower|replace(' ', '') }}">{{ r.overall_status }}</span></td><td>{{ r.username }}</td><td class="muted small">{{ r.created_at }}</td><td class="muted small">{{ r.finished_at or '-' }}</td>
+          </tr>
+          <tr id="{{ row_id }}" class="request-details-row" hidden><td colspan="11">
+            <div class="request-details-panel">
+              <div class="request-details-title">Channel status <span>Hover a status to view file details</span></div>
+              <div class="channel-status-list">
+              {% for channel in ['GREEN', 'BLUE', 'ARCAMAX', 'ORANGE', 'APPTNESS'] %}
+                {% if is_all or channel in selected %}
+                  {% set status = r[channel ~ '_STATUS'] or 'Pending' %}
+                  {% set status_class = status|lower|replace(' ', '_') %}
+                  <div class="channel-status-item">
+                    <span class="channel-status-name">{{ channel }}</span>
+                    <span class="badge-status {{ status_class }} has-popup" tabindex="0"
+                      data-channel="{{ channel }}" data-status="{{ status }}" data-ftp="{{ r[channel ~ '_FTP'] or '' }}"
+                      data-filecount="{{ r[channel ~ '_FILECOUNT'] or '' }}" data-filepath="{{ r[channel ~ '_FILEPATH'] or '' }}"
+                      data-filesize="{{ r[channel ~ '_FILESIZE'] or '' }}">{{ status }}</span>
+                  </div>
+                {% endif %}
+              {% endfor %}
+              </div>
+              {% if r.request_type == 'Doordash' %}
+              <div class="doordash-output-details"><strong>Doordash output files</strong><span>Email FTP: {{ r.DOORDASH_EMAIL_FTP or '-' }}</span><span>Email count: {{ r.DOORDASH_EMAIL_FILECOUNT or '-' }}</span><span>MD5 FTP: {{ r.DOORDASH_MD5HASH_FTP or '-' }}</span><span>MD5 count: {{ r.DOORDASH_MD5HASH_FILECOUNT or '-' }}</span></div>
+              {% endif %}
+            </div>
+          </td></tr>
+        {% else %}<tr><td colspan="11" class="text-center muted" style="padding:30px;">No requests found.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<div id="statusPopup" class="status-popup" role="tooltip" aria-hidden="true"><div class="popup-header"><span class="popup-channel-name"></span><span class="popup-status-badge"></span></div><div class="popup-body"></div></div>
 {% endblock %}
-{% block scripts %}<script>
-const privileged={{ 'true' if session.get('username','')|lower in ['admin','jaideep'] else 'false' }},detail=document.getElementById('requestDetails'),body=detail.querySelector('.popup-body');
-document.querySelectorAll('.request-detail-toggle').forEach(b=>b.onclick=()=>{const r=JSON.parse(b.dataset.request),chs=['GREEN','BLUE','ARCAMAX','ORANGE','APPTNESS'];let h='';chs.forEach(c=>{if(!(r.channel==='ALL'||r.channel.includes(c)))return;h+=`<div class="popup-row"><b>${c}</b><span>${r[c+'_STATUS']||'Pending'}</span></div>`;if(r[c+'_FTP'])h+=`<div class="popup-row"><span>FTP</span><span>${r[c+'_FTP']}</span></div>`;if(r[c+'_FILECOUNT'])h+=`<div class="popup-row"><span>File Count</span><span>${r[c+'_FILECOUNT']}</span></div>`;if(privileged&&r[c+'_FILEPATH'])h+=`<div class="popup-row"><span>S3 Path</span><span>${r[c+'_FILEPATH']}</span></div>`;if(privileged&&r[c+'_FILESIZE'])h+=`<div class="popup-row"><span>S3 Row Count</span><span>${r[c+'_FILESIZE']}</span></div>`;});if(r.request_type==='Doordash')h+=`<div class="popup-row"><span>Doordash Email FTP</span><span>${r.DOORDASH_EMAIL_FTP||'-'}</span></div><div class="popup-row"><span>Doordash Email Count</span><span>${r.DOORDASH_EMAIL_FILECOUNT||'-'}</span></div><div class="popup-row"><span>Doordash MD5 FTP</span><span>${r.DOORDASH_MD5HASH_FTP||'-'}</span></div><div class="popup-row"><span>Doordash MD5 Count</span><span>${r.DOORDASH_MD5HASH_FILECOUNT||'-'}</span></div>`;body.innerHTML=h||'No channel details available';detail.style.left='35%';detail.style.top='130px';detail.classList.add('visible');});document.getElementById('closeDetails').onclick=()=>detail.classList.remove('visible');
-const si=document.getElementById('searchInput'),tf=document.getElementById('typeFilter'),cf=document.getElementById('criteriaFilter'),sf=document.getElementById('statusFilter');function f(){let n=0;document.querySelectorAll('.req-row').forEach(r=>{let x=r.dataset.search.toLowerCase(),ok=(!si.value||x.includes(si.value.toLowerCase()))&&(!tf.value||x.includes(tf.value.toLowerCase()))&&(!cf.value||x.includes(cf.value))&&(!sf.value||x.includes(sf.value));r.style.display=ok?'':'none';if(ok)n++;});document.getElementById('rowCount').textContent=`(${n})`;}[si,tf,cf,sf].forEach(x=>x.oninput=f);f();
-</script>{% endblock %}
+
+{% block scripts %}
+<script>
+const privileged = {{ 'true' if session.get('username','')|lower in ['admin','jaideep'] else 'false' }};
+const popup = document.getElementById('statusPopup'), popupChannel = popup.querySelector('.popup-channel-name'), popupStatus = popup.querySelector('.popup-status-badge'), popupBody = popup.querySelector('.popup-body');
+const statusColours = {completed:['#dcfce7','#16a34a'], failed:['#fee2e2','#dc2626'], inprogress:['#fef3c7','#d97706'], pending:['#f1f5f9','#64748b'], not_selected:['#f1f5f9','#94a3b8']};
+function popupRow(label, value) { return value ? `<div class="popup-row"><span class="popup-label">${label}</span><span class="popup-value">${value}</span></div>` : ''; }
+function showPopup(badge) {
+  const status = (badge.dataset.status || 'Pending').trim(), key = status.toLowerCase().replace(/ /g, '_'), colours = statusColours[key] || statusColours.pending;
+  popupChannel.textContent = badge.dataset.channel || ''; popupStatus.textContent = status; popupStatus.style.background = colours[0]; popupStatus.style.color = colours[1];
+  let html = popupRow('FTP Path', badge.dataset.ftp) + popupRow('File Count', badge.dataset.filecount);
+  if (privileged) html += popupRow('S3 Path', badge.dataset.filepath) + popupRow('S3 Row Count', badge.dataset.filesize);
+  popupBody.innerHTML = html || '<span class="muted">No file details available.</span>';
+  const rect = badge.getBoundingClientRect(); popup.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - 360))}px`; popup.style.top = `${Math.min(rect.bottom + 8, window.innerHeight - 80)}px`;
+  popup.classList.add('visible'); popup.setAttribute('aria-hidden', 'false');
+}
+function hidePopup() { popup.classList.remove('visible'); popup.setAttribute('aria-hidden', 'true'); }
+document.querySelectorAll('.has-popup').forEach(badge => { badge.addEventListener('mouseenter', () => showPopup(badge)); badge.addEventListener('mouseleave', hidePopup); badge.addEventListener('focus', () => showPopup(badge)); badge.addEventListener('blur', hidePopup); });
+document.querySelectorAll('.request-summary-row').forEach(row => {
+  const details = document.getElementById(row.getAttribute('aria-controls'));
+  const toggle = () => { const open = details.hidden; document.querySelectorAll('.request-details-row').forEach(item => item.hidden = true); document.querySelectorAll('.request-summary-row').forEach(item => { item.setAttribute('aria-expanded', 'false'); item.classList.remove('expanded'); }); details.hidden = !open; row.setAttribute('aria-expanded', String(open)); row.classList.toggle('expanded', open); };
+  row.addEventListener('click', toggle); row.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); } });
+});
+const search = document.getElementById('searchInput'), typeF = document.getElementById('typeFilter'), critF = document.getElementById('criteriaFilter'), statF = document.getElementById('statusFilter'), channelF = document.getElementById('channelFilter'), countEl = document.getElementById('rowCount');
+function filterRows() { let visible = 0; document.querySelectorAll('.request-summary-row').forEach(row => { const text = row.dataset.search.toLowerCase(), channels = (row.dataset.channels || '').toUpperCase(), statuses = [...row.nextElementSibling.querySelectorAll('.badge-status')].map(item => item.dataset.status).join(' ').toLowerCase(); const show = (!search.value || text.includes(search.value.toLowerCase())) && (!typeF.value || text.includes(typeF.value.toLowerCase())) && (!critF.value || text.includes(critF.value)) && (!statF.value || text.includes(statF.value) || statuses.includes(statF.value)) && (!channelF.value || channels.includes(channelF.value)); row.hidden = !show; row.nextElementSibling.hidden = true; if (show) visible++; }); countEl.textContent = `(${visible})`; }
+[search, typeF, critF, statF, channelF].forEach(item => item.addEventListener('input', filterRows)); filterRows();
+</script>
+{% endblock %}
