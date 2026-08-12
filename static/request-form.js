@@ -96,7 +96,8 @@ document.addEventListener('DOMContentLoaded', () => {
   // ── Doordash auto-fill ────────────────────────────────────────────────────────
   function applyDoordashDefaults() {
     const isDoordash = requestTypeEl.value === 'Doordash';
-    channelGroup.classList.toggle('hidden', !requestTypeEl.value);
+    // Show channel choices as soon as the user selects a request type.
+    channelGroup.classList.toggle('hidden', requestTypeEl.value === '');
 
     if (isDoordash) {
       clientNameEl.value  = 'Doordash';
@@ -105,7 +106,16 @@ document.addEventListener('DOMContentLoaded', () => {
       criteriaTypeEl.setAttribute('disabled', true);
       compTypeEl.value    = 'include';
       compTypeEl.setAttribute('disabled', true);
-      setChannelLock(true, 'ALL');
+      // Doordash starts with ALL selected, while keeping the full channel bar
+      // visible (ALL, Green, Blue, Arcamax, Apptness, and Orange).
+      setChannelLock(false);
+      chAll.checked = true;
+      chAll.closest('label').classList.add('checked');
+      individualChannels.forEach(cb => {
+        cb.checked = false;
+        cb.disabled = true;
+        cb.closest('label').classList.remove('checked');
+      });
     } else {
       clientNameEl.removeAttribute('readonly');
       if (clientNameEl.value === 'Doordash') clientNameEl.value = '';
