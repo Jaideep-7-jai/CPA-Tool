@@ -481,7 +481,7 @@ def _insert_into_perm_table(
 
     else:  # ORANGE
         condition = (
-            f"a.ZIP {kw} (SELECT zip_code FROM {zip_staging_table})"
+            f"ZIP {kw} (SELECT zip_code FROM {zip_staging_table})"
         )
         insert_sql = (
             f"CREATE OR REPLACE TABLE {perm_table} AS "
