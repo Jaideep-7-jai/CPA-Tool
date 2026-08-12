@@ -27,6 +27,7 @@ from ZIPS.zips import (
     setup_channel_logging,
     setup_main_logging,
     update_request_status,
+    update_channel_storage,
 )
 
 CHANNELS = ["GREEN", "BLUE", "APPTNESS", "ARCAMAX", "ORANGE"]
@@ -112,6 +113,9 @@ def insert_complete_extract(request_id, channel_name, zip_staging_table, run_dir
         _step(log, 2, TOTAL_STEPS, "Exporting COMPLETE DATA FILE (email + ZIP) to S3", channel_name)
         update_request_status(request_id, "Exporting Complete File", channel_status, log)
         _export_complete_final_file("COMPLETE", perm_table, ctx["path_COMPLETE"], channel_name, log)
+        update_channel_storage(
+            request_id, channel_name, ctx["path_COMPLETE"], inserted_count, log
+        )
         elapsed = time.time() - start_time
         update_request_status(request_id, "Complete Data Exported", channel_status, log)
         return {
@@ -171,9 +175,9 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
     email_count = _download_and_combine(email_s3, run_dir / "EMAIL_FINAL_DL", run_dir / "EMAIL_FINAL_TMP", email_name, "GREEN", log)
     email_dest = final_files_dir / email_name
     shutil.move(str(run_dir / "EMAIL_FINAL_TMP" / email_name), str(email_dest))
-    _post_to_ftp(final_files_dir, path_date, email_name, log)
+    email_ftp_path = _post_to_ftp(final_files_dir, path_date, email_name, log)
     shutil.rmtree(str(run_dir / "EMAIL_FINAL_TMP"), ignore_errors=True)
-    outputs = [{"channel": "DOORDASH_EMAIL", "file": email_name, "final_file_path": str(email_dest), "status": "SUCCESS", "count": email_count}]
+    outputs = [{"channel": "DOORDASH_EMAIL", "file": email_name, "final_file_path": str(email_dest), "status": "SUCCESS", "count": email_count, "s3_path": email_s3, "ftp_path": email_ftp_path}]
     if arcamax_table:
         md5_count = _download_and_combine(md5_s3, run_dir / "MD5_FINAL_DL", run_dir / "MD5_FINAL_TMP", md5_name, "GREEN", log)
         md5_dest = final_files_dir / md5_name
@@ -181,9 +185,9 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
         md5_lines = md5_dest.read_text().splitlines()
         if md5_lines:
             md5_dest.write_text("md5hash\n" + "\n".join(md5_lines[1:]) + ("\n" if len(md5_lines) > 1 else ""))
-        _post_to_ftp(final_files_dir, path_date, md5_name, log)
+        md5_ftp_path = _post_to_ftp(final_files_dir, path_date, md5_name, log)
         shutil.rmtree(str(run_dir / "MD5_FINAL_TMP"), ignore_errors=True)
-        outputs.append({"channel": "DOORDASH_ARCAMAX_MD5", "file": md5_name, "final_file_path": str(md5_dest), "status": "SUCCESS", "count": md5_count})
+        outputs.append({"channel": "DOORDASH_ARCAMAX_MD5", "file": md5_name, "final_file_path": str(md5_dest), "status": "SUCCESS", "count": md5_count, "s3_path": md5_s3, "ftp_path": md5_ftp_path})
     return outputs
 
 
@@ -244,6 +248,26 @@ def process_doordash_zip_request(request_id: int, zip_file: str, channel, output
 
     try:
         combined_outputs = _create_combined_outputs(request_id, run_dir, path_date, results, log)
+        email_output = next((item for item in combined_outputs if item["channel"] == "DOORDASH_EMAIL"), None)
+        md5_output = next((item for item in combined_outputs if item["channel"] == "DOORDASH_ARCAMAX_MD5"), None)
+        if email_output or md5_output:
+            from ZIPS.zips import get_db_with_retry
+            conn = get_db_with_retry(log)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE requests SET DOORDASH_EMAIL_FTP=%s, DOORDASH_EMAIL_FILECOUNT=%s, DOORDASH_MD5HASH_FTP=%s, DOORDASH_MD5HASH_FILECOUNT=%s WHERE id=%s",
+                        (
+                            email_output.get("ftp_path") if email_output else None,
+                            email_output.get("count") if email_output else None,
+                            md5_output.get("ftp_path") if md5_output else None,
+                            md5_output.get("count") if md5_output else None,
+                            request_id,
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
         for ch in COMBINED_CHANNELS:
             if results.get(ch, {}).get("status") == "COMPLETE_EXPORTED":
                 update_request_status(request_id, "Completed", f"{ch}_STATUS", log)
