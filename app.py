@@ -319,8 +319,9 @@ def insert_request(record):
                     criteria_value, zip_file_path, output_dir, overall_status,
                     command_text, log_file, stdout_text, stderr_text,
                     return_code, started_at, finished_at,
-                    GREEN_STATUS, BLUE_STATUS, ARCAMAX_STATUS, ORANGE_STATUS
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    GREEN_STATUS, BLUE_STATUS, ARCAMAX_STATUS, ORANGE_STATUS,
+                    APPTNESS_STATUS
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
                     record["request_uuid"], record["request_name"], record["request_type"],
@@ -332,6 +333,7 @@ def insert_request(record):
                     record.get("return_code"), record.get("started_at"), record.get("finished_at"),
                     ch_statuses["GREEN_STATUS"], ch_statuses["BLUE_STATUS"],
                     ch_statuses["ARCAMAX_STATUS"], ch_statuses["ORANGE_STATUS"],
+                    ch_statuses["APPTNESS_STATUS"],
                 )
             )
             return cur.lastrowid
