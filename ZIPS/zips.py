@@ -302,19 +302,33 @@ def _build_common_context(request_id, channel_name, run_dir: Path):
     channel_tmp = run_dir / f"{channel_name.upper()}_tmp"
     channel_tmp.mkdir(parents=True, exist_ok=True)
 
-    path_date  = datetime.now().strftime("%Y%m%d")
-    perm_table = (
-        f"APT_CPA_{channel_name.upper()}_{client_name}_{request_name}_{request_type}_{path_date}"
-    )
-
-    path_FINAL    = (
-        f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}_FINAL"
-    )
-    path_COMPLETE = (
-        f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}_COMPLETE"
-    )
-
-    output_file = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
+    path_date = datetime.now().strftime("%Y%m%d")
+    if request_type == "Doordash":
+        # Doordash has its own S3 namespace.  Keeping this here also makes
+        # process_orange_zip (which is shared with the ZIP workflow) write
+        # its FINAL and COMPLETE extracts beneath Doordash rather than the
+        # path of an unrelated Suppression or Mailing request.
+        perm_table = (
+            f"APT_CPA_DOORDASH_{channel_name.upper()}_{request_name}_{path_date}"
+        )
+        path_FINAL = (
+            f"{S3_BASE}/Doordash/{path_date}/{request_name}/{channel_name}_FINAL"
+        )
+        path_COMPLETE = (
+            f"{S3_BASE}/Doordash/{path_date}/{request_name}/{channel_name}_COMPLETE"
+        )
+        output_file = f"Doordash_{channel_name}_{path_date}.csv"
+    else:
+        perm_table = (
+            f"APT_CPA_{channel_name.upper()}_{client_name}_{request_name}_{request_type}_{path_date}"
+        )
+        path_FINAL = (
+            f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}_FINAL"
+        )
+        path_COMPLETE = (
+            f"{S3_BASE}/{request_type}/{path_date}/{request_name}/{channel_name}_COMPLETE"
+        )
+        output_file = f"{client_name}_{request_type}_{channel_name}_{path_date}.csv"
 
     return {
         "request_data"   : request_data,
