@@ -511,6 +511,18 @@ button { cursor: pointer; border: none; background: none; font: inherit; }
 }
 .requests-table tbody tr:last-child td { border-bottom: none; }
 .requests-table strong { font-weight: 600; color: var(--text); }
+.request-summary-row { cursor: pointer; }
+.request-summary-row:focus { outline: 2px solid var(--primary); outline-offset: -2px; }
+.expand-indicator { display: inline-block; margin-left: 7px; color: var(--primary); transition: transform var(--transition); }
+.request-summary-row.expanded .expand-indicator { transform: rotate(180deg); }
+.request-details-row td { padding: 0 11px 10px; background: #f8fbff; }
+.request-details-panel { border: 1px solid #dbeafe; border-radius: 9px; padding: 10px 12px; }
+.request-details-title { color: var(--text); font-weight: 700; font-size: .8rem; margin-bottom: 8px; }
+.request-details-title span { color: var(--muted); font-size: .73rem; font-weight: 400; margin-left: 8px; }
+.channel-status-list { display: flex; flex-wrap: wrap; gap: 8px 14px; }
+.channel-status-item { display: inline-flex; align-items: center; gap: 6px; }
+.channel-status-name { color: var(--muted); font-size: .72rem; font-weight: 700; }
+.doordash-output-details { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; padding-top: 9px; border-top: 1px solid #dbeafe; font-size: .73rem; color: var(--muted); }
 .text-center { text-align: center; }
 .muted { color: var(--muted); }
 .small { font-size: .78rem; }
