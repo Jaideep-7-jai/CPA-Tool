@@ -9,6 +9,7 @@ import uuid
 import shlex
 import json
 import os
+from config import S3_BASE
 
 
 try:
@@ -53,10 +54,13 @@ _CHANNEL_COLUMNS = {
     "GREEN_FILEPATH",   "BLUE_FILEPATH",   "ARCAMAX_FILEPATH",   "ORANGE_FILEPATH",   "APPTNESS_FILEPATH",
     # file size in bytes for each channel output file
     "GREEN_FILESIZE",   "BLUE_FILESIZE",   "ARCAMAX_FILESIZE",   "ORANGE_FILESIZE",   "APPTNESS_FILESIZE",
+    "DOORDASH_EMAIL_FTP", "DOORDASH_MD5HASH_FTP",
+    "DOORDASH_EMAIL_FILECOUNT", "DOORDASH_MD5HASH_FILECOUNT",
 }
 
 # All recognised channel names (excluding ALL)
 _ALL_CHANNELS = ("GREEN", "BLUE", "ARCAMAX", "ORANGE", "APPTNESS")
+_PRIVILEGED_USERS = {"admin", "jaideep"}
 
 
 
@@ -183,6 +187,10 @@ def init_db():
             _add_column_if_missing(cur, "requests", "BLUE_FILESIZE",    "BIGINT NULL")
             _add_column_if_missing(cur, "requests", "ARCAMAX_FILESIZE", "BIGINT NULL")
             _add_column_if_missing(cur, "requests", "ORANGE_FILESIZE",  "BIGINT NULL")
+            _add_column_if_missing(cur, "requests", "DOORDASH_EMAIL_FTP", "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "DOORDASH_MD5HASH_FTP", "VARCHAR(500) NULL")
+            _add_column_if_missing(cur, "requests", "DOORDASH_EMAIL_FILECOUNT", "BIGINT NULL")
+            _add_column_if_missing(cur, "requests", "DOORDASH_MD5HASH_FILECOUNT", "BIGINT NULL")
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS filedetails (
@@ -406,7 +414,14 @@ def update_request_db(request_uuid, **kwargs):
 
 
 
-def fetch_all_requests(limit=200):
+def _request_scope(username):
+    """Return SQL scope and parameters for the current user's request data."""
+    if (username or "").lower() in _PRIVILEGED_USERS:
+        return "", []
+    return "WHERE u.username=%s", [username]
+
+
+def fetch_all_requests(limit=200, username=None):
     """Fetch all requests including per-channel statuses and file details."""
     conn = get_db()
     try:
@@ -422,14 +437,15 @@ def fetch_all_requests(limit=200):
                     r.APPTNESS_STATUS,
                     r.GREEN_FTP,    r.BLUE_FTP,    r.ARCAMAX_FTP,    r.ORANGE_FTP,    r.APPTNESS_FTP,
                     r.GREEN_FILECOUNT, r.BLUE_FILECOUNT, r.ARCAMAX_FILECOUNT, r.ORANGE_FILECOUNT, r.APPTNESS_FILECOUNT,
-                    r.GREEN_FILENAME,  r.BLUE_FILENAME,  r.ARCAMAX_FILENAME,  r.ORANGE_FILENAME, r.APPTNESS_FILENAME,
                     r.GREEN_FILEPATH,  r.BLUE_FILEPATH,  r.ARCAMAX_FILEPATH,  r.ORANGE_FILEPATH, r.APPTNESS_FILEPATH,
-                    r.GREEN_FILESIZE,  r.BLUE_FILESIZE,  r.ARCAMAX_FILESIZE,  r.ORANGE_FILESIZE, r.APPTNESS_FILESIZE
+                    r.GREEN_FILESIZE,  r.BLUE_FILESIZE,  r.ARCAMAX_FILESIZE,  r.ORANGE_FILESIZE, r.APPTNESS_FILESIZE,
+                    r.DOORDASH_EMAIL_FTP, r.DOORDASH_MD5HASH_FTP,
+                    r.DOORDASH_EMAIL_FILECOUNT, r.DOORDASH_MD5HASH_FILECOUNT
                 FROM requests r
                 JOIN users u ON u.id = r.created_by
-                ORDER BY r.id DESC
-                LIMIT %s
-            """, (limit,))
+                {scope}
+                ORDER BY r.id DESC LIMIT %s
+            """.format(scope=_request_scope(username)[0]), tuple(_request_scope(username)[1] + [limit]))
             rows = cur.fetchall()
             results = []
             for row in rows:
@@ -465,21 +481,13 @@ def fetch_all_requests(limit=200):
                     "ARCAMAX_FILECOUNT":row[28] or "",
                     "ORANGE_FILECOUNT": row[29] or "",
                     "APPTNESS_FILECOUNT": row[30] or "",
-                    "GREEN_FILENAME":   row[31] or "",
-                    "BLUE_FILENAME":    row[32] or "",
-                    "ARCAMAX_FILENAME": row[33] or "",
-                    "ORANGE_FILENAME":  row[34] or "",
-                    "APPTNESS_FILENAME": row[35] or "",
-                    "GREEN_FILEPATH":   row[36] or "",
-                    "BLUE_FILEPATH":    row[37] or "",
-                    "ARCAMAX_FILEPATH": row[38] or "",
-                    "ORANGE_FILEPATH":  row[39] or "",
-                    "APPTNESS_FILEPATH": row[40] or "",
-                    "GREEN_FILESIZE":   row[41],
-                    "BLUE_FILESIZE":    row[42],
-                    "ARCAMAX_FILESIZE": row[43],
-                    "ORANGE_FILESIZE":  row[44],
-                    "APPTNESS_FILESIZE": row[45],
+                    "GREEN_FILEPATH":   row[31] or "", "BLUE_FILEPATH": row[32] or "",
+                    "ARCAMAX_FILEPATH": row[33] or "", "ORANGE_FILEPATH": row[34] or "",
+                    "APPTNESS_FILEPATH": row[35] or "", "GREEN_FILESIZE": row[36],
+                    "BLUE_FILESIZE": row[37], "ARCAMAX_FILESIZE": row[38],
+                    "ORANGE_FILESIZE": row[39], "APPTNESS_FILESIZE": row[40],
+                    "DOORDASH_EMAIL_FTP": row[41] or "", "DOORDASH_MD5HASH_FTP": row[42] or "",
+                    "DOORDASH_EMAIL_FILECOUNT": row[43], "DOORDASH_MD5HASH_FILECOUNT": row[44],
                 })
             return results
     finally:
@@ -487,10 +495,11 @@ def fetch_all_requests(limit=200):
 
 
 
-def fetch_dashboard_stats():
+def fetch_dashboard_stats(username=None):
     conn = get_db()
     try:
         with conn.cursor() as cur:
+            where, params = _request_scope(username)
             cur.execute("""
                 SELECT
                     COUNT(*) AS total,
@@ -498,8 +507,8 @@ def fetch_dashboard_stats():
                     SUM(overall_status='failed') AS failed,
                     SUM(overall_status='inprogress') AS inprogress,
                     COUNT(DISTINCT request_type) AS types
-                FROM requests
-            """)
+                FROM requests r JOIN users u ON u.id=r.created_by {where}
+            """.format(where=where), tuple(params))
             row = cur.fetchone()
             total = row[0] or 0
             completed = int(row[1] or 0)
@@ -512,8 +521,8 @@ def fetch_dashboard_stats():
                        SUM(overall_status='completed') AS completed,
                        SUM(overall_status='failed') AS failed,
                        COUNT(*) AS total
-                FROM requests GROUP BY request_type
-            """)
+                FROM requests r JOIN users u ON u.id=r.created_by {where} GROUP BY request_type
+            """.format(where=where), tuple(params))
             by_type = {}
             for r in cur.fetchall():
                 by_type[r[0]] = {"completed": int(r[1] or 0), "failed": int(r[2] or 0), "total": int(r[3] or 0)}
@@ -521,15 +530,15 @@ def fetch_dashboard_stats():
 
             cur.execute("""
                 SELECT criteria_type, COUNT(*) AS total
-                FROM requests GROUP BY criteria_type
-            """)
+                FROM requests r JOIN users u ON u.id=r.created_by {where} GROUP BY criteria_type
+            """.format(where=where), tuple(params))
             by_criteria = {r[0]: int(r[1] or 0) for r in cur.fetchall()}
 
 
             cur.execute("""
                 SELECT channel, COUNT(*) AS total
-                FROM requests GROUP BY channel
-            """)
+                FROM requests r JOIN users u ON u.id=r.created_by {where} GROUP BY channel
+            """.format(where=where), tuple(params))
             by_channel = {r[0]: int(r[1] or 0) for r in cur.fetchall()}
 
 
@@ -731,6 +740,17 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
             for i, ch in enumerate(_ALL_CHANNELS):
                 existing_statuses[ch] = row[i] or ""
 
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT request_type, request_name, DATE(created_at) FROM requests WHERE request_uuid=%s",
+                    (request_uuid,),
+                )
+                request_meta = cur.fetchone()
+        finally:
+            conn.close()
+
         # ── 3. Build per-channel update dict from filedetails.json ───
         channel_updates = {}
         for fd in file_details:
@@ -751,17 +771,21 @@ def _persist_filedetails_to_db(request_uuid, request_name, output_dir):
             if existing_statuses.get(ch) == "NOT_SELECTED":
                 continue
 
-            fname      = fd.get("filename", "")
             row_count  = fd.get("file_count") or fd.get("row_count") or ""
-            filepath   = fd.get("path", "")
-            # file_size_bytes added by build_file_details_json in utils.py
-            file_size  = fd.get("file_size_bytes") or None
+            filepath = fd.get("s3_path", "")
+            if not filepath and request_meta:
+                request_type, db_request_name, created_date = request_meta
+                path_date = created_date.strftime("%Y%m%d")
+                export = "COMPLETE" if request_type == "Doordash" else "FINAL"
+                base = f"{S3_BASE}/{request_type}/{path_date}/{db_request_name}"
+                if request_type == "Doordash":
+                    base = f"{S3_BASE}/Doordash/{path_date}/{db_request_name}"
+                filepath = f"{base}/{ch}_{export}/"
 
             channel_updates[f"{ch}_STATUS"]    = "completed"
-            channel_updates[f"{ch}_FILENAME"]  = fname
             channel_updates[f"{ch}_FILECOUNT"] = str(row_count) if row_count else ""
             channel_updates[f"{ch}_FILEPATH"]  = filepath
-            channel_updates[f"{ch}_FILESIZE"]  = int(file_size) if file_size else None
+            channel_updates[f"{ch}_FILESIZE"]  = int(row_count) if row_count else None
 
         if channel_updates:
             update_request_db(request_uuid, **channel_updates)
@@ -805,8 +829,8 @@ def logout():
 @app.route('/')
 @login_required
 def dashboard():
-    stats = fetch_dashboard_stats()
-    recent = fetch_all_requests(limit=10)
+    stats = fetch_dashboard_stats(session.get('username'))
+    recent = fetch_all_requests(limit=10, username=session.get('username'))
     chart_data = build_chart_data(stats)
     return render_template('dashboard_home.html',
                            stats=stats,
@@ -820,7 +844,7 @@ def dashboard():
 @app.route('/new-request')
 @login_required
 def new_request():
-    recent = fetch_all_requests(limit=20)
+    recent = fetch_all_requests(limit=20, username=session.get('username'))
     return render_template('new_request.html',
                            recent=recent,
                            username=session.get('username'),
@@ -831,7 +855,7 @@ def new_request():
 @app.route('/requests')
 @login_required
 def requests_list():
-    all_reqs = fetch_all_requests(limit=500)
+    all_reqs = fetch_all_requests(limit=500, username=session.get('username'))
     return render_template('requests_list.html',
                            requests=all_reqs,
                            username=session.get('username'),
@@ -863,7 +887,7 @@ def api_check_name():
 @app.route('/api/requests')
 @login_required
 def api_requests():
-    return jsonify({'items': fetch_all_requests()})
+    return jsonify({'items': fetch_all_requests(username=session.get('username'))})
 
 
 
@@ -881,6 +905,18 @@ def api_analytics():
 @login_required
 def api_filedetails(request_uuid):
     """Return file details for a given request UUID from the DB table."""
+    if session.get("username", "").lower() not in _PRIVILEGED_USERS:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM requests r JOIN users u ON u.id=r.created_by WHERE r.request_uuid=%s AND u.username=%s",
+                    (request_uuid, session.get("username")),
+                )
+                if not cur.fetchone():
+                    return jsonify({'items': []}), 403
+        finally:
+            conn.close()
     return jsonify({'items': fetch_filedetails(request_uuid)})
 
 
