@@ -29,6 +29,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const chArcamax = document.getElementById('chArcamax');
   const chApptness = document.getElementById('chApptness');
   const channelWrapper = document.getElementById('channelWrapper');
+  const channelGroup = document.getElementById('channelGroup');
   const individualChannels = [chGreen, chBlue, chOrange, chApptness, chArcamax];
 
   // Conditional groups
@@ -95,6 +96,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // ── Doordash auto-fill ────────────────────────────────────────────────────────
   function applyDoordashDefaults() {
     const isDoordash = requestTypeEl.value === 'Doordash';
+    channelGroup.classList.toggle('hidden', !requestTypeEl.value);
 
     if (isDoordash) {
       clientNameEl.value  = 'Doordash';
