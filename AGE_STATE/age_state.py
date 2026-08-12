@@ -723,7 +723,7 @@ def process_green_blue(request_id, channel_name, run_dir: Path):
                 "status": "NO_DATA",
                 "elapsed": time.time() - start_time,
                 "count": 0,
-            }   
+            }
 
         log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
 
@@ -1000,7 +1000,7 @@ def process_orange(request_id, run_dir: Path):
                 "status": "NO_DATA",
                 "elapsed": time.time() - start_time,
                 "count": 0,
-            }   
+            }
 
         log.info(f"  STEP 1 DONE: Data loaded into {perm_table}")
 
