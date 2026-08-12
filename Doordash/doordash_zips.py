@@ -142,15 +142,16 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
         return []
 
     final_files_dir = run_dir / "FINAL_FILES"
+    request_name = _build_common_context(request_id, "GREEN", run_dir)["request_name"]
     email_name = f"Doordash_Green_Blue_Apptness_Arcamax_email_zips_{path_date}.csv"
     md5_name = f"Doordash_Arcamax_md5hash_zips_{path_date}.csv"
-    email_s3 = f"{S3_BASE}/Doordash/{path_date}/FINAL_EMAIL"
-    md5_s3 = f"{S3_BASE}/Doordash/{path_date}/FINAL_ARCAMAX_MD5"
+    email_s3 = f"{S3_BASE}/Doordash/{path_date}/{request_name}/FINAL_EMAIL"
+    md5_s3 = f"{S3_BASE}/Doordash/{path_date}/{request_name}/FINAL_ARCAMAX_MD5"
     union_sql = " UNION ALL ".join(
         f"SELECT email FROM {results[ch]['perm_table']}" for ch in completed
     )
     copy_email = (
-        f"COPY INTO '{email_s3}/' FROM (SELECT DISTINCT email FROM ({union_sql}) WHERE email IS NOT NULL) "
+        f"COPY INTO '{email_s3}/' FROM (SELECT DISTINCT email FROM ({union_sql}) AS all_channels WHERE email IS NOT NULL) "
         f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' FIELD_OPTIONALLY_ENCLOSED_BY='\"') HEADER=TRUE MAX_FILE_SIZE=490000000;"
     )
     arcamax_table = results.get("ARCAMAX", {}).get("perm_table")
@@ -205,7 +206,12 @@ def process_doordash_zip_request(request_id: int, zip_file: str, channel, output
     channels_to_run = list(CHANNELS) if "ALL" in channel else [ch.upper() for ch in channel if ch.upper() in CHANNELS]
     request_data = fetch_request_details(request_id)
     if not request_data:
-        raise Exception(f"Request ID {request_id} not found in DB")
+        raise RuntimeError(f"Request ID {request_id} was not found in requests")
+    if request_data["request_type"] != "Doordash":
+        raise RuntimeError(
+            f"Request ID {request_id} is a {request_data['request_type']} request. "
+            "Doordash jobs must use the ID from the requests table for a Doordash row."
+        )
     path_date = datetime.now().strftime("%Y%m%d")
     s3_zip_dir = f"{S3_BASE}/Doordash/ZIPS/{path_date}/staging"
     s3_zip_path = f"{s3_zip_dir}/{os.path.basename(zip_file)}"
