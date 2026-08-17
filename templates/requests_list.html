@@ -25,15 +25,39 @@
           {% set row_id = 'details-' ~ loop.index %}
           <tr class="req-row request-summary-row" tabindex="0" role="button" aria-expanded="false" aria-controls="{{ row_id }}"
               data-channels="{{ r.channel }}" data-search="{{ r.request_name }} {{ r.client_name }} {{ r.request_type }} {{ r.criteria_type }} {{ r.overall_status }}">
-            <td><strong>{{ r.request_name }}</strong><span class="expand-indicator" aria-hidden="true">⌄</span></td>
+            <td><span class="expand-indicator" aria-hidden="true">⌄</span><strong>{{ r.request_name }}</strong></td>
             <td>{{ r.client_name }}</td><td><span class="badge-type {{ r.request_type|lower }}">{{ r.request_type }}</span></td><td><span class="badge-criteria">{{ r.criteria_type|upper }}</span></td>
             <td class="muted small">{{ r.criteria_value or '-' }}</td><td class="muted small">{{ r.comp_type }}</td><td><span class="tag">{{ r.channel }}</span></td>
             <td><span class="badge {{ r.overall_status|lower|replace(' ', '') }}">{{ r.overall_status }}</span></td><td>{{ r.username }}</td><td class="muted small">{{ r.created_at }}</td><td class="muted small">{{ r.finished_at or '-' }}</td>
           </tr>
           <tr id="{{ row_id }}" class="request-details-row" hidden><td colspan="11">
             <div class="request-details-panel">
-              <div class="request-details-title">Channel status <span>Hover a status to view file details</span></div>
+              <div class="request-details-title">{% if r.request_type == 'Doordash' %}Doordash files{% else %}Channel status{% endif %}<span>Hover or click a pill to view file details</span></div>
               <div class="channel-status-list">
+              {% if r.request_type == 'Doordash' %}
+                {% set email_ready = r.DOORDASH_EMAIL_FTP or r.DOORDASH_EMAIL_FILECOUNT %}
+                {% set md5_ready = r.DOORDASH_MD5HASH_FTP or r.DOORDASH_MD5HASH_FILECOUNT %}
+                <div class="channel-status-item">
+                  <span class="channel-status-name">EMAIL FILE</span>
+                  <span class="badge-status artifact-pill {{ 'completed' if email_ready else 'pending' }} has-popup" tabindex="0"
+                    data-channel="EMAIL_FILE" data-status="{{ 'Completed' if email_ready else 'Pending' }}"
+                    data-ftp="{{ r.DOORDASH_EMAIL_FTP or '' }}" data-filecount="{{ r.DOORDASH_EMAIL_FILECOUNT or '' }}">EMAIL_FILE</span>
+                </div>
+                <div class="channel-status-item">
+                  <span class="channel-status-name">MD5 HASH FILE</span>
+                  <span class="badge-status artifact-pill {{ 'completed' if md5_ready else 'pending' }} has-popup" tabindex="0"
+                    data-channel="MD5HASH_FILE" data-status="{{ 'Completed' if md5_ready else 'Pending' }}"
+                    data-ftp="{{ r.DOORDASH_MD5HASH_FTP or '' }}" data-filecount="{{ r.DOORDASH_MD5HASH_FILECOUNT or '' }}">MD5HASH_FILE</span>
+                </div>
+                {% set orange_status = r.ORANGE_STATUS or 'Pending' %}
+                <div class="channel-status-item">
+                  <span class="channel-status-name">ORANGE</span>
+                  <span class="badge-status {{ orange_status|lower|replace(' ', '_') }} has-popup" tabindex="0"
+                    data-channel="ORANGE" data-status="{{ orange_status }}" data-ftp="{{ r.ORANGE_FTP or '' }}"
+                    data-filecount="{{ r.ORANGE_FILECOUNT or '' }}" data-filepath="{{ r.ORANGE_FILEPATH or '' }}"
+                    data-filesize="{{ r.ORANGE_FILESIZE or '' }}">{{ orange_status }}</span>
+                </div>
+              {% else %}
               {% set display_channels = ['GREEN', 'BLUE', 'ARCAMAX', 'ORANGE', 'APPTNESS'] if r.request_type == 'Doordash' else ['GREEN', 'BLUE', 'ARCAMAX', 'ORANGE'] %}
               {% for channel in display_channels %}
                 {% if is_all or channel in selected %}
@@ -48,10 +72,8 @@
                   </div>
                 {% endif %}
               {% endfor %}
-              </div>
-              {% if r.request_type == 'Doordash' %}
-              <div class="doordash-output-details"><strong>Doordash output files</strong><span>Email FTP: {{ r.DOORDASH_EMAIL_FTP or '-' }}</span><span>Email count: {{ r.DOORDASH_EMAIL_FILECOUNT or '-' }}</span><span>MD5 FTP: {{ r.DOORDASH_MD5HASH_FTP or '-' }}</span><span>MD5 count: {{ r.DOORDASH_MD5HASH_FILECOUNT or '-' }}</span></div>
               {% endif %}
+              </div>
             </div>
           </td></tr>
         {% else %}<tr><td colspan="11" class="text-center muted" style="padding:30px;">No requests found.</td></tr>{% endfor %}
@@ -69,7 +91,8 @@
 const privileged = {{ 'true' if session.get('username','')|lower in ['admin','jaideep'] else 'false' }};
 const popup = document.getElementById('statusPopup'), popupChannel = popup.querySelector('.popup-channel-name'), popupStatus = popup.querySelector('.popup-status-badge'), popupBody = popup.querySelector('.popup-body');
 const statusColours = {completed:['#dcfce7','#16a34a'], failed:['#fee2e2','#dc2626'], inprogress:['#fef3c7','#d97706'], pending:['#f1f5f9','#64748b'], not_selected:['#f1f5f9','#94a3b8']};
-function popupRow(label, value) { return value ? `<div class="popup-row"><span class="popup-label">${label}</span><span class="popup-value">${value}</span></div>` : ''; }
+function escapeHtml(value) { return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+function popupRow(label, value) { return value ? `<div class="popup-row"><span class="popup-label">${label}</span><span><span class="popup-value">${escapeHtml(value)}</span><button class="popup-copy-btn" type="button" data-copy="${escapeHtml(value)}">Copy</button></span></div>` : ''; }
 function showPopup(badge) {
   const status = (badge.dataset.status || 'Pending').trim(), key = status.toLowerCase().replace(/ /g, '_'), colours = statusColours[key] || statusColours.pending;
   popupChannel.textContent = badge.dataset.channel || ''; popupStatus.textContent = status; popupStatus.style.background = colours[0]; popupStatus.style.color = colours[1];
@@ -78,9 +101,19 @@ function showPopup(badge) {
   popupBody.innerHTML = html || '<span class="muted">No file details available.</span>';
   const rect = badge.getBoundingClientRect(); popup.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - 360))}px`; popup.style.top = `${Math.min(rect.bottom + 8, window.innerHeight - 80)}px`;
   popup.classList.add('visible'); popup.setAttribute('aria-hidden', 'false');
+  popup.querySelectorAll('.popup-copy-btn').forEach(button => button.addEventListener('click', event => {
+    event.stopPropagation();
+    navigator.clipboard.writeText(button.dataset.copy).then(() => { button.textContent = 'Copied'; setTimeout(() => { button.textContent = 'Copy'; }, 1200); });
+  }));
 }
 function hidePopup() { popup.classList.remove('visible'); popup.setAttribute('aria-hidden', 'true'); }
-document.querySelectorAll('.has-popup').forEach(badge => { badge.addEventListener('mouseenter', () => showPopup(badge)); badge.addEventListener('mouseleave', hidePopup); badge.addEventListener('focus', () => showPopup(badge)); badge.addEventListener('blur', hidePopup); });
+document.querySelectorAll('.has-popup').forEach(badge => {
+  badge.addEventListener('mouseenter', () => showPopup(badge));
+  badge.addEventListener('focus', () => showPopup(badge));
+  badge.addEventListener('click', event => { event.stopPropagation(); showPopup(badge); });
+  badge.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showPopup(badge); } });
+});
+document.addEventListener('click', event => { if (!event.target.closest('.has-popup') && !event.target.closest('#statusPopup')) hidePopup(); });
 document.querySelectorAll('.request-summary-row').forEach(row => {
   const details = document.getElementById(row.getAttribute('aria-controls'));
   const toggle = () => { const open = details.hidden; document.querySelectorAll('.request-details-row').forEach(item => item.hidden = true); document.querySelectorAll('.request-summary-row').forEach(item => { item.setAttribute('aria-expanded', 'false'); item.classList.remove('expanded'); }); details.hidden = !open; row.setAttribute('aria-expanded', String(open)); row.classList.toggle('expanded', open); };
