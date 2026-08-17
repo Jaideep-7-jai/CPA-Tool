@@ -4,6 +4,28 @@
 {% block breadcrumb %}<span class="breadcrumb">Requests &rsaquo; All</span>{% endblock %}
 
 {% block content %}
+<style>
+/* Page-local rules deliberately live with this template so the expanded
+   request layout does not depend on a browser-cached stylesheet. */
+#requestsTable .request-summary-row { cursor: pointer; }
+#requestsTable .request-summary-row.expanded { background: #eaf4ff; }
+#requestsTable .request-summary-row.expanded td:first-child { box-shadow: inset 4px 0 0 #2563eb; }
+#requestsTable .expand-indicator { display: inline-block; width: 18px; margin-right: 6px; color: #2563eb; font-size: 1rem; font-weight: 800; transition: transform .18s ease; }
+#requestsTable .request-summary-row.expanded .expand-indicator { transform: rotate(180deg); }
+#requestsTable .request-details-row td { padding: 0 12px 12px; background: #eaf4ff; border-bottom: 1px solid #bfdbfe; }
+#requestsTable .request-details-panel { border-left: 4px solid #2563eb; border-radius: 0 9px 9px 0; background: #f8fbff; padding: 13px 15px; }
+#requestsTable .request-details-title { color: #172554; font-weight: 700; font-size: .82rem; margin-bottom: 10px; }
+#requestsTable .request-details-title span { color: #64748b; font-weight: 400; font-size: .74rem; margin-left: 8px; }
+#requestsTable .channel-status-list { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 12px 22px; }
+#requestsTable .channel-status-item { display: inline-flex; flex-direction: row; align-items: center; gap: 7px; }
+#requestsTable .channel-status-name { color: #475569; font-size: .72rem; font-weight: 800; letter-spacing: .03em; }
+#requestsTable .artifact-pill { min-width: 100px; justify-content: center; }
+#requestsTable .badge-status { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px; font-size: .73rem; font-weight: 700; white-space: nowrap; }
+#requestsTable .badge-status.completed { background: #dcfce7; color: #16a34a; }
+#requestsTable .badge-status.failed { background: #fee2e2; color: #dc2626; }
+#requestsTable .badge-status.inprogress, #requestsTable .badge-status.in_progress { background: #fef3c7; color: #d97706; }
+#requestsTable .badge-status.pending, #requestsTable .badge-status.not_selected { background: #f1f5f9; color: #64748b; }
+</style>
 <div class="analytics-container">
   <section class="filters-bar">
     <input type="text" id="searchInput" placeholder="🔍 Search name, type, criteria..." class="filter-input">
@@ -22,6 +44,7 @@
         {% for r in requests %}
           {% set selected = r.channel.split(',') if r.channel else [] %}
           {% set is_all = r.channel == 'ALL' %}
+          {% set is_privileged = session.get('username','')|lower in ['admin', 'jaideep'] %}
           {% set row_id = 'details-' ~ loop.index %}
           <tr class="req-row request-summary-row" tabindex="0" role="button" aria-expanded="false" aria-controls="{{ row_id }}"
               data-channels="{{ r.channel }}" data-search="{{ r.request_name }} {{ r.client_name }} {{ r.request_type }} {{ r.criteria_type }} {{ r.overall_status }}">
@@ -37,18 +60,33 @@
               {% if r.request_type == 'Doordash' %}
                 {% set email_ready = r.DOORDASH_EMAIL_FTP or r.DOORDASH_EMAIL_FILECOUNT %}
                 {% set md5_ready = r.DOORDASH_MD5HASH_FTP or r.DOORDASH_MD5HASH_FILECOUNT %}
+                {% set email_status = 'completed' if email_ready else ('failed' if r.overall_status == 'failed' else ('inprogress' if r.overall_status == 'inprogress' else 'pending')) %}
+                {% set md5_status = 'completed' if md5_ready else ('failed' if r.overall_status == 'failed' else ('inprogress' if r.overall_status == 'inprogress' else 'pending')) %}
                 <div class="channel-status-item">
                   <span class="channel-status-name">EMAIL FILE</span>
-                  <span class="badge-status artifact-pill {{ 'completed' if email_ready else 'pending' }} has-popup" tabindex="0"
-                    data-channel="EMAIL_FILE" data-status="{{ 'Completed' if email_ready else 'Pending' }}"
+                  <span class="badge-status artifact-pill {{ email_status }} has-popup" tabindex="0"
+                    data-channel="EMAIL_FILE" data-status="{{ email_status|replace('inprogress', 'In Progress')|title }}"
                     data-ftp="{{ r.DOORDASH_EMAIL_FTP or '' }}" data-filecount="{{ r.DOORDASH_EMAIL_FILECOUNT or '' }}">EMAIL_FILE</span>
                 </div>
                 <div class="channel-status-item">
                   <span class="channel-status-name">MD5 HASH FILE</span>
-                  <span class="badge-status artifact-pill {{ 'completed' if md5_ready else 'pending' }} has-popup" tabindex="0"
-                    data-channel="MD5HASH_FILE" data-status="{{ 'Completed' if md5_ready else 'Pending' }}"
+                  <span class="badge-status artifact-pill {{ md5_status }} has-popup" tabindex="0"
+                    data-channel="MD5HASH_FILE" data-status="{{ md5_status|replace('inprogress', 'In Progress')|title }}"
                     data-ftp="{{ r.DOORDASH_MD5HASH_FTP or '' }}" data-filecount="{{ r.DOORDASH_MD5HASH_FILECOUNT or '' }}">MD5HASH_FILE</span>
                 </div>
+                {% if is_privileged %}
+                {% for channel in ['GREEN', 'BLUE', 'ARCAMAX', 'ORANGE', 'APPTNESS'] %}
+                  {% set status = r[channel ~ '_STATUS'] or 'Pending' %}
+                  {% set status_class = status|lower|replace(' ', '_') %}
+                  <div class="channel-status-item">
+                    <span class="channel-status-name">{{ channel }}</span>
+                    <span class="badge-status {{ status_class }} has-popup" tabindex="0"
+                      data-channel="{{ channel }}" data-status="{{ status }}" data-ftp="{{ r[channel ~ '_FTP'] or '' }}"
+                      data-filecount="{{ r[channel ~ '_FILECOUNT'] or '' }}" data-filepath="{{ r[channel ~ '_FILEPATH'] or '' }}"
+                      data-filesize="{{ r[channel ~ '_FILESIZE'] or '' }}">{{ status }}</span>
+                  </div>
+                {% endfor %}
+                {% else %}
                 {% set orange_status = r.ORANGE_STATUS or 'Pending' %}
                 <div class="channel-status-item">
                   <span class="channel-status-name">ORANGE</span>
@@ -57,6 +95,7 @@
                     data-filecount="{{ r.ORANGE_FILECOUNT or '' }}" data-filepath="{{ r.ORANGE_FILEPATH or '' }}"
                     data-filesize="{{ r.ORANGE_FILESIZE or '' }}">{{ orange_status }}</span>
                 </div>
+                {% endif %}
               {% else %}
               {% set display_channels = ['GREEN', 'BLUE', 'ARCAMAX', 'ORANGE', 'APPTNESS'] if r.request_type == 'Doordash' else ['GREEN', 'BLUE', 'ARCAMAX', 'ORANGE'] %}
               {% for channel in display_channels %}
@@ -90,7 +129,7 @@
 <script>
 const privileged = {{ 'true' if session.get('username','')|lower in ['admin','jaideep'] else 'false' }};
 const popup = document.getElementById('statusPopup'), popupChannel = popup.querySelector('.popup-channel-name'), popupStatus = popup.querySelector('.popup-status-badge'), popupBody = popup.querySelector('.popup-body');
-const statusColours = {completed:['#dcfce7','#16a34a'], failed:['#fee2e2','#dc2626'], inprogress:['#fef3c7','#d97706'], pending:['#f1f5f9','#64748b'], not_selected:['#f1f5f9','#94a3b8']};
+const statusColours = {completed:['#dcfce7','#16a34a'], failed:['#fee2e2','#dc2626'], inprogress:['#fef3c7','#d97706'], in_progress:['#fef3c7','#d97706'], pending:['#f1f5f9','#64748b'], not_selected:['#f1f5f9','#94a3b8']};
 function escapeHtml(value) { return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
 function popupRow(label, value) { return value ? `<div class="popup-row"><span class="popup-label">${label}</span><span><span class="popup-value">${escapeHtml(value)}</span><button class="popup-copy-btn" type="button" data-copy="${escapeHtml(value)}">Copy</button></span></div>` : ''; }
 function showPopup(badge) {
