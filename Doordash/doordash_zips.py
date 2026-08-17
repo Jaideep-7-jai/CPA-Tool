@@ -283,15 +283,18 @@ def process_doordash_zip_request(request_id: int, zip_file: str, channel, output
 
     total_records = sum(v.get("count", 0) for v in results.values() if isinstance(v, dict))
     if errors:
-        send_error_email("DOORDASH ZIP PARTIAL FAILURE", "\n".join(f"{c}: {e}" for c, e in errors))
+        error_summary = "\n".join(f"{channel_name}: {error}" for channel_name, error in errors)
+        send_error_email("DOORDASH ZIP FAILURE", error_summary)
+        # Do not let the parent job mark a partial/combined-output failure as
+        # completed.  The request stays in progress until this function exits;
+        # raising here makes app.run_job persist the final failed status.
+        raise RuntimeError(f"Doordash request failed:\n{error_summary}")
     else:
         files = [
             v["file"] for v in results.values()
             if isinstance(v, dict) and v.get("file")
         ] + [v["file"] for v in combined_outputs]
         send_success_email(f"DOORDASH ZIP REQUEST COMPLETE — {total_records:,} matched", files, str(run_dir))
-    if errors and not results:
-        raise RuntimeError(f"All channels failed: {errors}")
 
 
 if __name__ == "__main__":
