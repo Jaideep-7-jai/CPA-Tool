@@ -634,6 +634,7 @@ button { cursor: pointer; border: none; background: none; font: inherit; }
 .badge-status.completed   { background: var(--success-bg); color: var(--success); }
 .badge-status.failed      { background: var(--failed-bg);  color: var(--failed); }
 .badge-status.inprogress  { background: var(--warning-bg); color: var(--warning); }
+.badge-status.in_progress { background: var(--warning-bg); color: var(--warning); }
 .badge-status.pending     { background: #f1f5f9; color: #64748b; }
 .badge-status.not_selected{ background: #f1f5f9; color: #94a3b8; }
 .badge-status.completed\  { background: var(--success-bg); color: var(--success); }
