@@ -31,6 +31,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const channelWrapper = document.getElementById('channelWrapper');
   const channelGroup = document.getElementById('channelGroup');
   const individualChannels = [chGreen, chBlue, chOrange, chApptness, chArcamax];
+  const apptnessLabel = chApptness.closest('label');
 
   // Conditional groups
   const criteriaValueGroup = document.getElementById('criteriaValueGroup');
@@ -71,6 +72,7 @@ document.addEventListener('DOMContentLoaded', () => {
           chAll.closest('label').classList.remove('checked');
         }
       }
+      updateChannelChoices();
     });
   });
 
@@ -91,6 +93,25 @@ document.addEventListener('DOMContentLoaded', () => {
       individualChannels.forEach(cb => { cb.disabled = true; });
     }
     channelWrapper.classList.toggle('disabled', locked);
+  }
+
+  function updateChannelChoices() {
+    const isDoordash = requestTypeEl.value === 'Doordash';
+
+    // Apptness is an available channel only for Doordash requests.
+    apptnessLabel.classList.toggle('hidden', !isDoordash);
+
+    // For Doordash, ALL is the default. Keep the individual labels out of
+    // the way while ALL is selected; they become available if ALL is cleared.
+    individualChannels.forEach(channel => {
+      const label = channel.closest('label');
+      const hideIndividual = isDoordash && chAll.checked;
+      if (channel !== chApptness) label.classList.toggle('hidden', hideIndividual);
+      if (!isDoordash && channel === chApptness) {
+        channel.checked = false;
+        channel.disabled = false;
+      }
+    });
   }
 
   // ── Doordash auto-fill ────────────────────────────────────────────────────────
@@ -123,6 +144,7 @@ document.addEventListener('DOMContentLoaded', () => {
       compTypeEl.removeAttribute('disabled');
       setChannelLock(false);
     }
+    updateChannelChoices();
     updateCriteriaFields();
   }
 
