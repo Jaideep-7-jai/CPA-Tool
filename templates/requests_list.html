@@ -34,7 +34,8 @@
             <div class="request-details-panel">
               <div class="request-details-title">Channel status <span>Hover a status to view file details</span></div>
               <div class="channel-status-list">
-              {% for channel in ['GREEN', 'BLUE', 'ARCAMAX', 'ORANGE', 'APPTNESS'] %}
+              {% set display_channels = ['GREEN', 'BLUE', 'ARCAMAX', 'ORANGE', 'APPTNESS'] if r.request_type == 'Doordash' else ['GREEN', 'BLUE', 'ARCAMAX', 'ORANGE'] %}
+              {% for channel in display_channels %}
                 {% if is_all or channel in selected %}
                   {% set status = r[channel ~ '_STATUS'] or 'Pending' %}
                   {% set status_class = status|lower|replace(' ', '_') %}
