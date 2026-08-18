@@ -27,6 +27,10 @@
 #requestsTable .badge-status.pending, #requestsTable .badge-status.not_selected { background: #f1f5f9; color: #64748b; }
 </style>
 <div class="analytics-container">
+  <section class="page-hero requests-hero">
+    <div><span class="eyebrow"><i class="bi bi-table"></i> Request registry</span><h2>All Requests</h2><p>Select a request row to view its channel status and available output details.</p></div>
+    <a href="{{ url_for('new_request') }}" class="submit-button hero-action"><i class="bi bi-plus-lg"></i> New Request</a>
+  </section>
   <section class="filters-bar">
     <input type="text" id="searchInput" placeholder="🔍 Search name, type, criteria..." class="filter-input">
     <select id="typeFilter" class="filter-select"><option value="">All Types</option><option value="Suppression">Suppression</option><option value="Mailing">Mailing</option><option value="Doordash">Doordash</option></select>
@@ -36,7 +40,7 @@
   </section>
 
   <section class="table-section">
-    <div class="table-header"><h3>All Requests <span id="rowCount" class="row-count"></span></h3><a href="{{ url_for('new_request') }}" class="submit-button small"><i class="bi bi-plus-lg"></i> New Request</a></div>
+    <div class="table-header"><div><span class="eyebrow">Search results</span><h3>All Requests <span id="rowCount" class="row-count"></span></h3></div><a href="{{ url_for('new_request') }}" class="submit-button small"><i class="bi bi-plus-lg"></i> New Request</a></div>
     <div class="table-scroll">
       <table class="requests-table" id="requestsTable">
         <thead><tr><th>Request Name</th><th>Client Name</th><th>Type</th><th>Criteria</th><th>Value</th><th>Comp</th><th>Channel</th><th>Overall</th><th>Created By</th><th>Created At</th><th>Finished At</th></tr></thead>
@@ -50,7 +54,8 @@
               data-channels="{{ r.channel }}" data-search="{{ r.request_name }} {{ r.client_name }} {{ r.request_type }} {{ r.criteria_type }} {{ r.overall_status }}">
             <td><span class="expand-indicator" aria-hidden="true">⌄</span><strong>{{ r.request_name }}</strong></td>
             <td>{{ r.client_name }}</td><td><span class="badge-type {{ r.request_type|lower }}">{{ r.request_type }}</span></td><td><span class="badge-criteria">{{ r.criteria_type|upper }}</span></td>
-            <td class="muted small">{{ r.criteria_value or '-' }}</td><td class="muted small">{{ r.comp_type }}</td><td><span class="tag">{{ r.channel }}</span></td>
+            {% set value = r.criteria_value or '-' %}
+            <td class="muted small">{% if value|length > 20 %}<span class="value-truncated" title="{{ value }}">{{ value[:20] }}&hellip;</span>{% else %}{{ value }}{% endif %}</td><td class="muted small">{{ r.comp_type }}</td><td><span class="tag">{{ r.channel }}</span></td>
             <td><span class="badge {{ r.overall_status|lower|replace(' ', '') }}">{{ r.overall_status }}</span></td><td>{{ r.username }}</td><td class="muted small">{{ r.created_at }}</td><td class="muted small">{{ r.finished_at or '-' }}</td>
           </tr>
           <tr id="{{ row_id }}" class="request-details-row" hidden><td colspan="11">
