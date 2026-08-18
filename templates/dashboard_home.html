@@ -6,6 +6,15 @@
 {% block content %}
 <div class="analytics-container">
 
+  <section class="page-hero dashboard-hero">
+    <div>
+      <span class="eyebrow"><i class="bi bi-activity"></i> Operations centre</span>
+      <h2>Request activity at a glance</h2>
+      <p>Track submitted requests, their processing status, and channel distribution in one place.</p>
+    </div>
+    <a href="{{ url_for('new_request') }}" class="submit-button hero-action"><i class="bi bi-plus-lg"></i> Create Request</a>
+  </section>
+
   <!-- ── Metric Cards ───────────────────────────── -->
   <section class="cards-section">
     <div class="metric-card" title="Total requests submitted">
@@ -36,6 +45,7 @@
   </section>
 
   <!-- ── Charts ────────────────────────────────── -->
+  <section class="section-heading"><div><span class="eyebrow">Analytics</span><h2>Request insights</h2></div><span class="section-note">Updated from your accessible requests</span></section>
   <section class="charts-section">
     <div class="chart-card chart-type">
       <h3>Requests by Type</h3>
@@ -66,7 +76,7 @@
   <!-- ── Recent Requests ───────────────────────── -->
   <section class="table-section">
     <div class="table-header">
-      <h3>Recent Requests</h3>
+      <div><span class="eyebrow">Latest activity</span><h3>Recent Requests</h3></div>
       <a href="{{ url_for('requests_list') }}" class="view-all-btn">View All &rarr;</a>
     </div>
     <div class="table-scroll">
