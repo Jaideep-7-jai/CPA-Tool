@@ -136,7 +136,7 @@ def insert_complete_extract(request_id, channel_name, zip_staging_table, run_dir
 
 
 def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log):
-    """Write aggregate email and Arcamax MD5 files, then clean up source tables."""
+    """Write aggregate files, validate their S3 output, then clean up source tables."""
     completed = [
         ch for ch in COMBINED_CHANNELS
         if results.get(ch, {}).get("status") == "COMPLETE_EXPORTED"
@@ -146,40 +146,63 @@ def _create_combined_outputs(request_id, run_dir: Path, path_date, results, log)
         return []
 
     final_files_dir = run_dir / "FINAL_FILES"
+    final_files_dir.mkdir(parents=True, exist_ok=True)
     request_name = _build_common_context(request_id, "GREEN", run_dir)["request_name"]
     email_name = f"Doordash_Green_Blue_Apptness_Arcamax_email_zips_{path_date}.csv"
     md5_name = f"Doordash_Arcamax_md5hash_zips_{path_date}.csv"
     email_s3 = f"{S3_BASE}/Doordash/{path_date}/{request_name}/FINAL_EMAIL"
     md5_s3 = f"{S3_BASE}/Doordash/{path_date}/{request_name}/FINAL_ARCAMAX_MD5"
-    union_sql = " UNION ALL ".join(
-        f"SELECT email FROM {results[ch]['perm_table']}" for ch in completed
+    # COPY INTO accepts a direct SELECT.  Build a direct UNION query rather
+    # than nesting a UNION ALL in a derived table; the latter can finish with
+    # no exported objects on some Snowflake configurations.
+    union_sql = " UNION ".join(
+        f"SELECT TRIM(email) AS email FROM {results[ch]['perm_table']} WHERE email IS NOT NULL"
+        for ch in completed
     )
     copy_email = (
-        f"COPY INTO '{email_s3}/' FROM (SELECT DISTINCT email FROM ({union_sql}) AS all_channels WHERE email IS NOT NULL) "
+        f"COPY INTO '{email_s3}/' FROM ({union_sql}) "
         f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' FIELD_OPTIONALLY_ENCLOSED_BY='\"') HEADER=TRUE MAX_FILE_SIZE=490000000;"
     )
     arcamax_table = results.get("ARCAMAX", {}).get("perm_table")
+    email_count = 0
+    md5_count = 0
     try:
+        log.info("  Exporting distinct Doordash email file to S3")
         run_command(["snowsql", "-c", "datateam1", "-q", copy_email])
+        # Downloading immediately verifies that COPY INTO really wrote one or
+        # more objects.  Do not drop the source tables before this succeeds.
+        email_count = _download_and_combine(
+            email_s3, run_dir / "EMAIL_FINAL_DL", run_dir / "EMAIL_FINAL_TMP",
+            email_name, "GREEN", log,
+        )
         if arcamax_table:
             copy_md5 = (
                 f"COPY INTO '{md5_s3}/' FROM (SELECT DISTINCT MD5(LOWER(TRIM(email))) AS md5hash FROM {arcamax_table} WHERE email IS NOT NULL) "
                 f"CREDENTIALS=(AWS_KEY_ID='{AWS_KEY_ID}' AWS_SECRET_KEY='{AWS_SECRET_KEY}') FILE_FORMAT=(TYPE=CSV COMPRESSION=GZIP FIELD_DELIMITER='|' FIELD_OPTIONALLY_ENCLOSED_BY='\"') HEADER=TRUE MAX_FILE_SIZE=490000000;"
             )
+            log.info("  Exporting distinct Arcamax MD5 file to S3")
             run_command(["snowsql", "-c", "datateam1", "-q", copy_md5])
-    finally:
-        # The aggregate data is now in S3; cleanup must precede FTP posting.
-        for ch in completed:
-            _drop_perm_table(results[ch]["perm_table"], log)
+            md5_count = _download_and_combine(
+                md5_s3, run_dir / "MD5_FINAL_DL", run_dir / "MD5_FINAL_TMP",
+                md5_name, "GREEN", log,
+            )
+    except Exception:
+        # Retain the source tables when an aggregate export cannot be
+        # validated.  This preserves the input needed for diagnosis/retry.
+        log.exception("  Doordash aggregate S3 export validation failed; source tables retained")
+        raise
 
-    email_count = _download_and_combine(email_s3, run_dir / "EMAIL_FINAL_DL", run_dir / "EMAIL_FINAL_TMP", email_name, "GREEN", log)
+    # Both aggregate files are safely written and downloaded.  The requested
+    # cleanup occurs before either aggregate file is posted to FTP.
+    for ch in completed:
+        _drop_perm_table(results[ch]["perm_table"], log)
+
     email_dest = final_files_dir / email_name
     shutil.move(str(run_dir / "EMAIL_FINAL_TMP" / email_name), str(email_dest))
     email_ftp_path = _post_to_ftp(final_files_dir, path_date, email_name, log)
     shutil.rmtree(str(run_dir / "EMAIL_FINAL_TMP"), ignore_errors=True)
     outputs = [{"channel": "DOORDASH_EMAIL", "file": email_name, "final_file_path": str(email_dest), "status": "SUCCESS", "count": email_count, "s3_path": email_s3, "ftp_path": email_ftp_path}]
     if arcamax_table:
-        md5_count = _download_and_combine(md5_s3, run_dir / "MD5_FINAL_DL", run_dir / "MD5_FINAL_TMP", md5_name, "GREEN", log)
         md5_dest = final_files_dir / md5_name
         shutil.move(str(run_dir / "MD5_FINAL_TMP" / md5_name), str(md5_dest))
         md5_lines = md5_dest.read_text().splitlines()
