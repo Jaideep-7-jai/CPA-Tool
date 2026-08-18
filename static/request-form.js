@@ -101,12 +101,12 @@ document.addEventListener('DOMContentLoaded', () => {
     // Apptness is an available channel only for Doordash requests.
     apptnessLabel.classList.toggle('hidden', !isDoordash);
 
-    // For Doordash, ALL is the default. Keep the individual labels out of
-    // the way while ALL is selected; they become available if ALL is cleared.
+    // Doordash always displays every channel name, but the complete group is
+    // locked by applyDoordashDefaults with ALL selected.  Other request types
+    // retain their editable channel selection and do not show Apptness.
     individualChannels.forEach(channel => {
       const label = channel.closest('label');
-      const hideIndividual = isDoordash && chAll.checked;
-      if (channel !== chApptness) label.classList.toggle('hidden', hideIndividual);
+      if (channel !== chApptness) label.classList.remove('hidden');
       if (!isDoordash && channel === chApptness) {
         channel.checked = false;
         channel.disabled = false;
@@ -127,16 +127,9 @@ document.addEventListener('DOMContentLoaded', () => {
       criteriaTypeEl.setAttribute('disabled', true);
       compTypeEl.value    = 'include';
       compTypeEl.setAttribute('disabled', true);
-      // Doordash starts with ALL selected, while keeping the full channel bar
-      // visible (ALL, Green, Blue, Arcamax, Apptness, and Orange).
-      setChannelLock(false);
-      chAll.checked = true;
-      chAll.closest('label').classList.add('checked');
-      individualChannels.forEach(cb => {
-        cb.checked = false;
-        cb.disabled = true;
-        cb.closest('label').classList.remove('checked');
-      });
+      // Doordash always runs ALL channels. Keep the selection and all labels
+      // visible, while locking the group so the end user cannot change it.
+      setChannelLock(true, 'ALL');
     } else {
       clientNameEl.removeAttribute('readonly');
       if (clientNameEl.value === 'Doordash') clientNameEl.value = '';
