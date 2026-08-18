@@ -8,7 +8,10 @@
 
   <!-- ── Form ─────────────────────────────────── -->
   <section class="form-section">
-    <h2>Create Request</h2>
+    <div class="form-card-heading">
+      <div><span class="eyebrow">New workflow</span><h2>Create Request</h2><p>Complete the request details below. Required fields are validated before submission.</p></div>
+      <div class="form-heading-icon"><i class="bi bi-send-plus"></i></div>
+    </div>
     <form id="requestForm" class="request-form" enctype="multipart/form-data">
 
       <!-- 1. Request Name -->
@@ -118,7 +121,7 @@
 
   <!-- ── History Sidebar ───────────────────────── -->
   <section class="history-section">
-    <h2>Recent Requests</h2>
+    <div class="history-heading"><div><span class="eyebrow">Your activity</span><h2>Recent Requests</h2></div><i class="bi bi-clock-history"></i></div>
     {% if recent %}
       <div class="history-list">
         {% for r in recent %}
