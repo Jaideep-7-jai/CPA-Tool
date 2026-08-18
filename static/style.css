@@ -54,6 +54,18 @@ button { cursor: pointer; border: none; background: none; font: inherit; }
 }
 
 /* ═══════════════════════════════════════════════
+   POLISHED PAGE SURFACES
+═══════════════════════════════════════════════ */
+.dashboard-content { background: radial-gradient(circle at 84% 0%, rgba(37,99,235,.08), transparent 28%), var(--bg); }
+.page-hero { display:flex; align-items:center; justify-content:space-between; gap:20px; padding:22px 24px; margin-bottom:16px; border:1px solid rgba(37,99,235,.12); border-radius:16px; background:linear-gradient(120deg, #fff 0%, #f8fbff 68%, #edf5ff 100%); box-shadow:0 8px 30px rgba(30,64,175,.07); }
+.page-hero h2, .section-heading h2 { font-size:1.18rem; letter-spacing:-.025em; line-height:1.2; margin:3px 0 5px; }
+.page-hero p { color:var(--muted); font-size:.82rem; margin:0; max-width:620px; }
+.eyebrow { display:inline-flex; align-items:center; gap:5px; color:var(--primary); font-size:.64rem; font-weight:800; letter-spacing:.1em; text-transform:uppercase; }
+.hero-action { flex-shrink:0; }
+.section-heading { display:flex; align-items:end; justify-content:space-between; gap:16px; margin:22px 0 10px; }
+.section-note { color:var(--faint); font-size:.73rem; }
+
+/* ═══════════════════════════════════════════════
    SIDEBAR
 ═══════════════════════════════════════════════ */
 .dashboard-sidebar {
@@ -1020,6 +1032,40 @@ button { cursor: pointer; border: none; background: none; font: inherit; }
 }
 .item-meta span:last-child { font-size: .7rem; color: var(--faint); }
 .no-data { color: var(--faint); font-size: .8rem; text-align: center; padding: 16px 0; }
+
+/* Modern portal refinements shared by Dashboard, Requests, and Create Request */
+.cards-section { gap: 14px; }
+.metric-card { min-height: 142px; padding: 18px; border-radius: 16px; background: linear-gradient(145deg, #fff, #fbfdff); }
+.metric-card::before { opacity: 1; height: 4px; }
+.metric-card:hover { transform: translateY(-4px); }
+.chart-card { border-radius: 16px; padding: 17px; height: 290px; background: linear-gradient(145deg, #fff, #fcfdff); }
+.table-section { border-radius: 16px; box-shadow: 0 10px 28px rgba(30,64,175,.06); }
+.table-header { min-height: 66px; padding: 14px 18px; background: linear-gradient(180deg,#fff,#fbfcff); }
+.table-header h3 { margin-top: 1px; font-size: .95rem; }
+.filters-bar { padding: 13px 15px; border-radius: 16px; box-shadow: 0 8px 22px rgba(30,64,175,.05); }
+.filter-input, .filter-select { min-height: 40px; border-radius: 10px; background: #f8faff; }
+.requests-table th { padding: 11px 13px; background: #f8faff; }
+.requests-table td { padding: 12px 13px; }
+.requests-table tbody tr:hover { background: #f4f8ff; }
+.value-truncated { max-width: 165px; cursor: help; color: var(--muted); }
+.form-section { border-radius: 18px; padding: 0 24px 24px; overflow: hidden; box-shadow: 0 14px 35px rgba(30,64,175,.08); }
+.form-card-heading { display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin:0 -24px 20px; padding:22px 24px 18px; border-bottom:1px solid #e7edf8; background:linear-gradient(120deg,#fff,#f4f9ff); }
+.form-card-heading h2 { margin:3px 0 5px; font-size:1.12rem; }
+.form-card-heading h2::before { display:none; }
+.form-card-heading p { margin:0; color:var(--muted); font-size:.78rem; }
+.form-heading-icon { display:grid; place-items:center; width:42px; height:42px; border-radius:12px; background:var(--primary-light); color:var(--primary); font-size:1.15rem; }
+.request-form { gap:16px; }
+.form-group label { font-size:.82rem; }
+.form-group input[type=text], .form-group input[type=number], .form-group select { min-height:43px; border-radius:10px; background:#f8faff; }
+.channel-multi-wrapper { border-radius:11px; background:#f8faff; padding:11px; }
+.channel-option { min-height:31px; border-radius:8px; }
+.file-upload-area { border-radius:12px; padding:26px; background:#f8faff; }
+.history-section { border-radius:18px; box-shadow:0 14px 35px rgba(30,64,175,.08); }
+.history-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding-bottom:12px; margin-bottom:4px; border-bottom:1px solid #edf1f8; }
+.history-heading h2 { margin:2px 0 0; }
+.history-heading h2::before { display:none; }
+.history-heading > i { color:var(--primary); background:var(--primary-light); padding:7px; border-radius:9px; }
+.history-item { border-radius:11px; padding:11px; }
 
 /* ═══════════════════════════════════════════════
    LOGIN PAGE
